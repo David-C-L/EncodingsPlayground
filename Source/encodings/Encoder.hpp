@@ -76,7 +76,7 @@ public:
      * @param elementCount Number of elements to encode
      * @return Estimated size in bytes (0 if cannot estimate)
      */
-    virtual size_t estimateEncodedSize(size_t elementCount) const {
+    virtual size_t estimateEncodedSize(size_t /* elementCount */) const {
         return 0; // Default: cannot estimate
     }
 };

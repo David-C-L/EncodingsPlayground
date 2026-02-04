@@ -6,7 +6,7 @@
 #include <string>
 #include <concepts>
 #include <ranges>
-#include "DataType.hpp"
+#include "core/DataType.hpp"
 
 namespace encodings::datagen {
 
