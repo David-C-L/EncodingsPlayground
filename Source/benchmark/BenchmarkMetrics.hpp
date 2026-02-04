@@ -6,9 +6,9 @@
 #include <map>
 #include <optional>
 #include <sstream>
-#include "DataType.hpp"
+#include "core/DataType.hpp"
 
-namespace encodings::core {
+namespace encodings::benchmark {
 
 using namespace std::chrono;
 
@@ -19,22 +19,23 @@ struct TimingMetrics {
     nanoseconds encodeTime{0};
     nanoseconds decodeBulkTime{0};
     nanoseconds decodeRandomAccessTime{0};
+    nanoseconds decodeStridedAccessTime{0};
+    nanoseconds decodeRangeAccessTime{0};
     
     // Statistical measures (if multiple runs)
     std::optional<nanoseconds> encodeTimeStdDev;
     std::optional<nanoseconds> decodeBulkTimeStdDev;
     std::optional<nanoseconds> decodeRandomAccessTimeStdDev;
+    std::optional<nanoseconds> decodeStridedAccessTimeStdDev;
+    std::optional<nanoseconds> decodeRangeAccessTimeStdDev;
     
-    // Throughput calculations
-    double encodeThroughputMBps() const {
-        if (encodeTime.count() == 0) return 0.0;
-        return 1000.0; // Calculated by BenchmarkRunner based on data size
-    }
+    // Per-element throughput
+    double encodeElementsPerSecond{0.0};
+    double decodeBulkElementsPerSecond{0.0};
     
-    double decodeBulkThroughputMBps() const {
-        if (decodeBulkTime.count() == 0) return 0.0;
-        return 1000.0; // Calculated by BenchmarkRunner based on data size
-    }
+    // Throughput in MB/s
+    double encodeThroughputMBps{0.0};
+    double decodeBulkThroughputMBps{0.0};
 };
 
 /**
@@ -85,15 +86,21 @@ struct AccuracyMetrics {
  * @brief Random access performance metrics
  */
 struct RandomAccessMetrics {
-    nanoseconds averageAccessTime{0};
-    nanoseconds minAccessTime{0};
-    nanoseconds maxAccessTime{0};
-    size_t accessCount{0};
+    // Random access (shuffled indices)
+    nanoseconds averageRandomAccessTime{0};
+    nanoseconds minRandomAccessTime{0};
+    nanoseconds maxRandomAccessTime{0};
+    size_t randomAccessCount{0};
     
-    // Access pattern analysis
-    std::optional<nanoseconds> sequentialAccessTime;
-    std::optional<nanoseconds> randomAccessTime;
-    std::optional<nanoseconds> batchAccessTime;
+    // Strided access pattern
+    nanoseconds averageStridedAccessTime{0};
+    size_t stridedAccessCount{0};
+    size_t stride{0};
+    
+    // Range queries
+    nanoseconds averageRangeAccessTime{0};
+    size_t rangeQueryCount{0};
+    size_t averageRangeSize{0};
 };
 
 /**
@@ -156,27 +163,36 @@ struct BenchmarkMetrics {
  * @brief Configuration for benchmark runs
  */
 struct BenchmarkConfig {
-    size_t dataSize{10000};              // Number of elements to generate
-    size_t iterations{10};               // Number of benchmark iterations
+    // Data generation
+    std::vector<size_t> dataSizes{1000, 10000, 100000};  // Sizes to test
+    
+    // Benchmarking
+    size_t iterations{10};               // Number of benchmark iterations (for statistics)
     size_t warmupRuns{3};                // Warmup iterations (not measured)
     
     // Random access testing
     bool testRandomAccess{true};
     size_t randomAccessSamples{100};     // Number of random reads to test
     
-    // Batch access testing
-    bool testBatchAccess{true};
-    size_t batchSize{100};
-    size_t batchCount{10};
+    // Strided access testing
+    bool testStridedAccess{true};
+    size_t stridedAccessSamples{100};
+    size_t stride{10};                   // Access every Nth element
+    
+    // Range query testing
+    bool testRangeAccess{true};
+    size_t rangeQueryCount{10};
+    std::vector<size_t> rangeSizes{10, 100, 1000};  // Different range sizes to test
     
     // Validation
     bool validateCorrectness{true};      // Verify decoded data matches original
+    bool validateRandomAccess{true};     // Verify random access against sequential decode
     double maxAcceptableError{0.0};      // For lossy encodings
     
     // Output
     bool verboseOutput{false};
     bool saveResults{true};
-    std::string outputPath{"Benchmarks/results"};
+    std::string outputPath{"/home/david/Documents/PhD/symbol-store/EncodingsPlayground/Benchmarks/results"};
 };
 
-} // namespace encodings::core
+} // namespace encodings::benchmark
