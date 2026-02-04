@@ -28,7 +28,7 @@ add_subdirectory(Source/encoders)
 add_subdirectory(Source/benchmark)
 
 if(BUILD_BENCHMARKS)
-    # add_subdirectory(Benchmarks)
+    add_subdirectory(Benchmarks)
 endif()
 
 if(BUILD_TESTS)
