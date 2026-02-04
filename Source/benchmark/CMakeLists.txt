@@ -7,6 +7,8 @@ target_sources(encodings_benchmark INTERFACE
     BASE_DIRS ${PROJECT_SOURCE_DIR}/Source
     FILES
         BenchmarkMetrics.hpp
+        BenchmarkRunner.hpp
+        BenchmarkOutput.hpp
 )
 
 target_include_directories(encodings_benchmark INTERFACE
