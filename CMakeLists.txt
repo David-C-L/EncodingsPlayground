@@ -35,3 +35,9 @@ if(BUILD_TESTS)
     enable_testing()
     # add_subdirectory(Tests)
 endif()
+
+# Simple test for DeltaRunLengthEncoder
+add_executable(test_delta_rle test_delta_rle.cpp)
+target_include_directories(test_delta_rle PRIVATE ${CMAKE_SOURCE_DIR}/Source)
+target_link_libraries(test_delta_rle PRIVATE encodings_core encodings_encodings encodings_encoders)
+set_target_properties(test_delta_rle PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)

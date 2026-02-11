@@ -6,9 +6,9 @@
 namespace encodings::datagen {
 
     template<typename K, typename V>
-    class MapGenerator : public DataGenerator<std::map<K, V>> {
+    class MapGeneratorCompositional : public DataGenerator<std::map<K, V>> {
     public:
-        MapGenerator(std::shared_ptr<DataGenerator<K>> keyGen,
+        MapGeneratorCompositional(std::shared_ptr<DataGenerator<K>> keyGen,
                     std::shared_ptr<DataGenerator<V>> valueGen,
                     std::shared_ptr<DataGenerator<int64_t>> sizeGen)
 
