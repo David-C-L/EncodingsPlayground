@@ -35,7 +35,9 @@ def plot_compression_ratios(results, output_dir):
             
             if matching:
                 ratio = matching[0]['metrics']['memory']['compressionRatio']
-                data[encoder].append(ratio)
+                # Invert ratio to show "how many times smaller"
+                inverted_ratio = 1.0 / ratio if ratio > 0 else 0
+                data[encoder].append(inverted_ratio)
             else:
                 data[encoder].append(0)
     
@@ -58,7 +60,7 @@ def plot_compression_ratios(results, output_dir):
                        ha='center', va='bottom', fontsize=8)
     
     ax.set_xlabel('Dataset')
-    ax.set_ylabel('Compression Ratio')
+    ax.set_ylabel('Compression Ratio (times smaller than raw)')
     ax.set_title(f'Compression Ratios (n={max_size})')
     ax.set_xticks(x)
     ax.set_xticklabels(datasets, rotation=45, ha='right')

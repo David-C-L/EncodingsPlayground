@@ -30,12 +30,14 @@ def plot_compression_by_encoder(results, output_dir='.', data_size=1000):
         encoder = result['encoderName']
         generator = result['datasetName']
         ratio = result['metrics']['memory']['compressionRatio']
+        # Invert ratio to show "how many times smaller" (0.5 -> 2x compression)
+        inverted_ratio = 1.0 / ratio if ratio > 0 else 0
         
         if encoder not in encoders:
             encoders[encoder] = {'generators': [], 'ratios': []}
         
         encoders[encoder]['generators'].append(generator)
-        encoders[encoder]['ratios'].append(ratio)
+        encoders[encoder]['ratios'].append(inverted_ratio)
     
     # Get unique generators in consistent order
     all_generators = sorted(set(r['datasetName'] for r in filtered_results))
@@ -55,7 +57,7 @@ def plot_compression_by_encoder(results, output_dir='.', data_size=1000):
         ax.bar(x + offset, ratios, width, label=encoder)
     
     ax.set_xlabel('Data Generator')
-    ax.set_ylabel('Compression Ratio')
+    ax.set_ylabel('Compression Ratio (times smaller than raw)')
     ax.set_title(f'Map Encoding: Compression Ratio by Encoder and Generator (n={data_size})')
     ax.set_xticks(x)
     ax.set_xticklabels(all_generators, rotation=45, ha='right')
@@ -215,12 +217,14 @@ def plot_space_time_tradeoff(results, output_dir='.', data_size=1000):
     for result in results:
         encoder = result['encoderName']
         compression = result['metrics']['memory']['compressionRatio']
+        # Invert ratio to show "how many times smaller"
+        inverted_compression = 1.0 / compression if compression > 0 else 0
         encode_time = result['metrics']['timing']['encodeTime_ns'] / 1_000_000  # Convert to ms
         
-        ax1.scatter(compression, encode_time,
+        ax1.scatter(inverted_compression, encode_time,
                    label=encoder, color=encoder_colors[encoder], s=100, alpha=0.6)
     
-    ax1.set_xlabel('Compression Ratio')
+    ax1.set_xlabel('Compression Ratio (times smaller than raw)')
     ax1.set_ylabel('Encode Time (ms)')
     ax1.set_title('Compression vs Encode Speed')
     ax1.grid(True, alpha=0.3)
@@ -234,12 +238,14 @@ def plot_space_time_tradeoff(results, output_dir='.', data_size=1000):
     for result in results:
         encoder = result['encoderName']
         compression = result['metrics']['memory']['compressionRatio']
+        # Invert ratio to show "how many times smaller"
+        inverted_compression = 1.0 / compression if compression > 0 else 0
         decode_time = result['metrics']['timing']['decodeBulkTime_ns'] / 1_000_000  # Convert to ms
         
-        ax2.scatter(compression, decode_time,
+        ax2.scatter(inverted_compression, decode_time,
                    label=encoder, color=encoder_colors[encoder], s=100, alpha=0.6)
     
-    ax2.set_xlabel('Compression Ratio')
+    ax2.set_xlabel('Compression Ratio (times smaller than raw)')
     ax2.set_ylabel('Decode Time (ms)')
     ax2.set_title('Compression vs Decode Speed')
     ax2.grid(True, alpha=0.3)
@@ -264,18 +270,20 @@ def plot_best_encoder_by_generator(results, output_dir='.', data_size=1000):
         generator = result['datasetName']
         encoder = result['encoderName']
         ratio = result['metrics']['memory']['compressionRatio']
+        # Invert ratio for display
+        inverted_ratio = 1.0 / ratio if ratio > 0 else 0
         
         if generator not in generators:
             generators[generator] = []
         
         generators[generator].append({
             'encoder': encoder,
-            'ratio': ratio,
+            'ratio': inverted_ratio,  # Store inverted for comparison
             'encode_time': result['metrics']['timing']['encodeTime_ns'] / 1_000_000,
             'decode_time': result['metrics']['timing']['decodeBulkTime_ns'] / 1_000_000
         })
     
-    # Find best compression for each generator
+    # Find best compression for each generator (highest inverted ratio = best)
     fig, ax = plt.subplots(figsize=(12, 6))
     
     gen_names = []
@@ -283,7 +291,7 @@ def plot_best_encoder_by_generator(results, output_dir='.', data_size=1000):
     best_ratios = []
     
     for gen_name, encoder_results in generators.items():
-        best = min(encoder_results, key=lambda x: x['ratio'])
+        best = max(encoder_results, key=lambda x: x['ratio'])  # Changed to max since we inverted
         gen_names.append(gen_name)
         best_encoders.append(best['encoder'])
         best_ratios.append(best['ratio'])
@@ -298,7 +306,7 @@ def plot_best_encoder_by_generator(results, output_dir='.', data_size=1000):
                encoder, ha='center', va='bottom', rotation=45, fontsize=8)
     
     ax.set_xlabel('Data Generator')
-    ax.set_ylabel('Best Compression Ratio')
+    ax.set_ylabel('Best Compression Ratio (times smaller than raw)')
     ax.set_title('Best Encoder for Each Data Pattern')
     ax.set_xticklabels(gen_names, rotation=45, ha='right')
     ax.grid(axis='y', alpha=0.3)
@@ -322,10 +330,12 @@ def plot_heatmap(results, output_dir='.', data_size=1000):
     for result in results:
         i = encoders.index(result['encoderName'])
         j = generators.index(result['datasetName'])
-        matrix[i, j] = result['metrics']['memory']['compressionRatio']
+        ratio = result['metrics']['memory']['compressionRatio']
+        # Invert ratio for display
+        matrix[i, j] = 1.0 / ratio if ratio > 0 else 0
     
     fig, ax = plt.subplots(figsize=(12, 8))
-    im = ax.imshow(matrix, cmap='RdYlGn_r', aspect='auto')
+    im = ax.imshow(matrix, cmap='RdYlGn', aspect='auto')  # Green=high (good)
     
     ax.set_xticks(np.arange(len(generators)))
     ax.set_yticks(np.arange(len(encoders)))
@@ -334,7 +344,7 @@ def plot_heatmap(results, output_dir='.', data_size=1000):
     
     # Add colorbar
     cbar = ax.figure.colorbar(im, ax=ax)
-    cbar.ax.set_ylabel('Compression Ratio', rotation=-90, va="bottom")
+    cbar.ax.set_ylabel('Compression Ratio (times smaller than raw)', rotation=-90, va="bottom")
     
     # Add text annotations
     for i in range(len(encoders)):
