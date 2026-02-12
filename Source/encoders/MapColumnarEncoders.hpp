@@ -25,6 +25,7 @@ public:
         : keyEncoder_(keyEncoder), valueEncoder_(valueEncoder) {
         
         this->properties_.add(EncodingProperty::Lossless);
+        this->properties_.add(EncodingProperty::RandomAccess);
         this->properties_.add(EncodingProperty::DictionaryBased);
         this->properties_.add(EncodingProperty::Vectorizable);
     }
@@ -448,6 +449,7 @@ public:
         : keyEncoder_(keyEncoder), valueEncoder_(valueEncoder), sizeCodec_(sizeCodec) {
         
         this->properties_.add(EncodingProperty::Lossless);
+        this->properties_.add(EncodingProperty::RandomAccess);
         this->properties_.add(EncodingProperty::DictionaryBased);
         this->properties_.add(EncodingProperty::Vectorizable);
     }
@@ -482,15 +484,17 @@ public:
         std::vector<std::vector<V>> valueGroups(largestMapSize);
         
         // Reserve space: group i will have elements from all maps with size > i
-        for (size_t i = 0; i < largestMapSize; ++i) {
-            size_t groupSize = 0;
-            for (const auto& [size, freq] : sizeFrequency) {
-                if (size > i) {
-                    groupSize += freq;
-                }
+        // Build cumulative frequency from largest to smallest for O(n) reservation
+        std::vector<size_t> cumulativeFreq(largestMapSize + 1, 0);
+        for (const auto& [size, freq] : sizeFrequency) {
+            for (size_t i = 0; i < size && i < largestMapSize; ++i) {
+                cumulativeFreq[i] += freq;
             }
-            keyGroups[i].reserve(groupSize);
-            valueGroups[i].reserve(groupSize);
+        }
+        
+        for (size_t i = 0; i < largestMapSize; ++i) {
+            keyGroups[i].reserve(cumulativeFreq[i]);
+            valueGroups[i].reserve(cumulativeFreq[i]);
         }
 
         for (const auto& map : data) {
@@ -502,23 +506,25 @@ public:
             }
         }
 
-        // Encode each group separately
+        // Encode each group separately and calculate lengths
         std::vector<EncodedData> encodedKeyGroups(largestMapSize);
         std::vector<EncodedData> encodedValueGroups(largestMapSize);
         std::vector<uint32_t> keyGroupSizes(largestMapSize);
         std::vector<uint32_t> valueGroupSizes(largestMapSize);
+        
+        uint32_t keyLen = 0;
+        uint32_t valueLen = 0;
         
         for (size_t i = 0; i < largestMapSize; ++i) {
             encodedKeyGroups[i] = keyEncoder_->encode(keyGroups[i]);
             encodedValueGroups[i] = valueEncoder_->encode(valueGroups[i]);
             keyGroupSizes[i] = encodedKeyGroups[i].size();
             valueGroupSizes[i] = encodedValueGroups[i].size();
+            keyLen += keyGroupSizes[i];
+            valueLen += valueGroupSizes[i];
         }
 
-        // Calculate total encoded lengths
         uint32_t sizeLen = encodedSizes.size();
-        uint32_t keyLen = std::accumulate(keyGroupSizes.begin(), keyGroupSizes.end(), 0u);
-        uint32_t valueLen = std::accumulate(valueGroupSizes.begin(), valueGroupSizes.end(), 0u);
         uint32_t numGroups = static_cast<uint32_t>(largestMapSize);
         
         // Format: [size_len][key_len][value_len][num_groups]
@@ -561,10 +567,12 @@ public:
             offset += encoded.size();
         }
 
+        // Calculate uncompressed size based on actual data
         size_t uncompressedSize = 0;
         for (const auto& map : data) {
             uncompressedSize += map.size() * (sizeof(K) + sizeof(V));
         }
+        
         return this->createEncodedData(std::move(result), data.size(), uncompressedSize, "MapGroupIndices");
     }
     
@@ -596,6 +604,90 @@ public:
         auto sizes = this->decodeMapSizesWithCodec(sizeData, sizeCodec_);
         offset += sizeLen;
         
+        return decodeRangeInternal(data, offset, numGroups, sizes, 0, sizes.size());
+    }
+    
+    std::optional<MapType> decodeAt(const EncodedData& encoded, size_t index) override {
+        if (encoded.empty() || index >= encoded.metadata().elementCount) {
+            return std::nullopt;
+        }
+        
+        auto result = decodeRange(encoded, index, index + 1);
+        if (result.empty()) {
+            return std::nullopt;
+        }
+        return std::move(result[0]);
+    }
+    
+    std::vector<MapType> decodeRange(const EncodedData& encoded, size_t start, size_t end) override {
+        if (encoded.empty() || start >= encoded.metadata().elementCount) {
+            return {};
+        }
+        
+        const uint8_t* data = encoded.data().data();
+        size_t offset = 0;
+        
+        // Read header
+        uint32_t sizeLen, keyLen, valueLen, numGroups;
+        std::memcpy(&sizeLen, data + offset, sizeof(uint32_t));
+        offset += sizeof(uint32_t);
+        std::memcpy(&keyLen, data + offset, sizeof(uint32_t));
+        offset += sizeof(uint32_t);
+        std::memcpy(&valueLen, data + offset, sizeof(uint32_t));
+        offset += sizeof(uint32_t);
+        std::memcpy(&numGroups, data + offset, sizeof(uint32_t));
+        offset += sizeof(uint32_t);
+        
+        // Decode only the sizes we need for the range
+        std::vector<uint8_t> sizeBytes(data + offset, data + offset + sizeLen);
+        EncodingMetadata sizeMetadata;
+        sizeMetadata.encodingName = "SizeDecoder";
+        sizeMetadata.elementCount = encoded.metadata().elementCount;
+        EncodedData sizeData(std::move(sizeBytes), std::move(sizeMetadata));
+        
+        // Decode the specific range of sizes using the codec's decodeRange if available
+        auto allSizes = this->decodeMapSizesWithCodec(sizeData, sizeCodec_);
+        
+        size_t actualEnd = std::min(end, allSizes.size());
+        if (start >= actualEnd) {
+            return {};
+        }
+        
+        // Extract just the sizes we need
+        std::vector<S> sizes(allSizes.begin() + start, allSizes.begin() + actualEnd);
+        
+        offset += sizeLen;
+        
+        return decodeRangeInternal(data, offset, numGroups, allSizes, start, actualEnd);
+    }
+    
+    std::string name() const override {
+        return "MapGroupIndices" + keyEncoder_->name() + valueEncoder_->name() + sizeCodec_->name();
+    }
+    
+private:
+    std::shared_ptr<Codec<K>> keyEncoder_;
+    std::shared_ptr<Codec<V>> valueEncoder_;
+    std::shared_ptr<Codec<S>> sizeCodec_;
+    
+    /**
+     * @brief Internal method to decode a range of maps efficiently
+     * 
+     * @param data Pointer to the encoded data (after header)
+     * @param offset Offset to the group sizes section
+     * @param numGroups Total number of groups
+     * @param allSizes All map sizes (needed to calculate group element counts)
+     * @param start Start index of maps to decode
+     * @param end End index of maps to decode (exclusive)
+     */
+    std::vector<MapType> decodeRangeInternal(
+        const uint8_t* data, 
+        size_t offset,
+        uint32_t numGroups,
+        const std::vector<S>& allSizes,
+        size_t start,
+        size_t end) {
+        
         // Read encoded group sizes
         std::vector<uint32_t> keyGroupSizes(numGroups);
         std::vector<uint32_t> valueGroupSizes(numGroups);
@@ -606,51 +698,81 @@ public:
         
         // Calculate how many elements are in each group
         std::vector<size_t> groupElementCounts(numGroups, 0);
-        for (const auto& size : sizes) {
+        for (const auto& size : allSizes) {
             for (size_t i = 0; i < size && i < numGroups; ++i) {
                 groupElementCounts[i]++;
             }
         }
         
-        // Decode each key group
-        std::vector<std::vector<K>> keyGroups(numGroups);
-        for (size_t i = 0; i < numGroups; ++i) {
-            std::vector<uint8_t> groupBytes(data + offset, data + offset + keyGroupSizes[i]);
-            EncodingMetadata groupMetadata;
-            groupMetadata.encodingName = "GroupDecoder";
-            groupMetadata.elementCount = groupElementCounts[i];
-            EncodedData groupData(std::move(groupBytes), std::move(groupMetadata));
-            keyGroups[i] = keyEncoder_->decodeAll(groupData);
-            offset += keyGroupSizes[i];
+        // Determine which groups we actually need to decode
+        // We need groups 0 to max(sizes in our range) - 1
+        size_t maxSizeInRange = 0;
+        for (size_t i = start; i < end; ++i) {
+            if (allSizes[i] > maxSizeInRange) {
+                maxSizeInRange = allSizes[i];
+            }
         }
         
-        // Decode each value group
-        std::vector<std::vector<V>> valueGroups(numGroups);
+        // Decode only the key groups we need
+        std::vector<std::vector<K>> keyGroups(maxSizeInRange);
+        size_t keyOffset = offset;
         for (size_t i = 0; i < numGroups; ++i) {
-            std::vector<uint8_t> groupBytes(data + offset, data + offset + valueGroupSizes[i]);
-            EncodingMetadata groupMetadata;
-            groupMetadata.encodingName = "GroupDecoder";
-            groupMetadata.elementCount = groupElementCounts[i];
-            EncodedData groupData(std::move(groupBytes), std::move(groupMetadata));
-            valueGroups[i] = valueEncoder_->decodeAll(groupData);
-            offset += valueGroupSizes[i];
+            if (i < maxSizeInRange && groupElementCounts[i] > 0) {
+                // Decode this group
+                std::vector<uint8_t> groupBytes(data + keyOffset, data + keyOffset + keyGroupSizes[i]);
+                EncodingMetadata groupMetadata;
+                groupMetadata.encodingName = "GroupDecoder";
+                groupMetadata.elementCount = groupElementCounts[i];
+                EncodedData groupData(std::move(groupBytes), std::move(groupMetadata));
+                keyGroups[i] = keyEncoder_->decodeAll(groupData);
+            }
+            // Skip this group in the data stream
+            keyOffset += keyGroupSizes[i];
         }
         
-        // Reconstruct maps from groups
-        std::vector<MapType> result;
-        result.reserve(sizes.size());
+        // Decode only the value groups we need
+        std::vector<std::vector<V>> valueGroups(maxSizeInRange);
+        size_t valueOffset = keyOffset;
+        for (size_t i = 0; i < numGroups; ++i) {
+            if (i < maxSizeInRange && groupElementCounts[i] > 0) {
+                // Decode this group
+                std::vector<uint8_t> groupBytes(data + valueOffset, data + valueOffset + valueGroupSizes[i]);
+                EncodingMetadata groupMetadata;
+                groupMetadata.encodingName = "GroupDecoder";
+                groupMetadata.elementCount = groupElementCounts[i];
+                EncodedData groupData(std::move(groupBytes), std::move(groupMetadata));
+                valueGroups[i] = valueEncoder_->decodeAll(groupData);
+            }
+            // Skip this group in the data stream
+            valueOffset += valueGroupSizes[i];
+        }
         
-        for (size_t mapIdx = 0; mapIdx < sizes.size(); ++mapIdx) {
-            MapType map;
-            for (size_t posIdx = 0; posIdx < sizes[mapIdx]; ++posIdx) {
-                // Find which element in group posIdx corresponds to this map
-                size_t groupElementIdx = 0;
+        // Precompute group element starting indices for each map
+        // groupStartIndices[mapIdx][posIdx] = index in group posIdx where mapIdx's element is
+        std::vector<std::vector<size_t>> groupStartIndices(end - start);
+        for (size_t mapIdx = start; mapIdx < end; ++mapIdx) {
+            groupStartIndices[mapIdx - start].resize(allSizes[mapIdx]);
+            for (size_t posIdx = 0; posIdx < allSizes[mapIdx]; ++posIdx) {
+                // Count how many maps before this one have an element at posIdx
+                size_t count = 0;
                 for (size_t m = 0; m < mapIdx; ++m) {
-                    if (sizes[m] > posIdx) {
-                        groupElementIdx++;
+                    if (allSizes[m] > posIdx) {
+                        count++;
                     }
                 }
-                
+                groupStartIndices[mapIdx - start][posIdx] = count;
+            }
+        }
+        
+        // Reconstruct only the maps in our range
+        std::vector<MapType> result;
+        result.reserve(end - start);
+        
+        for (size_t mapIdx = start; mapIdx < end; ++mapIdx) {
+            MapType map;
+            size_t localIdx = mapIdx - start;
+            for (size_t posIdx = 0; posIdx < allSizes[mapIdx]; ++posIdx) {
+                size_t groupElementIdx = groupStartIndices[localIdx][posIdx];
                 map[keyGroups[posIdx][groupElementIdx]] = valueGroups[posIdx][groupElementIdx];
             }
             result.push_back(std::move(map));
@@ -658,15 +780,6 @@ public:
         
         return result;
     }
-    
-    std::string name() const override {
-        return "MapGroupIndices" + keyEncoder_->name() + valueEncoder_->name();
-    }
-    
-private:
-    std::shared_ptr<Codec<K>> keyEncoder_;
-    std::shared_ptr<Codec<V>> valueEncoder_;
-    std::shared_ptr<Codec<S>> sizeCodec_;
 };
 
 
