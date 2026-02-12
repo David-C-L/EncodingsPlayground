@@ -4,6 +4,7 @@
 #include <vector>
 #include <cstring>
 #include <concepts>
+#include <algorithm>
 #include "encodings/Encoder.hpp"
 #include "encodings/EncodedData.hpp"
 #include "encodings/EncodingProperty.hpp"
