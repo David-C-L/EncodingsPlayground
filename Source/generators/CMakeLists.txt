@@ -9,6 +9,7 @@ target_sources(encodings_generators INTERFACE
         DataGenerator.hpp
         MapGenerator.hpp
         CommonGenerators.hpp
+        VectorGenerator.hpp
 )
 
 target_include_directories(encodings_generators INTERFACE
