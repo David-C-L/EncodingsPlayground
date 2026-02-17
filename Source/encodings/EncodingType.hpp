@@ -17,6 +17,8 @@ namespace encodings {
         DeltaEncoding,
         DictionaryEncoding,
         BitPacking,
+        Zstd,
+        SphericalEncoding,
         Composed,      // Sequential composition (e.g., Delta | RLE)
         Structural     // Structural composition (e.g., different encoders per field)
     };
@@ -29,6 +31,8 @@ namespace encodings {
             case EncodingType::DeltaEncoding:        return "DeltaEncoding";
             case EncodingType::DictionaryEncoding:   return "DictionaryEncoding";
             case EncodingType::BitPacking:           return "BitPacking";
+            case EncodingType::Zstd:                 return "Zstd";
+            case EncodingType::SphericalEncoding:    return "SphericalEncoding";
             case EncodingType::Composed:             return "Composed";
             case EncodingType::Structural:           return "Structural";
         }

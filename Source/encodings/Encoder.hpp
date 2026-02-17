@@ -168,9 +168,7 @@ public:
     using Decoder<T>::decodeRange;
 
     // Single encodingType() implementation for both interfaces
-    EncodingType encodingType() const override {
-        return Encoder<T>::encodingType();
-    }
+    EncodingType encodingType() const override = 0;
 
     // Single name() implementation for both interfaces
     std::string name() const override = 0;
@@ -182,8 +180,12 @@ public:
     DataType dataType() const override {
         if constexpr (PrimitiveType<T>) {
             return typeToDataType<T>;
+        } else if constexpr (core::MapType<T>) {
+            return DataType::Map;
+        } else if constexpr (core::Vector32Type<T>) {
+            return DataType::Vector32;
         } else {
-            return DataType::Array;
+            return DataType::Array; // Default for composite types
         }
     }
 };

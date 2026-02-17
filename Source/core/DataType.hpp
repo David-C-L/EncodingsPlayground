@@ -7,6 +7,7 @@
 #include <map>
 #include <concepts>
 #include <type_traits>
+#include <numeric>
 
 namespace encodings::core {
 
@@ -34,7 +35,11 @@ enum class DataType {
     
     // Composite types
     Array,
-    Map
+    Map,
+
+    // N-dimensional vectors
+    Vector32
+
 };
 
 /**
@@ -56,6 +61,7 @@ constexpr const char* dataTypeToString(DataType type) {
         case DataType::String:  return "String";
         case DataType::Array:   return "Array";
         case DataType::Map:     return "Map";
+        case DataType::Vector32: return "Vector32";
     }
     return "Unknown";
 }
@@ -83,9 +89,37 @@ constexpr size_t dataTypeSize(DataType type) {
         case DataType::String:
         case DataType::Array:
         case DataType::Map:
+        case DataType::Vector32:
             return 0; // Variable size
     }
     return 0;
+}
+
+template<typename T>
+size_t dataTypeSize(DataType type, std::span<const T> data, size_t Dimension = 0) {
+    switch (type) {
+        case DataType::String:
+            return std::accumulate(data.begin(), data.end(), 0, [](size_t sum, const T& str) {
+                return sum + sizeof(uint32_t) + str.size(); // 4 bytes for length prefix
+            });
+        case DataType::Array:
+            return std::accumulate(data.begin(), data.end(), 0, [](size_t sum, const T& arr) {
+                return sum + sizeof(uint32_t) + arr.size() * sizeof(typename T::value_type); // 4 bytes for length prefix
+            });
+        case DataType::Map:
+            return std::accumulate(data.begin(), data.end(), 0, [](size_t sum, const T& map) {
+                size_t mapSize = sizeof(uint32_t); // 4 bytes for number of entries
+                for (const auto& [key, value] : map) {
+                    mapSize += sizeof(uint32_t) + key.size(); // Key size
+                    mapSize += sizeof(uint32_t) + value.size(); // Value size
+                }
+                return sum + mapSize;
+            });
+        case DataType::Vector32:
+            return data.size() * Dimension * sizeof(float); // Assuming fixed dimension and float type
+        default:
+            return data.size() * dataTypeSize(type);
+    }
 }
 
 // Type concepts for compile-time type checking
@@ -116,6 +150,24 @@ concept MapType = requires(T t) {
     { t.begin() } -> std::same_as<typename T::iterator>;
     { t.end() } -> std::same_as<typename T::iterator>;
 };
+
+template<typename T>
+concept Float32Type = FloatingPointType<T> && sizeof(T) == 4;
+
+template<typename T> 
+concept Float64Type = FloatingPointType<T> && sizeof(T) == 8;
+
+template<typename T>
+concept Vector32Type =
+    ArrayType<T> &&
+    std::ranges::contiguous_range<T> &&
+    Float32Type<typename T::value_type>;
+
+template<typename T>
+concept Vector64Type =
+    ArrayType<T> &&
+    std::ranges::contiguous_range<T> &&
+    Float64Type<typename T::value_type>;
 
 /**
  * @brief Type traits to map C++ types to DataType enum
