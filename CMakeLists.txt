@@ -41,6 +41,7 @@ if(BUILD_TESTS)
     add_test(NAME test_tpch_partkey COMMAND test_tpch_partkey)
     add_test(NAME test_spherical_encoder COMMAND test_spherical_encoder)
     add_test(NAME test_vector_generators COMMAND test_vector_generators)
+    add_test(NAME test_bitset COMMAND test_bitset)
 endif()
 
 # Simple test for DeltaRunLengthEncoder
@@ -90,3 +91,9 @@ add_executable(demo_compile_time_dimension demo_compile_time_dimension.cpp)
 target_include_directories(demo_compile_time_dimension PRIVATE ${CMAKE_SOURCE_DIR}/Source)
 target_link_libraries(demo_compile_time_dimension PRIVATE encodings_core encodings_encodings encodings_encoders encodings_generators)
 set_target_properties(demo_compile_time_dimension PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+# Test for FastBitset
+add_executable(test_bitset test_bitset.cpp)
+target_include_directories(test_bitset PRIVATE ${CMAKE_SOURCE_DIR}/Source)
+target_link_libraries(test_bitset PRIVATE encodings_core encodings_encodings encodings_encoders)
+set_target_properties(test_bitset PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)

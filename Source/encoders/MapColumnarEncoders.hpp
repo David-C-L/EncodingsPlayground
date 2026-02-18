@@ -428,9 +428,357 @@ private:
     std::shared_ptr<Codec<V>> valueEncoder_;
 };
 
+/**
+ * @brief Strategy 7: Columnar with group keys, then codec per group
+ * 
+ * Transform to flatmap where values are grouped by key across all maps,
+ * then encode each group of values separately with its own codec.
+ * This is optimal when:
+ * - Maps share common keys across instances
+ * - Values for each key have good compression patterns
+ * 
+ * Supports two modes:
+ * 1. Single value encoder: Same codec applied to all value groups
+ * 2. Per-group encoders: Different codec for each key's values (set at encode time)
+ * 
+ * Example: [{a:1,b:2}, {a:3,c:4}, {a:5,b:6}]
+ *   -> key a: [1,3,5], key b: [2,6], key c: [4]
+ *   -> encode each stream with its own optimal codec
+ * 
+ * Format: [size_encoding][num_groups][group_keys][presence_bitmap]
+ *         [value_group_sizes...][value_groups...]
+ */
+// TODO: make value types be std::variant of all value types possible for encoding
+template<typename K, typename V, typename S = uint32_t>
+class MapGroupKeysEncoder : public MapEncoder<K, V> {
+public:
+    using MapType = typename MapEncoder<K, V>::MapType;
+    
+    /**
+     * @brief Construct with single value encoder for all groups
+     */
+    MapGroupKeysEncoder(
+        std::shared_ptr<Codec<K>> keyEncoder,
+        std::shared_ptr<Codec<V>> valueEncoder,
+        std::shared_ptr<Codec<S>> sizeCodec)
+        : keyEncoder_(keyEncoder),
+          sizeCodec_(sizeCodec),
+          singleValueEncoder_(valueEncoder),
+          usePerGroupEncoders_(false) {
+        
+        this->properties_.add(EncodingProperty::Lossless);
+        this->properties_.add(EncodingProperty::DictionaryBased);
+        this->properties_.add(EncodingProperty::Vectorizable);
+    }
+
+    MapGroupKeysEncoder(
+        std::shared_ptr<Codec<K>> keyEncoder,
+        std::shared_ptr<Codec<V>> valueEncoder)
+        : MapGroupKeysEncoder(keyEncoder, valueEncoder, std::make_shared<RunLengthEncoder<S>>()) {}
+    
+    /**
+     * @brief Construct with per-group value encoders
+     * 
+     * @param keyEncoder Encoder for the unique keys
+     * @param valueEncoderMap Map from key to its specific value encoder
+     * @param defaultValueEncoder Fallback encoder for keys not in the map
+     * @param sizeCodec Encoder for map sizes
+     */
+    MapGroupKeysEncoder(
+        std::shared_ptr<Codec<K>> keyEncoder,
+        std::map<K, std::shared_ptr<Codec<V>>> valueEncoderMap,
+        std::shared_ptr<Codec<V>> defaultValueEncoder,
+        std::shared_ptr<Codec<S>> sizeCodec)
+        : keyEncoder_(keyEncoder),
+          valueEncoderMap_(std::move(valueEncoderMap)),
+          defaultValueEncoder_(defaultValueEncoder),
+          sizeCodec_(sizeCodec),
+          usePerGroupEncoders_(true) {
+        
+        this->properties_.add(EncodingProperty::Lossless);
+        this->properties_.add(EncodingProperty::DictionaryBased);
+        this->properties_.add(EncodingProperty::Vectorizable);
+    }
+    
+    MapGroupKeysEncoder(
+        std::shared_ptr<Codec<K>> keyEncoder,
+        std::map<K, std::shared_ptr<Codec<V>>> valueEncoderMap,
+        std::shared_ptr<Codec<V>> defaultValueEncoder)
+        : MapGroupKeysEncoder(keyEncoder, std::move(valueEncoderMap), defaultValueEncoder, 
+                             std::make_shared<RunLengthEncoder<S>>()) {}
+    
+    EncodedData encode(std::span<const MapType> data) override {
+        if (data.empty()) {
+            return this->createEncodedData(std::vector<uint8_t>{}, 0, 0, "MapGroupKeys");
+        }
+        
+        // Encode map sizes
+        auto encodedSizes = this->encodeMapSizesWithCodec(data, sizeCodec_);
+
+        // Find all unique keys across all maps (preserving insertion order)
+        std::vector<K> uniqueKeys;
+        std::map<K, size_t> keyToGroupIndex;
+        
+        for (const auto& map : data) {
+            for (const auto& [key, value] : map) {
+                if (keyToGroupIndex.find(key) == keyToGroupIndex.end()) {
+                    keyToGroupIndex[key] = uniqueKeys.size();
+                    uniqueKeys.push_back(key);
+                }
+            }
+        }
+        
+        size_t numGroups = uniqueKeys.size();
+        
+        // Build value groups: for each key, collect all values across all maps
+        // Also build presence bitmap: tracks which maps contain which keys
+        std::vector<std::vector<V>> valueGroups(numGroups);
+        std::vector<std::vector<bool>> presenceBitmap(data.size(), std::vector<bool>(numGroups, false));
+        
+        // First pass: count occurrences to reserve space
+        std::vector<size_t> groupCounts(numGroups, 0);
+        for (size_t mapIdx = 0; mapIdx < data.size(); ++mapIdx) {
+            for (const auto& [key, value] : data[mapIdx]) {
+                groupCounts[keyToGroupIndex[key]]++;
+            }
+        }
+        
+        for (size_t i = 0; i < numGroups; ++i) {
+            valueGroups[i].reserve(groupCounts[i]);
+        }
+        
+        // Second pass: populate value groups and presence bitmap
+        for (size_t mapIdx = 0; mapIdx < data.size(); ++mapIdx) {
+            for (const auto& [key, value] : data[mapIdx]) {
+                size_t groupIdx = keyToGroupIndex[key];
+                valueGroups[groupIdx].push_back(value);
+                presenceBitmap[mapIdx][groupIdx] = true;
+            }
+        }
+        
+        // Encode the unique keys
+        auto encodedKeys = keyEncoder_->encode(uniqueKeys);
+        
+        // Encode presence bitmap as packed bits
+        // Each map has numGroups bits indicating presence of each key
+        size_t bitmapBytesPerMap = (numGroups + 7) / 8;  // Round up to nearest byte
+        std::vector<uint8_t> packedBitmap(data.size() * bitmapBytesPerMap, 0);
+        
+        for (size_t mapIdx = 0; mapIdx < data.size(); ++mapIdx) {
+            for (size_t groupIdx = 0; groupIdx < numGroups; ++groupIdx) {
+                if (presenceBitmap[mapIdx][groupIdx]) {
+                    size_t bitPosition = mapIdx * numGroups + groupIdx;
+                    size_t byteIdx = bitPosition / 8;
+                    size_t bitIdx = bitPosition % 8;
+                    packedBitmap[byteIdx] |= (1 << bitIdx);
+                }
+            }
+        }
+        
+        // Encode each value group separately with appropriate encoder
+        std::vector<EncodedData> encodedValueGroups(numGroups);
+        std::vector<uint32_t> valueGroupSizes(numGroups);
+        uint32_t totalValueLen = 0;
+        
+        for (size_t i = 0; i < numGroups; ++i) {
+            // Select encoder for this group
+            std::shared_ptr<Codec<V>> encoder;
+            if (usePerGroupEncoders_) {
+                const K& key = uniqueKeys[i];
+                auto it = valueEncoderMap_.find(key);
+                encoder = (it != valueEncoderMap_.end()) ? it->second : defaultValueEncoder_;
+            } else {
+                encoder = singleValueEncoder_;
+            }
+            
+            encodedValueGroups[i] = encoder->encode(valueGroups[i]);
+            valueGroupSizes[i] = encodedValueGroups[i].size();
+            totalValueLen += valueGroupSizes[i];
+        }
+        
+        uint32_t sizeLen = encodedSizes.size();
+        uint32_t keyLen = encodedKeys.size();
+        uint32_t numGroupsU32 = static_cast<uint32_t>(numGroups);
+        uint32_t bitmapLen = static_cast<uint32_t>(packedBitmap.size());
+        
+        // Format: [size_len][key_len][bitmap_len][total_value_len][num_groups]
+        //         [sizes][keys][bitmap][value_group_sizes...][value_groups...]
+        std::vector<uint8_t> result;
+        size_t headerSize = 5 * sizeof(uint32_t) + sizeLen + keyLen + bitmapLen +
+                            numGroups * sizeof(uint32_t);
+        result.resize(headerSize + totalValueLen);
+        
+        size_t offset = 0;
+        std::memcpy(result.data() + offset, &sizeLen, sizeof(uint32_t));
+        offset += sizeof(uint32_t);
+        std::memcpy(result.data() + offset, &keyLen, sizeof(uint32_t));
+        offset += sizeof(uint32_t);
+        std::memcpy(result.data() + offset, &bitmapLen, sizeof(uint32_t));
+        offset += sizeof(uint32_t);
+        std::memcpy(result.data() + offset, &totalValueLen, sizeof(uint32_t));
+        offset += sizeof(uint32_t);
+        std::memcpy(result.data() + offset, &numGroupsU32, sizeof(uint32_t));
+        offset += sizeof(uint32_t);
+        
+        // Write sizes
+        std::memcpy(result.data() + offset, encodedSizes.data().data(), sizeLen);
+        offset += sizeLen;
+        
+        // Write keys
+        std::memcpy(result.data() + offset, encodedKeys.data().data(), keyLen);
+        offset += keyLen;
+        
+        // Write presence bitmap
+        std::memcpy(result.data() + offset, packedBitmap.data(), bitmapLen);
+        offset += bitmapLen;
+        
+        // Write value group sizes
+        std::memcpy(result.data() + offset, valueGroupSizes.data(), numGroups * sizeof(uint32_t));
+        offset += numGroups * sizeof(uint32_t);
+        
+        // Write value groups
+        for (const auto& encoded : encodedValueGroups) {
+            std::memcpy(result.data() + offset, encoded.data().data(), encoded.size());
+            offset += encoded.size();
+        }
+        
+        size_t uncompressedSize = 0;
+        for (const auto& map : data) {
+            uncompressedSize += map.size() * (sizeof(K) + sizeof(V));
+        }
+        
+        return this->createEncodedData(std::move(result), data.size(), uncompressedSize, "MapGroupKeys");
+    }
+    
+    std::vector<MapType> decodeAll(const EncodedData& encoded) override {
+        if (encoded.empty()) {
+            return {};
+        }
+        
+        const uint8_t* data = encoded.data().data();
+        size_t offset = 0;
+        
+        // Read header
+        uint32_t sizeLen, keyLen, bitmapLen, totalValueLen, numGroups;
+        std::memcpy(&sizeLen, data + offset, sizeof(uint32_t));
+        offset += sizeof(uint32_t);
+        std::memcpy(&keyLen, data + offset, sizeof(uint32_t));
+        offset += sizeof(uint32_t);
+        std::memcpy(&bitmapLen, data + offset, sizeof(uint32_t));
+        offset += sizeof(uint32_t);
+        std::memcpy(&totalValueLen, data + offset, sizeof(uint32_t));
+        offset += sizeof(uint32_t);
+        std::memcpy(&numGroups, data + offset, sizeof(uint32_t));
+        offset += sizeof(uint32_t);
+        
+        // Decode sizes
+        std::vector<uint8_t> sizeBytes(data + offset, data + offset + sizeLen);
+        EncodingMetadata sizeMetadata;
+        sizeMetadata.encodingName = "SizeDecoder";
+        sizeMetadata.elementCount = encoded.metadata().elementCount;
+        EncodedData sizeData(std::move(sizeBytes), std::move(sizeMetadata));
+        auto sizes = this->decodeMapSizesWithCodec(sizeData, sizeCodec_);
+        offset += sizeLen;
+        
+        // Decode keys
+        std::vector<uint8_t> keyBytes(data + offset, data + offset + keyLen);
+        EncodingMetadata keyMetadata;
+        keyMetadata.encodingName = "KeyDecoder";
+        keyMetadata.elementCount = numGroups;
+        EncodedData keyData(std::move(keyBytes), std::move(keyMetadata));
+        auto uniqueKeys = keyEncoder_->decodeAll(keyData);
+        offset += keyLen;
+        
+        // Decode presence bitmap
+        std::vector<uint8_t> packedBitmap(data + offset, data + offset + bitmapLen);
+        offset += bitmapLen;
+        
+        // Read value group sizes
+        std::vector<uint32_t> valueGroupSizes(numGroups);
+        std::memcpy(valueGroupSizes.data(), data + offset, numGroups * sizeof(uint32_t));
+        offset += numGroups * sizeof(uint32_t);
+        
+        // Calculate group element counts from bitmap
+        std::vector<size_t> groupElementCounts(numGroups, 0);
+        for (size_t mapIdx = 0; mapIdx < sizes.size(); ++mapIdx) {
+            for (size_t groupIdx = 0; groupIdx < numGroups; ++groupIdx) {
+                size_t bitPosition = mapIdx * numGroups + groupIdx;
+                size_t byteIdx = bitPosition / 8;
+                size_t bitIdx = bitPosition % 8;
+                if (packedBitmap[byteIdx] & (1 << bitIdx)) {
+                    groupElementCounts[groupIdx]++;
+                }
+            }
+        }
+        
+        // Decode value groups with appropriate decoder
+        std::vector<std::vector<V>> valueGroups(numGroups);
+        for (size_t i = 0; i < numGroups; ++i) {
+            std::vector<uint8_t> groupBytes(data + offset, data + offset + valueGroupSizes[i]);
+            EncodingMetadata groupMetadata;
+            groupMetadata.encodingName = "ValueGroupDecoder";
+            groupMetadata.elementCount = groupElementCounts[i];
+            EncodedData groupData(std::move(groupBytes), std::move(groupMetadata));
+            
+            // Select decoder for this group
+            std::shared_ptr<Codec<V>> decoder;
+            if (usePerGroupEncoders_) {
+                const K& key = uniqueKeys[i];
+                auto it = valueEncoderMap_.find(key);
+                decoder = (it != valueEncoderMap_.end()) ? it->second : defaultValueEncoder_;
+            } else {
+                decoder = singleValueEncoder_;
+            }
+            
+            valueGroups[i] = decoder->decodeAll(groupData);
+            offset += valueGroupSizes[i];
+        }
+        
+        // Reconstruct maps
+        std::vector<MapType> result;
+        result.reserve(sizes.size());
+        
+        // Track current index in each value group
+        std::vector<size_t> groupIndices(numGroups, 0);
+        
+        for (size_t mapIdx = 0; mapIdx < sizes.size(); ++mapIdx) {
+            MapType map;
+            for (size_t groupIdx = 0; groupIdx < numGroups; ++groupIdx) {
+                size_t bitPosition = mapIdx * numGroups + groupIdx;
+                size_t byteIdx = bitPosition / 8;
+                size_t bitIdx = bitPosition % 8;
+                if (packedBitmap[byteIdx] & (1 << bitIdx)) {
+                    map[uniqueKeys[groupIdx]] = valueGroups[groupIdx][groupIndices[groupIdx]++];
+                }
+            }
+            result.push_back(std::move(map));
+        }
+        
+        return result;
+    }
+    
+    std::string name() const override {
+        if (usePerGroupEncoders_) {
+            return "MapGroupKeys_" + keyEncoder_->name() + "_PerGroup";
+        }
+        return "MapGroupKeys_" + keyEncoder_->name() + "_" + singleValueEncoder_->name();
+    }
+    
+private:
+    std::shared_ptr<Codec<K>> keyEncoder_;
+    std::shared_ptr<Codec<S>> sizeCodec_;
+    
+    // Single encoder mode
+    std::shared_ptr<Codec<V>> singleValueEncoder_;
+    
+    // Per-group encoder mode
+    std::map<K, std::shared_ptr<Codec<V>>> valueEncoderMap_;
+    std::shared_ptr<Codec<V>> defaultValueEncoder_;
+    bool usePerGroupEncoders_;
+};
 
 /**
- * @brief Strategy 4: Columnar layout with pairs, then dictionary encode
+ * @brief Strategy 8: Columnar with group indices
  * 
  * Transform to columnar layout (all keys together, all values together),
  * then encode as pairs.

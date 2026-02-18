@@ -144,16 +144,16 @@ int main() {
         std::cout << "Registered: MapGroupIndices\n";
     }
     
-    // ===== Strategy 7: Columnar with group indices (new) =====
-    {
-        auto keyEncoder = std::make_shared<RunLengthEncoder<K>>();
-        auto valueEncoder = std::make_shared<DictionaryEncoder<V>>();
-        auto sizeEncoder = std::make_shared<BitParenthesesEncoder<uint8_t>>();
-        auto encoder = std::make_shared<MapGroupIndicesEncoder<K, V, uint8_t>>(
-            keyEncoder, valueEncoder, sizeEncoder);
-        runner.registerEncoder(encoder->name(), encoder);
-        std::cout << "Registered: MapGroupIndices\n";
-    }
+    // // ===== Strategy 7: Columnar with group indices (new) =====
+    // {
+    //     auto keyEncoder = std::make_shared<RunLengthEncoder<K>>();
+    //     auto valueEncoder = std::make_shared<DictionaryEncoder<V>>();
+    //     auto sizeEncoder = std::make_shared<BitParenthesesEncoder<uint8_t>>();
+    //     auto encoder = std::make_shared<MapGroupIndicesEncoder<K, V, uint8_t>>(
+    //         keyEncoder, valueEncoder, sizeEncoder);
+    //     runner.registerEncoder(encoder->name(), encoder);
+    //     std::cout << "Registered: MapGroupIndices\n";
+    // }
     
     // ===== Strategy 8: Columnar with group indices (new) =====
     {
@@ -188,15 +188,49 @@ int main() {
         std::cout << "Registered: MapGroupIndices Delta RLE\n";
     }
 
-    // ===== Strategy 8: Columnar with group indices (new) =====
+    // // ===== Strategy 8: Columnar with group indices (new) =====
+    // {
+    //     auto keyEncoder = std::make_shared<DeltaRunLengthEncoder<K>>();
+    //     auto valueEncoder = std::make_shared<DictionaryEncoder<V>>();
+    //     auto sizeEncoder = std::make_shared<BitParenthesesEncoder<uint8_t>>();
+    //     auto encoder = std::make_shared<MapGroupIndicesEncoder<K, V, uint8_t>>(
+    //         keyEncoder, valueEncoder, sizeEncoder);
+    //     runner.registerEncoder(encoder->name(), encoder);
+    //     std::cout << "Registered: MapGroupIndices Delta RLE\n";
+    // }
+
+
+    // ===== Strategy 9: Columnar with group keys (new) =====
     {
         auto keyEncoder = std::make_shared<DeltaRunLengthEncoder<K>>();
         auto valueEncoder = std::make_shared<DictionaryEncoder<V>>();
-        auto sizeEncoder = std::make_shared<BitParenthesesEncoder<uint8_t>>();
-        auto encoder = std::make_shared<MapGroupIndicesEncoder<K, V, uint8_t>>(
+        auto sizeEncoder = std::make_shared<DeltaRunLengthEncoder<uint8_t>>();
+        auto encoder = std::make_shared<MapGroupKeysEncoder<K, V, uint8_t>>(
             keyEncoder, valueEncoder, sizeEncoder);
         runner.registerEncoder(encoder->name(), encoder);
-        std::cout << "Registered: MapGroupIndices Delta RLE\n";
+        std::cout << "Registered: MapGroupKeys Delta RLE\n";
+    }
+    
+    // ===== Strategy 9: Columnar with group keys (new) =====
+    {
+        auto keyEncoder = std::make_shared<DeltaRunLengthEncoder<K>>();
+        auto valueEncoder = std::make_shared<DictionaryEncoder<V>>();
+        auto sizeEncoder = std::make_shared<RunLengthEncoder<uint8_t>>();
+        auto encoder = std::make_shared<MapGroupKeysEncoder<K, V, uint8_t>>(
+            keyEncoder, valueEncoder, sizeEncoder);
+        runner.registerEncoder(encoder->name(), encoder);
+        std::cout << "Registered: MapGroupKeys RLE\n";
+    }
+
+    // ===== Strategy 9: Columnar with group keys (new) =====
+    {
+        auto keyEncoder = std::make_shared<DeltaRunLengthEncoder<K>>();
+        auto valueEncoder = std::make_shared<DictionaryEncoder<V>>();
+        auto sizeEncoder = std::make_shared<RawEncoder<uint8_t>>();
+        auto encoder = std::make_shared<MapGroupKeysEncoder<K, V, uint8_t>>(
+            keyEncoder, valueEncoder, sizeEncoder);
+        runner.registerEncoder(encoder->name(), encoder);
+        std::cout << "Registered: MapGroupKeys RLE\n";
     }
     
     std::cout << "\nTotal encoders registered: " << runner.getNumEncoders() << "\n\n";
