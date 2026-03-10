@@ -3,6 +3,8 @@
 #include <span>
 #include <vector>
 #include <unordered_map>
+
+#include <ankerl/unordered_dense.h>
 #include <cstring>
 #include <algorithm>
 #include "encodings/Encoder.hpp"
@@ -40,7 +42,7 @@ public:
         }
         
         // Build dictionary and encode keys
-        std::unordered_map<T, size_t> valueToKey;
+        ankerl::unordered_dense::map<T, size_t> valueToKey;
         std::vector<T> dictionary;
         std::vector<size_t> keys;
         keys.reserve(data.size());
