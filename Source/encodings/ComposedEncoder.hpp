@@ -23,15 +23,16 @@ namespace encodings {
  * @tparam FirstEncoder The first encoder to apply
  * @tparam SecondEncoder The second encoder to apply (operates on bytes)
  */
-template<typename T, typename FirstEncoder, typename SecondEncoder>
-    requires std::is_base_of_v<Encoder<T>, FirstEncoder> &&
-             std::is_base_of_v<Encoder<uint8_t>, SecondEncoder>
-class ComposedEncoder : public Codec<T> {
+template<typename TIn, typename TMid, typename TOut,
+ typename FirstEncoder, typename SecondEncoder>
+    requires std::is_base_of_v<Encoder<TIn, TMid>, FirstEncoder> &&
+             std::is_base_of_v<Encoder<TMid, TOut>, SecondEncoder>
+class ComposedEncoder : public Codec<TIn, TOut> {
 public:
     ComposedEncoder(FirstEncoder first, SecondEncoder second)
         : first_(std::move(first)), second_(std::move(second)) {}
-    
-    EncodedData encode(std::span<const T> data) override {
+
+    EncodedBuffer<TOut> encode(std::span<const TIn> data) override {
         // Apply first encoding
         auto intermediateEncoded = first_.encode(data);
         
@@ -42,6 +43,10 @@ public:
         auto& metadata = finalEncoded.metadata();
         metadata.encodingName = name();
         metadata.dataType = this->dataType();
+        metadata.encodedType = this->encodedType();
+        metadata.elementCount = data.size();
+        metadata.uncompressedSize = intermediateEncoded.size();
+        metadata.compressedSize = finalEncoded.size();
         metadata.customMetadata["first_encoding"] = first_.name();
         metadata.customMetadata["second_encoding"] = second_.name();
         metadata.customMetadata["intermediate_size"] = 
@@ -50,17 +55,24 @@ public:
         return finalEncoded;
     }
     
-    std::vector<T> decodeAll(const EncodedData& encoded) override {
+    std::vector<TIn> decodeAll(const EncodedBuffer<TOut>& encoded) override {
         // Reverse order: decode second, then first
         auto intermediateDecoded = second_.decodeAll(encoded);
         
         // Reconstruct intermediate EncodedData
-        EncodedData intermediate(std::move(intermediateDecoded), EncodingMetadata{});
+        EncodedData intermediate(std::move(intermediateDecoded), {
+            .encodingName = first_.name(),
+            .dataType = first_.encodedType(),
+            .encodedType = first_.dataType(),
+            .elementCount = 0, // Unknown at this stage
+            .compressedSize = intermediate.size(),
+            .uncompressedSize = 0, // Unknown at this stage
+        });
         
         return first_.decodeAll(intermediate);
     }
-    
-    std::optional<T> decodeAt(const EncodedData& encoded, size_t index) override {
+
+    std::optional<TIn> decodeAt(const EncodedBuffer<TOut>& encoded, size_t index) override {
         // Random access only works if both encoders support it
         if (!properties().has(EncodingProperty::RandomAccess)) {
             return std::nullopt;
@@ -72,13 +84,13 @@ public:
         if (index >= all.size()) return std::nullopt;
         return all[index];
     }
-    
-    std::vector<T> decodeRange(const EncodedData& encoded, size_t start, size_t end) override {
+
+    std::vector<TIn> decodeRange(const EncodedBuffer<TOut>& encoded, size_t start, size_t end) override {
         // Similar challenge - decode all and slice
         auto all = decodeAll(encoded);
         if (start >= all.size()) return {};
         end = std::min(end, all.size());
-        return std::vector<T>(all.begin() + start, all.begin() + end);
+        return std::vector<TIn>(all.begin() + start, all.begin() + end);
     }
     
     EncodingType encodingType() const override {
@@ -154,10 +166,11 @@ private:
  * 
  * Usage: auto composed = composeEncoders(deltaEncoder, rleEncoder);
  */
-template<typename T, typename First, typename Second>
+template<typename TIn, typename TMid, typename TOut,
+ typename First, typename Second>
 auto composeEncoders(First&& first, Second&& second) {
-    return ComposedEncoder<T, std::decay_t<First>, std::decay_t<Second>>(
-        std::forward<First>(first), 
+    return ComposedEncoder<TIn, TMid, TOut, std::decay_t<First>, std::decay_t<Second>>(
+        std::forward<First>(first),
         std::forward<Second>(second)
     );
 }
@@ -165,13 +178,14 @@ auto composeEncoders(First&& first, Second&& second) {
 /**
  * @brief Three-way composition helper
  */
-template<typename T, typename First, typename Second, typename Third>
+template<typename TIn, typename TMid1, typename TMid2, typename TOut,
+ typename First, typename Second, typename Third>
 auto composeEncoders(First&& first, Second&& second, Third&& third) {
-    auto firstTwo = composeEncoders<T>(
+    auto firstTwo = composeEncoders<TIn, TMid1, TMid2>(
         std::forward<First>(first), 
         std::forward<Second>(second)
     );
-    return composeEncoders<T>(
+    return composeEncoders<TIn, TMid2, TOut>(
         std::move(firstTwo), 
         std::forward<Third>(third)
     );
