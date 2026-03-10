@@ -57,12 +57,30 @@ target_include_directories(map_benchmarks_refactored
         ${CMAKE_SOURCE_DIR}/Source
 )
 
+# Create vector benchmark executable
+add_executable(vector_benchmarks
+    vector_benchmarks.cpp
+)
+
+target_link_libraries(vector_benchmarks
+    PRIVATE
+        encodings_core
+        encodings_encodings
+        encodings_generators
+        encodings_encoders
+        encodings_benchmark
+)
+
+target_include_directories(vector_benchmarks
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/Source
+)
 
 # Create results directory
 file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/benchmark_results)
 
 # Set output directory for the executables
-set_target_properties(run_benchmarks map_benchmarks map_benchmarks_refactored PROPERTIES
+set_target_properties(run_benchmarks map_benchmarks map_benchmarks_refactored vector_benchmarks PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 
