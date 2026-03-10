@@ -7,6 +7,9 @@
 #include <cmath>
 #include <memory>
 #include <algorithm>
+#include <numeric>
+#include <limits>
+#include <type_traits>
 #include "encodings/Encoder.hpp"
 #include "encodings/EncodedData.hpp"
 #include "encodings/EncodingProperty.hpp"
@@ -15,12 +18,49 @@
 #include "core/DataType.hpp"
 
 namespace encodings::encoders {
-
     using core::DataType;
     using core::PrimitiveType;
+    using core::FloatingPointType;
     using core::typeToDataType;
     using core::Vector32Type;
     using core::Float32Type;
+
+/**
+ * @brief Result of a magnitude encode-decode round-trip error measurement.
+ *
+ * All values are in long double so the caller can compare float/double/long double
+ * MagT variants on equal footing without any precision being lost in the result.
+ */
+struct MagnitudeErrorResult {
+    long double meanAbsoluteError  = 0.0L;  ///< Mean |m_hat - m| over all vectors
+    long double maxAbsoluteError   = 0.0L;  ///< Max  |m_hat - m|
+    long double meanRelativeError  = 0.0L;  ///< Mean |m_hat - m| / m  (skips m ≈ 0)
+};
+
+/**
+ * @brief Interface for encoders that can report magnitude round-trip errors.
+ *
+ * Only SphericalEncoder with normalizeToUnit=true implements this.  Callers
+ * dynamic_cast to this interface; a null result means the encoder does not
+ * store magnitudes.
+ */
+template<typename T>
+requires Vector32Type<T>
+class IMagnitudeErrorProvider {
+public:
+    virtual ~IMagnitudeErrorProvider() = default;
+
+    /**
+     * @brief Encode then decode @p data and measure the error in the stored magnitudes.
+     *
+     * The reference magnitude for each vector is computed in long double regardless
+     * of MagT, so the result faithfully shows the precision loss introduced by
+     * casting to MagT before storage.
+     */
+    virtual MagnitudeErrorResult computeMagnitudeErrors(
+        std::span<const T> data) const = 0;
+};
+
 
 /**
  * @brief Spherical coordinate encoding for vector types with compile-time dimension
@@ -43,9 +83,9 @@ namespace encodings::encoders {
  * @tparam T The vector32 type to encode (must be a contiguous range of float)
  * @tparam Dimension The dimensionality of the vectors (compile-time constant)
  */
-template<typename T, size_t Dimension>
-    requires Vector32Type<T> && (Dimension >= 2)
-class SphericalEncoder : public Codec<T> {
+template<typename T, size_t Dimension, typename MagT = float_t>
+    requires Vector32Type<T> && FloatingPointType<MagT> && (Dimension >= 2)
+class SphericalEncoder : public Codec<T>, public IMagnitudeErrorProvider<T> {
 public:
     static constexpr size_t dimension = Dimension;
     
@@ -58,10 +98,10 @@ public:
      */
     SphericalEncoder(
         std::shared_ptr<Codec<uint8_t>> angleCodec = nullptr,
-        std::shared_ptr<Codec<float>> magnitudeCodec = nullptr,
+        std::shared_ptr<Codec<MagT>> magnitudeCodec = nullptr,
         bool normalizeToUnit = false
     ) : angleCodec_(angleCodec ? angleCodec : std::make_shared<ZstdEncoder<uint8_t>>()), 
-        magnitudeCodec_(magnitudeCodec ? magnitudeCodec : std::make_shared<ZstdEncoder<float>>()),
+        magnitudeCodec_(magnitudeCodec ? magnitudeCodec : std::make_shared<ZstdEncoder<MagT>>()),
         normalizeToUnit_(normalizeToUnit) { }
 
     EncodedData encode(std::span<const T> data) override {
@@ -87,25 +127,40 @@ public:
         
         // Prepare vectors for processing
         std::vector<float> vectors(n * d);
-        std::vector<float> magnitudes;
+        std::vector<MagT> magnitudes;
         
         // Copy and optionally normalize input vectors
         if (normalizeToUnit_) {
             magnitudes.reserve(n);
             for (size_t i = 0; i < n; ++i) {
                 const T& vec = data[i];
-                double sumSq = 0.0;
+                long double sumSq = 0.0;
                 size_t idx = 0;
                 for (const auto& val : vec) {
                     if (idx >= d) break;
-                    sumSq += static_cast<double>(val) * val;
+                    sumSq += static_cast<long double>(val) * static_cast<long double>(val);
                     idx++;
                 }
-                float magnitude = static_cast<float>(std::sqrt(sumSq));
+                MagT magnitude = static_cast<MagT>(std::sqrt(sumSq));
                 magnitudes.push_back(magnitude);
-                
-                // Normalize and store
-                float invMag = (magnitude > 1e-10f) ? (1.0f / magnitude) : 0.0f;
+
+                // Compute a tolerance that depends on the magnitude type (MagT).
+                // Purpose: avoid division by zero or huge values when magnitude is extremely small.
+                // We pick sensible defaults for float/double and fall back to a numeric_limits-based
+                // heuristic for other floating types.
+                MagT zero_tol;
+                if constexpr (std::is_same_v<MagT, float>) {
+                    zero_tol = static_cast<MagT>(1e-10f);
+                } else if constexpr (std::is_same_v<MagT, double>) {
+                    // double has much smaller machine epsilon; use a smaller absolute tolerance
+                    zero_tol = static_cast<MagT>(1e-20);
+                } else {
+                    // Generic fallback: use a scaled machine epsilon
+                    zero_tol = std::numeric_limits<MagT>::epsilon() * static_cast<MagT>(100);
+                }
+
+                // Normalize and store (avoid division when magnitude is effectively zero)
+                MagT invMag = (magnitude > zero_tol) ? (static_cast<MagT>(1) / magnitude) : static_cast<MagT>(0);
                 idx = 0;
                 for (const auto& val : vec) {
                     if (idx >= d) break;
@@ -115,7 +170,7 @@ public:
             }
             
             // Encode magnitudes
-            EncodedData magnitudeEncoded = magnitudeCodec_->encode(std::span<const float>(magnitudes));
+            EncodedData magnitudeEncoded = magnitudeCodec_->encode(std::span<const MagT>(magnitudes));
             const auto& magData = magnitudeEncoded.data();
             
             // Write magnitude data size (8 bytes)
@@ -193,7 +248,7 @@ public:
         bool wasNormalized = (flags & 0x01) != 0;
         
         // Read magnitudes if present
-        std::vector<float> magnitudes;
+        std::vector<MagT> magnitudes;
         if (wasNormalized) {
             uint64_t magSize;
             std::memcpy(&magSize, data + offset, sizeof(uint64_t));
@@ -202,8 +257,8 @@ public:
             // Create EncodedData for magnitudes
             EncodedData magnitudeEncoded;
             magnitudeEncoded.data().assign(data + offset, data + offset + magSize);
-            magnitudeEncoded.metadata().dataType = core::DataType::Float32;
-            magnitudeEncoded.metadata().uncompressedSize = encoded.metadata().elementCount * sizeof(float);
+            magnitudeEncoded.metadata().dataType = typeToDataType<MagT>;
+            magnitudeEncoded.metadata().uncompressedSize = encoded.metadata().elementCount * core::dataTypeSize(typeToDataType<MagT>);
             magnitudeEncoded.metadata().elementCount = encoded.metadata().elementCount;
             offset += magSize;
             
@@ -253,10 +308,10 @@ public:
                 vec.resize(d);
             }
             
-            float mag = wasNormalized ? magnitudes[i] : 1.0f;
+            long double mag = wasNormalized ? static_cast<long double>(magnitudes[i]) : static_cast<long double>(1.0f);
             size_t idx = 0;
             for (auto it = vec.begin(); it != vec.end() && idx < d; ++it, ++idx) {
-                *it = vectors[i * d + idx] * mag;
+                *it = static_cast<typename T::value_type>(vectors[i * d + idx] * mag);
             }
             result[i] = vec;
         }
@@ -293,6 +348,7 @@ public:
         std::string baseName = "SphericalEncoder";
         if (normalizeToUnit_) {
             baseName += "_Normalized";
+            baseName += "_MagCodec(" + magnitudeCodec_->name() + "_" + core::dataTypeToString(core::typeToDataType<MagT>) + ")";
         }
         return baseName;
     }
@@ -316,16 +372,70 @@ public:
         size_t angleSize = elementCount * (d - 1) * sizeof(float);
         
         if (normalizeToUnit_) {
-            size_t magSize = sizeof(uint64_t) + elementCount * sizeof(float);
+            size_t magSize = sizeof(uint64_t) + elementCount * core::dataTypeSize(typeToDataType<MagT>);
             return baseSize + magSize + angleSize;
         }
         
         return baseSize + angleSize;
     }
     
+    /**
+     * @brief Measure the error introduced by storing magnitudes as MagT.
+     *
+     * For each vector the "true" magnitude is computed in long double.  It is then
+     * cast to MagT (simulating what encode() does), cast back to long double, and
+     * the absolute and relative differences are accumulated.  The angle pipeline is
+     * NOT exercised here — this metric is purely about magnitude precision.
+     *
+     * Only meaningful when normalizeToUnit_ == true; returns zeros otherwise.
+     */
+    MagnitudeErrorResult computeMagnitudeErrors(
+        std::span<const T> data) const override
+    {
+        MagnitudeErrorResult result{};
+        if (!normalizeToUnit_ || data.empty()) return result;
+
+        constexpr size_t d = Dimension;
+        size_t n = data.size();
+        long double sumAbs = 0.0L, sumRel = 0.0L;
+        size_t relCount = 0;
+
+        for (size_t i = 0; i < n; ++i) {
+            const T& vec = data[i];
+
+            // Reference magnitude in long double
+            long double sumSq = 0.0L;
+            size_t idx = 0;
+            for (const auto& val : vec) {
+                if (idx++ >= d) break;
+                sumSq += static_cast<long double>(val) * static_cast<long double>(val);
+            }
+            long double trueMag = std::sqrt(sumSq);
+
+            // Simulate the cast to MagT and back
+            MagT stored   = static_cast<MagT>(trueMag);
+            long double retrieved = static_cast<long double>(stored);
+
+            long double absErr = std::fabs(retrieved - trueMag);
+            sumAbs += absErr;
+            result.maxAbsoluteError = std::max(result.maxAbsoluteError, absErr);
+
+            if (trueMag > 1e-30L) {
+                sumRel += absErr / trueMag;
+                ++relCount;
+            }
+        }
+
+        result.meanAbsoluteError = sumAbs / static_cast<long double>(n);
+        result.meanRelativeError = (relCount > 0)
+            ? sumRel / static_cast<long double>(relCount)
+            : 0.0L;
+        return result;
+    }
+
 private:
     std::shared_ptr<Codec<uint8_t>> angleCodec_;
-    std::shared_ptr<Codec<float>> magnitudeCodec_;
+    std::shared_ptr<Codec<MagT>> magnitudeCodec_;
     bool normalizeToUnit_;
 
     /**
