@@ -1,5 +1,17 @@
 # Encoders library - concrete encoder implementations
 
+# ---------------------------------------------------------------------------
+# ankerl::unordered_dense  (header-only, faster than std::unordered_map)
+# ---------------------------------------------------------------------------
+include(FetchContent)
+FetchContent_Declare(
+    unordered_dense
+    GIT_REPOSITORY https://github.com/martinus/unordered_dense.git
+    GIT_TAG        v4.5.0
+    GIT_SHALLOW    TRUE
+)
+FetchContent_MakeAvailable(unordered_dense)
+
 find_package(ZSTD QUIET)
 if(NOT ZSTD_FOUND)
     # Try pkg-config as a fallback (Debian/Ubuntu libzstd-dev provides zstd.pc)
@@ -48,6 +60,9 @@ target_sources(encodings_encoders INTERFACE
         ZstdEncoder.hpp
         SphericalEncoder.hpp
         MapEncoders.hpp
+        SubIntEncoder.hpp
+        VarIntEncoder.hpp
+        DeltaVarIntEncoder.hpp
 )
 
 target_include_directories(encodings_encoders INTERFACE
@@ -59,6 +74,7 @@ target_link_libraries(encodings_encoders INTERFACE
     encodings_core
     encodings_encodings
     ZSTD::libzstd
+    unordered_dense
 )
 
 target_compile_features(encodings_encoders INTERFACE cxx_std_23)

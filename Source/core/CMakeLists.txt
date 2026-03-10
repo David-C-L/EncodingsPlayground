@@ -10,6 +10,7 @@ target_sources(encodings_core PUBLIC
     FILES
         DataType.hpp
         Bitset.hpp
+        BitPacker.hpp
 )
 
 target_include_directories(encodings_core PUBLIC
