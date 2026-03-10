@@ -19,8 +19,11 @@ namespace encodings {
         BitPacking,
         Zstd,
         SphericalEncoding,
-        Composed,      // Sequential composition (e.g., Delta | RLE)
-        Structural     // Structural composition (e.g., different encoders per field)
+        SubIntEncoding,  // Sub-integer byte-group dictionary + bit-packing
+        VarIntEncoding,      // LEB128 variable-length integer with optional ZigZag
+        DeltaVarIntEncoding, // Delta pre-pass then LEB128 VarInt
+        Composed,            // Sequential composition (e.g., Delta | RLE)
+        Structural       // Structural composition (e.g., different encoders per field)
     };
 
     /** Convert EncodingType enum to human-readable string */
@@ -33,6 +36,9 @@ namespace encodings {
             case EncodingType::BitPacking:           return "BitPacking";
             case EncodingType::Zstd:                 return "Zstd";
             case EncodingType::SphericalEncoding:    return "SphericalEncoding";
+            case EncodingType::SubIntEncoding:       return "SubIntEncoding";
+            case EncodingType::VarIntEncoding:       return "VarIntEncoding";
+            case EncodingType::DeltaVarIntEncoding:  return "DeltaVarIntEncoding";
             case EncodingType::Composed:             return "Composed";
             case EncodingType::Structural:           return "Structural";
         }

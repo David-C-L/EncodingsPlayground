@@ -21,6 +21,7 @@ struct EncodingMetadata {
     size_t uncompressedSize;
     bool supportsRandomAccess;
     
+    DataType encodedType = DataType::UInt8; // Default to byte-oriented encoding, can be overridden for other encodings
     // Additional encoding-specific metadata can be stored here
     std::map<std::string, std::string> customMetadata;
     
@@ -49,23 +50,27 @@ struct EncodingMetadata {
  * This class holds the raw encoded bytes along with metadata about
  * the encoding scheme used and the original data characteristics.
  */
-class EncodedData {
+template<typename TOut>
+class EncodedBuffer {
 public:
-    EncodedData() = default;
-    
-    explicit EncodedData(std::vector<uint8_t> data, EncodingMetadata metadata)
+    EncodedBuffer() = default;
+
+    explicit EncodedBuffer(std::vector<TOut> data, EncodingMetadata metadata)
         : data_(std::move(data)), metadata_(std::move(metadata)) {}
     
     // Access to encoded bytes
-    const std::vector<uint8_t>& data() const { return data_; }
-    std::vector<uint8_t>& data() { return data_; }
+    const std::vector<TOut>& data() const { return data_; }
+    std::vector<TOut>& data() { return data_; }
     
     // Access to metadata
     const EncodingMetadata& metadata() const { return metadata_; }
     EncodingMetadata& metadata() { return metadata_; }
     
     // Size information
-    size_t size() const { return data_.size(); }
+    size_t size() const {
+        auto typeSize = core::dataTypeSize(core::typeToDataType<TOut>);
+        return data_.size() * typeSize;
+    }
     bool empty() const { return data_.empty(); }
     
     // Utility methods
@@ -73,8 +78,10 @@ public:
     void clear() { data_.clear(); }
     
 private:
-    std::vector<uint8_t> data_;
+    std::vector<TOut> data_;
     EncodingMetadata metadata_;
 };
+
+using EncodedData = EncodedBuffer<uint8_t>;
 
 } // namespace encodings

@@ -20,9 +20,10 @@ namespace encodings {
 /**
  * @brief Abstract base class for encoding strategies
  * 
- * @tparam T The type of data to encode (e.g., int32_t, std::string)
+ * @tparam TIn The type of data to encode (e.g., int32_t, std::string)
+ * @tparam TOut The type of data produced by the encoder (default is uint8_t for byte-oriented encodings)
  */
-template<typename T>
+template<typename TIn, typename TOut = uint8_t>
 class Encoder {
 public:
     virtual ~Encoder() = default;
@@ -36,7 +37,7 @@ public:
      * @note std::span is passed by value following C++ standard library conventions.
      *       The underlying data is not copied; span is merely a view (pointer + size).
      */
-    virtual EncodedData encode(std::span<const T> data) = 0;
+    virtual EncodedBuffer<TOut> encode(std::span<const TIn> data) = 0;
     
     /**
      * @brief Get the encoding type of this encoding scheme
@@ -60,9 +61,22 @@ public:
      * @brief Get the data type this encoder handles
      */
     virtual DataType dataType() const {
-        if constexpr (PrimitiveType<T>) {
-            return typeToDataType<T>;
-        } else if constexpr (core::MapType<T>) {
+        if constexpr (PrimitiveType<TIn>) {
+            return typeToDataType<TIn>;
+        } else if constexpr (core::MapType<TIn>) {
+            return DataType::Map;
+        } else {
+            return DataType::Array; // Default for composite types
+        }
+    }
+
+    /**
+     * @brief Get the data type this encoder produces
+     */
+    virtual DataType encodedType() const {
+        if constexpr (PrimitiveType<TOut>) {
+            return typeToDataType<TOut>;
+        } else if constexpr (core::MapType<TOut>) {
             return DataType::Map;
         } else {
             return DataType::Array; // Default for composite types
@@ -86,7 +100,7 @@ public:
  * 
  * @tparam T The type of data to decode
  */
-template<typename T>
+template<typename TIn, typename TOut = uint8_t>
 class Decoder {
 public:
     virtual ~Decoder() = default;
@@ -97,7 +111,7 @@ public:
      * @param encoded The encoded data to decode
      * @return Vector containing all decoded elements
      */
-    virtual std::vector<T> decodeAll(const EncodedData& encoded) = 0;
+    virtual std::vector<TIn> decodeAll(const EncodedBuffer<TOut>& encoded) = 0;
     
     /**
      * @brief Decode a single element at a specific index (random access)
@@ -106,7 +120,7 @@ public:
      * @param index Index of the element to decode
      * @return The decoded element, or std::nullopt if index is out of bounds
      */
-    virtual std::optional<T> decodeAt(const EncodedData& encoded, size_t index) = 0;
+    virtual std::optional<TIn> decodeAt(const EncodedBuffer<TOut>& encoded, size_t index) = 0;
     
     /**
      * @brief Decode a range of elements (batch random access)
@@ -116,7 +130,7 @@ public:
      * @param end Ending index (exclusive)
      * @return Vector containing decoded elements in the range
      */
-    virtual std::vector<T> decodeRange(const EncodedData& encoded, size_t start, size_t end) = 0;
+    virtual std::vector<TIn> decodeRange(const EncodedBuffer<TOut>& encoded, size_t start, size_t end) = 0;
     
     /**
      * @brief Get the encoding type of this decoding scheme (should match encoder)
@@ -138,9 +152,22 @@ public:
      * @brief Get the data type this decoder handles
      */
     virtual DataType dataType() const {
-        if constexpr (PrimitiveType<T>) {
-            return typeToDataType<T>;
-        } else if constexpr (core::MapType<T>) {
+        if constexpr (PrimitiveType<TIn>) {
+            return typeToDataType<TIn>;
+        } else if constexpr (core::MapType<TIn>) {
+            return DataType::Map;
+        } else {
+            return DataType::Array; // Default for composite types
+        }
+    }
+
+    /**
+     * @brief Get the data type this decoder expects as input (encoded type)
+     */
+    virtual DataType encodedType() const {
+        if constexpr (PrimitiveType<TOut>) {
+            return typeToDataType<TOut>;
+        } else if constexpr (core::MapType<TOut>) {
             return DataType::Map;
         } else {
             return DataType::Array; // Default for composite types
@@ -156,16 +183,16 @@ public:
  * 
  * @tparam T The type of data to encode/decode
  */
-template<typename T>
-class Codec : public Encoder<T>, public Decoder<T> {
+template<typename TIn, typename TOut = uint8_t>
+class Codec : public Encoder<TIn, TOut>, public Decoder<TIn, TOut> {
 public:
     virtual ~Codec() = default;
     
     // Inherit from both Encoder and Decoder
-    using Encoder<T>::encode;
-    using Decoder<T>::decodeAll;
-    using Decoder<T>::decodeAt;
-    using Decoder<T>::decodeRange;
+    using Encoder<TIn, TOut>::encode;
+    using Decoder<TIn, TOut>::decodeAll;
+    using Decoder<TIn, TOut>::decodeAt;
+    using Decoder<TIn, TOut>::decodeRange;
 
     // Single encodingType() implementation for both interfaces
     EncodingType encodingType() const override = 0;
@@ -178,11 +205,24 @@ public:
     
     // Single dataType() implementation for both interfaces
     DataType dataType() const override {
-        if constexpr (PrimitiveType<T>) {
-            return typeToDataType<T>;
-        } else if constexpr (core::MapType<T>) {
+        if constexpr (PrimitiveType<TIn>) {
+            return typeToDataType<TIn>;
+        } else if constexpr (core::MapType<TIn>) {
             return DataType::Map;
-        } else if constexpr (core::Vector32Type<T>) {
+        } else if constexpr (core::Vector32Type<TIn>) {
+            return DataType::Vector32;
+        } else {
+            return DataType::Array; // Default for composite types
+        }
+    }
+
+    // Single encodedType() implementation for both interfaces
+    DataType encodedType() const override {
+        if constexpr (PrimitiveType<TOut>) {
+            return typeToDataType<TOut>;
+        } else if constexpr (core::MapType<TOut>) {
+            return DataType::Map;
+        } else if constexpr (core::Vector32Type<TOut>) {
             return DataType::Vector32;
         } else {
             return DataType::Array; // Default for composite types
