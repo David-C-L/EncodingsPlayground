@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <stdfloat>
 #include <string>
 #include <variant>
 #include <vector>
@@ -28,6 +29,7 @@ enum class DataType {
     // Floating point types
     Float32,
     Float64,
+    Float128, // For internal calculations (e.g., magnitude in SphericalEncoder)
     
     // Other primitives
     Bool,
@@ -57,6 +59,7 @@ constexpr const char* dataTypeToString(DataType type) {
         case DataType::UInt64:  return "UInt64";
         case DataType::Float32: return "Float32";
         case DataType::Float64: return "Float64";
+        case DataType::Float128: return "Float128";
         case DataType::Bool:    return "Bool";
         case DataType::String:  return "String";
         case DataType::Array:   return "Array";
@@ -86,6 +89,8 @@ constexpr size_t dataTypeSize(DataType type) {
         case DataType::UInt64:
         case DataType::Float64:
             return 8;
+        case DataType::Float128:
+            return 16;
         case DataType::String:
         case DataType::Array:
         case DataType::Map:
@@ -185,6 +190,7 @@ template<> struct TypeToDataType<uint32_t> { static constexpr DataType value = D
 template<> struct TypeToDataType<uint64_t> { static constexpr DataType value = DataType::UInt64; };
 template<> struct TypeToDataType<float>    { static constexpr DataType value = DataType::Float32; };
 template<> struct TypeToDataType<double>   { static constexpr DataType value = DataType::Float64; };
+template<> struct TypeToDataType<long double>{ static constexpr DataType value = DataType::Float128; }; // FOR INTERNAL USE (TODO: UPDATE TO FLOAT128 SOMEHOW)
 template<> struct TypeToDataType<bool>     { static constexpr DataType value = DataType::Bool; };
 template<> struct TypeToDataType<std::string> { static constexpr DataType value = DataType::String; };
 
