@@ -1,10 +1,17 @@
 #include "benchmark/BenchmarkRunner.hpp"
 #include "benchmark/BenchmarkOutput.hpp"
 #include "generators/CommonGenerators.hpp"
+#include "generators/ParquetColumnGenerator.hpp"
+#include "generators/GeneratorUtils.hpp"
+#include "generators/SnowflakeIDGenerator.hpp"
 #include "encoders/RawEncoder.hpp"
 #include "encoders/RunLengthEncoder.hpp"
+#include "encoders/DeltaRunLengthEncoder.hpp"
+#include "encoders/SubIntEncoder.hpp"
 #include "encoders/DeltaEncoder.hpp"
 #include "encoders/DictionaryEncoder.hpp"
+#include "encoders/VarIntEncoder.hpp"
+#include "encoders/DeltaVarIntEncoder.hpp"
 #include "encodings/ComposedEncoder.hpp"
 #include <iostream>
 
@@ -18,27 +25,40 @@ int main() {
     
     // Configure benchmarks
     BenchmarkConfig config;
-    config.dataSizes = {1000, 10000, 100000};
-    config.iterations = 5;
-    config.warmupRuns = 2;
-    config.randomAccessSamples = 100;
-    config.stridedAccessSamples = 100;
-    config.stride = 10;
-    config.rangeQueryCount = 10;
-    config.rangeSizes = {10, 100, 1000};
+    config.dataSizes = {10000000};
+    config.iterations = 1;
+    config.warmupRuns = 0;
+    config.randomAccessSamples = 10000;
+    config.stridedAccessSamples = 1000;
+    config.stride = 100;
+    config.rangeQueryCount = 100;
+    config.rangeSizes = {65536};
     config.validateCorrectness = true;
     config.validateRandomAccess = true;
     config.verboseOutput = true;
     
     // Create benchmark runner
     BenchmarkRunner<int32_t> runner(config);
-    
+
+    // SubInt Configs
+    SubIntConfig subIntConfig13;
+    subIntConfig13.splitMode = SplitMode::Split13;
+    SubIntConfig subIntConfig22;
+    subIntConfig22.splitMode = SplitMode::Split22;
+    SubIntConfig subIntConfig31;
+    subIntConfig31.splitMode = SplitMode::Split31;
+
     // Register encoders
     std::cout << "Registering encoders..." << std::endl;
     runner.registerEncoder("Raw", std::make_shared<RawEncoder<int32_t>>());
-    runner.registerEncoder("RLE", std::make_shared<RunLengthEncoder<int32_t>>());
-    runner.registerEncoder("Delta", std::make_shared<DeltaEncoder<int32_t>>());
+    // runner.registerEncoder("RLE", std::make_shared<RunLengthEncoder<int32_t>>());
+    // runner.registerEncoder("DeltaRLE", std::make_shared<DeltaRunLengthEncoder<int32_t>>());
+    runner.registerEncoder("SubInt13", std::make_shared<SubIntEncoder>(subIntConfig13));
+    runner.registerEncoder("SubInt22", std::make_shared<SubIntEncoder>(subIntConfig22));
+    runner.registerEncoder("SubInt31", std::make_shared<SubIntEncoder>(subIntConfig31));
     runner.registerEncoder("Dictionary", std::make_shared<DictionaryEncoder<int32_t>>());
+    runner.registerEncoder("VarInt", std::make_shared<VarIntEncoder<int32_t>>());
+    runner.registerEncoder("DeltaVarInt", std::make_shared<DeltaVarIntEncoder<int32_t>>());
     
     // TODO: Add composed encoder example (requires encoders that work on bytes)
     // For now, we benchmark individual encoders
@@ -48,31 +68,51 @@ int main() {
     // Register datasets
     std::cout << "Registering data generators..." << std::endl;
     
-    // Sequential data (great for Delta)
-    runner.addDataset("Sequential", 
-        std::make_shared<SequentialGenerator<int32_t>>(0, 1));
+    // GBIF occurrence counts (real-world data with a mix of patterns)
+    std::filesystem::path dataDir = "/home/david/Documents/PhD/symbol-store/EncodingsPlayground/Datasets/iNaturalist_species_ids.parquet";
+    std::string columnName = "species_id";
+    runner.addDataset("GBIF Occurrences", 
+        std::make_shared<ParquetColumnGenerator<int32_t>>(dataDir, columnName));
     
-    // Repetitive data (great for RLE)
-    runner.addDataset("Repetitive", 
-        std::make_shared<RepetitiveGenerator<int32_t>>(20, 0, 50));
+    runner.addDataset("Instagram Snowflake IDs", 
+        std::make_shared<SnowflakeIDGenerator<int32_t>>(INSTAGRAM_SNOWFLAKE_INT_CONFIG, 127, 42, 0.05)
+    );
+
+    auto parquetGen = ParquetColumnGenerator<int32_t>(dataDir, columnName);
+    auto histogram = computeHistogram<int32_t>(parquetGen, 10000000);
+    std::filesystem::path histogramPath = config.outputPath + "/gbif_species_id_histogram.csv";
+    writeHistogramCSV(histogram, histogramPath);
+
+    auto snowflakeGen = SnowflakeIDGenerator<int32_t>(INSTAGRAM_SNOWFLAKE_INT_CONFIG, 127, 42, 0.05);
+    auto histogramSnowflake = computeHistogram<int32_t>(snowflakeGen, 10000000);
+    std::filesystem::path histogramPathSnowflake = config.outputPath + "/instagram_snowflake_id_histogram.csv";
+    writeHistogramCSV(histogramSnowflake, histogramPathSnowflake);
     
-    // Low cardinality (great for Dictionary)
-    runner.addDataset("Zipfian", 
-        std::make_shared<ZipfianGenerator<int32_t>>(100, 1.5));
+    // // Sequential data (great for Delta)
+    // runner.addDataset("Sequential", 
+    //     std::make_shared<SequentialGenerator<int32_t>>(0, 1));
     
-    // Random data (nothing helps much)
-    runner.addDataset("Random", 
-        std::make_shared<UniformRandomGenerator<int32_t>>(
-            std::numeric_limits<int32_t>::min() / 2,
-            std::numeric_limits<int32_t>::max() / 2));
+    // // Repetitive data (great for RLE)
+    // runner.addDataset("Repetitive", 
+    //     std::make_shared<RepetitiveGenerator<int32_t>>(20, 0, 50));
     
-    // Nearly sorted (good for Delta)
-    runner.addDataset("NearlySorted", 
-        std::make_shared<NearlySortedGenerator<int32_t>>(0, 1, 0.05));
+    // // Low cardinality (great for Dictionary)
+    // runner.addDataset("Zipfian", 
+    //     std::make_shared<ZipfianGenerator<int32_t>>(100, 1.5));
     
-    // Constant (best for RLE)
-    runner.addDataset("Constant", 
-        std::make_shared<ConstantGenerator<int32_t>>(42));
+    // // Random data (nothing helps much)
+    // runner.addDataset("Random", 
+    //     std::make_shared<UniformRandomGenerator<int32_t>>(
+    //         std::numeric_limits<int32_t>::min() / 2,
+    //         std::numeric_limits<int32_t>::max() / 2));
+    
+    // // Nearly sorted (good for Delta)
+    // runner.addDataset("NearlySorted", 
+    //     std::make_shared<NearlySortedGenerator<int32_t>>(0, 1, 0.05));
+    
+    // // Constant (best for RLE)
+    // runner.addDataset("Constant", 
+    //     std::make_shared<ConstantGenerator<int32_t>>(42));
 
     std::cout << "Registered " << runner.getNumDatasets() << " datasets\n" << std::endl;
 
@@ -124,11 +164,11 @@ int main() {
     }
     
     // Find fastest encoders
-    std::cout << "\nFastest Encoding (100k elements):\n";
+    std::cout << "\nFastest Encoding (10m elements):\n";
     std::map<std::string, std::pair<std::string, double>> fastestEncode;
     
     for (const auto& result : results.results) {
-        if (result.dataSize == 100000) {
+        if (result.dataSize == 10000000) {
             double elemPerSec = result.metrics.timing.encodeElementsPerSecond;
             auto& fastest = fastestEncode[result.datasetName];
             
