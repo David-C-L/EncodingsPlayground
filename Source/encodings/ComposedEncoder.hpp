@@ -56,19 +56,24 @@ public:
     }
     
     std::vector<TIn> decodeAll(const EncodedBuffer<TOut>& encoded) override {
-        // Reverse order: decode second, then first
+        // Reverse order: decode second, then first.
         auto intermediateDecoded = second_.decodeAll(encoded);
-        
-        // Reconstruct intermediate EncodedData
-        EncodedData intermediate(std::move(intermediateDecoded), {
-            .encodingName = first_.name(),
-            .dataType = first_.encodedType(),
-            .encodedType = first_.dataType(),
-            .elementCount = 0, // Unknown at this stage
-            .compressedSize = intermediate.size(),
-            .uncompressedSize = 0, // Unknown at this stage
-        });
-        
+
+        // Build the intermediate EncodedBuffer<TMid> to pass back to first_.
+        // Compute size before the move so we don't read from a moved-from object.
+        const size_t midSize = intermediateDecoded.size() * sizeof(TMid);
+        const size_t midCount = intermediateDecoded.size();
+
+        EncodingMetadata midMeta;
+        midMeta.encodingName     = first_.name();
+        midMeta.dataType         = first_.encodedType();
+        midMeta.encodedType      = first_.dataType();
+        midMeta.elementCount     = midCount;
+        midMeta.compressedSize   = midSize;
+        midMeta.uncompressedSize = 0;
+
+        EncodedBuffer<TMid> intermediate(std::move(intermediateDecoded),
+                                         std::move(midMeta));
         return first_.decodeAll(intermediate);
     }
 
