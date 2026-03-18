@@ -4,6 +4,7 @@
 #include <array>
 #include <bit>
 #include <cassert>
+#include <concepts>
 #include <cstdint>
 #include <cstring>
 #include <iomanip>
@@ -13,6 +14,21 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+
+// ---------------------------------------------------------------------------
+// Optional debug output.
+// Define SUBINT_DEBUG=1 before including this header (or via -DSUBINT_DEBUG=1)
+// to enable per-element encode/decode trace prints.
+// ---------------------------------------------------------------------------
+#ifndef SUBINT_DEBUG
+#  define SUBINT_DEBUG 0
+#endif
+
+#if SUBINT_DEBUG
+#  define SUBINT_DBG(...)  do { std::cerr << "[SubInt] " << __VA_ARGS__ << "\n"; } while(0)
+#else
+#  define SUBINT_DBG(...)  do {} while(0)
+#endif
 
 #include <ankerl/unordered_dense.h>
 #include <vector>
@@ -40,42 +56,77 @@ using HashSet = ankerl::unordered_dense::set<K>;
 // ============================================================================
 
 /**
- * @brief Which byte split to apply to each int32_t.
+ * @brief Describes a two-group byte split of an integer.
  *
- *  Split13  ->  [byte 0]        | [bytes 1-3]      (1-byte left,  3-byte right)
- *  Split22  ->  [bytes 0-1]     | [bytes 2-3]      (2-byte left,  2-byte right)
- *  Split31  ->  [bytes 0-2]     | [byte 3]         (3-byte left,  1-byte right)
+ * For a 4-byte (int32_t) integer, valid splits are:
+ *   {1,3}, {2,2}, {3,1}
+ *
+ * For an 8-byte (int64_t) integer, valid splits are:
+ *   {1,7}, {2,6}, {3,5}, {4,4}, {5,3}, {6,2}, {7,1}
  *
  * "left" always refers to the lower-address (little-endian) bytes.
+ * The encoder validates at construction that leftBytes + rightBytes == sizeof(T).
  */
-enum class SplitMode : uint8_t {
-    Split13 = 0,   // 1-byte left  | 3-byte right
-    Split22 = 1,   // 2-byte left  | 2-byte right
-    Split31 = 2,   // 3-byte left  | 1-byte right
+struct SplitMode {
+    uint8_t leftBytes;   ///< bytes in the left  (low)  group
+    uint8_t rightBytes;  ///< bytes in the right (high) group
+
+    constexpr bool operator==(const SplitMode&) const noexcept = default;
 };
+
+// ---- Named helpers for int32_t splits ------------------------------------
+inline constexpr SplitMode Split13() noexcept { return {1, 3}; }
+inline constexpr SplitMode Split22() noexcept { return {2, 2}; }
+inline constexpr SplitMode Split31() noexcept { return {3, 1}; }
+
+// ---- Named helpers for int64_t splits ------------------------------------
+inline constexpr SplitMode Split17() noexcept { return {1, 7}; }
+inline constexpr SplitMode Split26() noexcept { return {2, 6}; }
+inline constexpr SplitMode Split35() noexcept { return {3, 5}; }
+inline constexpr SplitMode Split44() noexcept { return {4, 4}; }
+inline constexpr SplitMode Split53() noexcept { return {5, 3}; }
+inline constexpr SplitMode Split62() noexcept { return {6, 2}; }
+inline constexpr SplitMode Split71() noexcept { return {7, 1}; }
 
 /**
  * @brief Maximum code widths (bits) by group size in bytes.
  *
- *  1-byte group  -> max 4 bits  (can address up to 16 distinct values)
- *  2-byte group  -> max 8 bits  (can address up to 256 distinct values)
- *  3-byte group  -> max 16 bits (can address up to 65536 distinct values)
+ *  1-byte group  ->  4 bits  (up to     16 distinct values)
+ *  2-byte group  ->  8 bits  (up to    256 distinct values)
+ *  3-byte group  -> 16 bits  (up to 65 536 distinct values)
+ *  4-byte group  -> 16 bits  (up to 65 536 distinct values)
+ *  5-byte group  -> 32 bits  (up to ~4 billion — uses HashMap for lookup)
+ *  6-byte group  -> 32 bits
+ *  7-byte group  -> 32 bits
  */
 static constexpr uint32_t kMaxCodeWidth1 =  4;
 static constexpr uint32_t kMaxCodeWidth2 =  8;
 static constexpr uint32_t kMaxCodeWidth3 = 16;
+static constexpr uint32_t kMaxCodeWidth4 = 16;
+static constexpr uint32_t kMaxCodeWidth5 = 32;
+static constexpr uint32_t kMaxCodeWidth6 = 32;
+static constexpr uint32_t kMaxCodeWidth7 = 32;
 
 /**
- * @brief User-supplied fixed code widths (overrides adaptive selection).
+ * @brief Configuration for SubIntEncoder<T>.
  *
- * Set a field to 0 to request adaptive selection for that group.
- * Width must be a power-of-two number of bits in {1, 2, 4, 8, 16}.
+ * @tparam T  int32_t or int64_t — controls which SplitMode values are legal
+ *            and what the default split is.
+ *
+ * The encoder throws std::invalid_argument at construction time if
+ * splitMode.leftBytes + splitMode.rightBytes != sizeof(T).
  */
+template <typename T>
+    requires (std::is_same_v<T, int32_t> || std::is_same_v<T, int64_t>)
 struct SubIntConfig {
-    SplitMode   splitMode       = SplitMode::Split22;
-    uint32_t    leftCodeWidth   = 0;   ///< 0 = adaptive
-    uint32_t    rightCodeWidth  = 0;   ///< 0 = adaptive
-    BitOrder    bitOrder        = BitOrder::LSB;
+    /// Default split: {2,2} for int32_t, {4,4} for int64_t.
+    SplitMode splitMode = []() -> SplitMode {
+        if constexpr (std::is_same_v<T, int32_t>) return Split22();
+        else                                        return Split44();
+    }();
+    uint32_t  leftCodeWidth  = 0;   ///< 0 = adaptive
+    uint32_t  rightCodeWidth = 0;   ///< 0 = adaptive
+    BitOrder  bitOrder       = BitOrder::LSB;
 };
 
 // ============================================================================
@@ -83,100 +134,71 @@ struct SubIntConfig {
 // ============================================================================
 namespace detail {
 
-/// Number of bytes in the left group for each SplitMode.
-inline constexpr uint32_t leftBytes(SplitMode m) noexcept {
-    switch (m) {
-        case SplitMode::Split13: return 1;
-        case SplitMode::Split22: return 2;
-        case SplitMode::Split31: return 3;
-    }
-    return 0;
-}
-
-/// Number of bytes in the right group for each SplitMode.
-inline constexpr uint32_t rightBytes(SplitMode m) noexcept {
-    return 4u - leftBytes(m);
-}
-
 /// Maximum code width for a group of `bytes` bytes.
 inline constexpr uint32_t maxCodeWidth(uint32_t bytes) noexcept {
     switch (bytes) {
         case 1: return kMaxCodeWidth1;
         case 2: return kMaxCodeWidth2;
         case 3: return kMaxCodeWidth3;
+        case 4: return kMaxCodeWidth4;
+        case 5: return kMaxCodeWidth5;
+        case 6: return kMaxCodeWidth6;
+        case 7: return kMaxCodeWidth7;
     }
     return 0;
 }
 
-/// Smallest power-of-two number of bits that can index `n` distinct values.
-/// Returns 0 if n == 0 or n == 1 (need 0 bits, but we use 1 as minimum).
+/**
+ * @brief Whether a group of `bytes` bytes should use a flat lookup array
+ *        (vs. HashMap) for encode/decode.
+ *
+ * Groups of 1–4 bytes have a max code width of ≤ 16 bits, so the flat decode
+ * table is at most 2^16 = 65 536 entries — perfectly acceptable.
+ * Groups of 5–7 bytes have a max code width of 32 bits; a flat array indexed
+ * by code would need up to 2^32 entries, so we use HashMaps instead.
+ *
+ * Note: the flat *encode* array is indexed by value, not code.  For 3-byte
+ * groups the value space is 2^24 = 16 M entries (64 MB) — acceptable.
+ * For 4-byte groups 2^32 entries would be 256 MB+, so encode also falls back
+ * to HashMap for groups ≥ 4 bytes.  The flat *decode* table for 4-byte groups
+ * is still fine (max 2^16 entries for codes), and is handled separately in
+ * DecodeCtx via useFlatArray(bytes).
+ */
+inline constexpr bool useFlatArray(uint32_t bytes) noexcept {
+    return bytes <= 4u;
+}
+
+/// Smallest power-of-two bit count that can index `n` distinct values.
+/// Returns 1 as the minimum (even for n ≤ 1).
 inline uint32_t adaptiveWidth(uint32_t n, uint32_t maxW) noexcept {
-    if (n <= 1)  return 1;          // degenerate; 1 bit minimum
-    // ceil(log2(n))
+    if (n <= 1) return 1;
     uint32_t bits = static_cast<uint32_t>(std::bit_width(n - 1u));
-    // Round up to next power-of-two number of bits: 1,2,4,8,16
+    // Round up to the next power-of-two bit count: 1,2,4,8,16,32
     uint32_t w = 1;
     while (w < bits) w <<= 1;
     return std::min(w, maxW);
 }
 
-/// Extract the left group value from a raw int32 (little-endian bytes).
-inline uint32_t extractLeft(uint32_t raw, SplitMode m) noexcept {
-    const uint32_t lb = leftBytes(m);
-    const uint32_t mask = (lb == 4) ? ~0u : ((1u << (lb * 8u)) - 1u);
+/// Extract the left group value from a raw unsigned integer (little-endian).
+inline uint64_t extractLeft(uint64_t raw, uint32_t lb) noexcept {
+    const uint64_t mask = (lb >= 8u) ? ~uint64_t{0}
+                                     : ((uint64_t{1} << (lb * 8u)) - 1u);
     return raw & mask;
 }
 
-/// Extract the right group value from a raw int32.
-inline uint32_t extractRight(uint32_t raw, SplitMode m) noexcept {
-    const uint32_t lb = leftBytes(m);
+/// Extract the right group value from a raw unsigned integer.
+inline uint64_t extractRight(uint64_t raw, uint32_t lb) noexcept {
     return raw >> (lb * 8u);
 }
 
-/// Reconstruct a raw int32 from left and right group values.
-inline uint32_t reconstruct(uint32_t left, uint32_t right, SplitMode m) noexcept {
-    return left | (right << (leftBytes(m) * 8u));
+/// Reconstruct a raw unsigned integer from left and right group values.
+inline uint64_t reconstruct(uint64_t left, uint64_t right, uint32_t lb) noexcept {
+    return left | (right << (lb * 8u));
 }
 
 /// Validate a user-supplied code width is a non-zero power of two ≤ maxW.
 inline bool validWidth(uint32_t w, uint32_t maxW) noexcept {
     return w != 0 && w <= maxW && (w & (w - 1)) == 0;
-}
-
-// ---------------------------------------------------------------------------
-// Dictionary builder
-// ---------------------------------------------------------------------------
-
-/**
- * Build a value→code map for a set of observed values.
- * Returns false if the number of distinct values exceeds 2^maxW (overflow).
- * On overflow, `dict` is left empty — caller must handle raw fallback.
- */
-inline bool buildDict(
-    const std::vector<uint32_t>& values,
-    uint32_t                     maxW,
-    uint32_t                     fixedW,       ///< 0 = adaptive
-    HashMap<uint32_t, uint32_t>& dict,
-    uint32_t&                    codeWidth)
-{
-    // Single pass: assign insertion-order codes via dict.size() before insert
-    for (uint32_t v : values) {
-        dict.emplace(v, static_cast<uint32_t>(dict.size()));
-    }
-
-    const uint32_t n = static_cast<uint32_t>(dict.size());
-    const uint32_t capacity = (fixedW == 0)
-        ? (1u << adaptiveWidth(n, maxW))
-        : (1u << fixedW);
-
-    if (n > capacity) {
-        dict.clear();
-        codeWidth = 0;
-        return false;
-    }
-
-    codeWidth = (fixedW != 0) ? fixedW : adaptiveWidth(n, maxW);
-    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -201,12 +223,12 @@ inline void writeU64(std::vector<uint8_t>& buf, uint64_t v) {
         buf.push_back(static_cast<uint8_t>(v >> (i * 8)));
 }
 
-inline uint8_t  readU8 (const uint8_t* p)             { return *p; }
-inline uint16_t readU16(const uint8_t* p)             {
+inline uint8_t  readU8 (const uint8_t* p) { return *p; }
+inline uint16_t readU16(const uint8_t* p) {
     return static_cast<uint16_t>(p[0]) | (static_cast<uint16_t>(p[1]) << 8);
 }
 inline uint32_t readU32(const uint8_t* p) {
-    return static_cast<uint32_t>(p[0])        |
+    return static_cast<uint32_t>(p[0])         |
            (static_cast<uint32_t>(p[1]) <<  8) |
            (static_cast<uint32_t>(p[2]) << 16) |
            (static_cast<uint32_t>(p[3]) << 24);
@@ -219,51 +241,87 @@ inline uint64_t readU64(const uint8_t* p) {
 }
 
 // ---------------------------------------------------------------------------
+// Dictionary size-benefit check
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief Returns true if a dictionary encoding is cheaper than raw storage.
+ *
+ * A dictionary is only worth building when the space it saves in the bit
+ * stream exceeds the space it costs in the header:
+ *
+ *   dict_header_bytes = 5 + dictSize * groupBytes
+ *   stream_with_dict  = N * codeWidth  bits  →  ceil / 8 bytes
+ *   stream_raw        = N * groupBytes * 8 bits  →  N * groupBytes bytes
+ *
+ *   saving = stream_raw - stream_with_dict - dict_header_bytes  >  0
+ *
+ * @param N          Number of elements.
+ * @param dictSize   Number of distinct group values.
+ * @param codeWidth  Bit width assigned by adaptiveWidth().
+ * @param groupBytes Bytes per group value.
+ */
+inline bool dictWorthIt(size_t   N,
+                        size_t   dictSize,
+                        uint32_t codeWidth,
+                        uint32_t groupBytes) noexcept
+{
+    const size_t rawBytes    = N * groupBytes;
+    const size_t streamBytes = (N * codeWidth + 7u) / 8u;
+    const size_t headerBytes = 5u + dictSize * groupBytes;
+    // Dict is beneficial only when it actually saves space vs raw.
+    return (streamBytes + headerBytes) < rawBytes;
+}
+
+// ---------------------------------------------------------------------------
 // Dictionary serialisation helpers
 // ---------------------------------------------------------------------------
 
-/// Write one dictionary to `buf`. `groupBytes` is the byte width of each key.
-/// Format:
-///   [code_width : 1 byte]
-///   [num_entries: 2 bytes]
-///   for each entry (in code order):
-///       [key: groupBytes bytes (little-endian)]
+/**
+ * Write one dictionary to `buf`.
+ *
+ * Format:
+ *   [code_width  : 1 byte ]
+ *   [num_entries : 4 bytes]   (uint32_t — supports up to 2^32 entries)
+ *   for each entry (in code order):
+ *       [key : groupBytes bytes, little-endian]
+ */
 void writeDict(
-    std::vector<uint8_t>&                  buf,
-    const HashMap<uint32_t, uint32_t>&     dict,
-    uint32_t                               codeWidth,
-    uint32_t                               groupBytes)
+    std::vector<uint8_t>&              buf,
+    const HashMap<uint64_t, uint32_t>& dict,
+    uint32_t                           codeWidth,
+    uint32_t                           groupBytes)
 {
-    // Sort by code so we can recover dict from just the keys in order.
-    std::vector<std::pair<uint32_t,uint32_t>> entries(dict.begin(), dict.end());
+    // Sort by code so the decoder can recover the dict from keys in order.
+    std::vector<std::pair<uint64_t, uint32_t>> entries(dict.begin(), dict.end());
     std::sort(entries.begin(), entries.end(),
-              [](auto& a, auto& b){ return a.second < b.second; });
+              [](const auto& a, const auto& b){ return a.second < b.second; });
 
-    writeU8(buf, static_cast<uint8_t>(codeWidth));
-    writeU16(buf, static_cast<uint16_t>(entries.size()));
+    writeU8 (buf, static_cast<uint8_t> (codeWidth));
+    writeU32(buf, static_cast<uint32_t>(entries.size()));
     for (auto& [key, _] : entries) {
-        // Write `groupBytes` bytes of key, little-endian
         for (uint32_t b = 0; b < groupBytes; ++b)
             buf.push_back(static_cast<uint8_t>(key >> (b * 8)));
     }
 }
 
-/// Read one dictionary back. Returns {dict, codeWidth, bytes_consumed}.
+/// Read one dictionary back.
 struct ReadDictResult {
-    HashMap<uint32_t, uint32_t> codeToValue; ///< code -> group value
+    HashMap<uint32_t, uint64_t> codeToValue; ///< code (uint32_t) → group value (uint64_t)
     uint32_t                    codeWidth;
     size_t                      bytesRead;
 };
 
 ReadDictResult readDict(const uint8_t* p, uint32_t groupBytes) {
     ReadDictResult r;
-    r.codeWidth = readU8(p);      p += 1;
-    uint16_t n  = readU16(p);     p += 2;
-    r.bytesRead = 3 + static_cast<size_t>(n) * groupBytes;
+    r.codeWidth       = readU8 (p);   p += 1;
+    const uint32_t n  = readU32(p);   p += 4;
+    r.bytesRead = 5 + static_cast<size_t>(n) * groupBytes;
+    r.codeToValue.reserve(n);
     for (uint32_t code = 0; code < n; ++code) {
-        uint32_t key = 0;
+        uint64_t key = 0;
         for (uint32_t b = 0; b < groupBytes; ++b)
-            key |= static_cast<uint32_t>(*p++) << (b * 8);
+            key |= static_cast<uint64_t>(*p++) << (b * 8);
         r.codeToValue[code] = key;
     }
     return r;
@@ -272,92 +330,131 @@ ReadDictResult readDict(const uint8_t* p, uint32_t groupBytes) {
 } // namespace detail
 
 // ============================================================================
-// SubIntEncoder
+// SubIntEncoder<T>
 // ============================================================================
 
 /**
- * @brief Sub-integer code encoder for int32_t values.
+ * @brief Sub-integer code encoder for int32_t or int64_t values.
  *
- * Splits each 32-bit integer into two byte groups according to a chosen
- * SplitMode, builds a dictionary for each group, and packs the resulting
- * codes into a compact bit stream.
+ * Splits each integer into two byte groups according to a chosen SplitMode,
+ * builds a dictionary for each group, and packs the resulting codes into a
+ * compact bit stream.
  *
- * Wire format:
+ * Template parameter T must be int32_t or int64_t.
+ * The SplitMode must satisfy leftBytes + rightBytes == sizeof(T); otherwise
+ * the constructor throws std::invalid_argument.
  *
- *   [num_ints          : 8 bytes]
- *   [split_mode        : 1 byte ]   (0=Split13, 1=Split22, 2=Split31)
- *   [bit_order         : 1 byte ]   (0=LSB, 1=MSB)
- *   [fallback_flags    : 1 byte ]   bit0 = left_raw, bit1 = right_raw
- *   [shared_dict_flag  : 1 byte ]   1 if Split22 uses a single shared dict
+ * ── Wire format ──────────────────────────────────────────────────────────────
+ *
+ *   [num_ints            : 8 bytes]
+ *   [left_group_bytes    : 1 byte ]
+ *   [right_group_bytes   : 1 byte ]
+ *   [bit_order           : 1 byte ]   (0 = LSB-first, 1 = MSB-first)
+ *   [fallback_flags      : 1 byte ]   bit0 = left_raw, bit1 = right_raw
+ *   [shared_dict_flag    : 1 byte ]   1 if equal-size groups share one dict
  *   -- if left NOT raw:
- *   [left dict                  ]   see writeDict()
+ *   [left dict                    ]   see writeDict() / readDict()
  *   -- if right NOT raw AND NOT shared:
- *   [right dict                 ]
- *   [encoded_ints_length: 8 bytes]
- *   [encoded_ints               ]   packed bit stream
+ *   [right dict                   ]
+ *   [encoded_ints_length : 8 bytes]
+ *   [encoded_ints                 ]   packed bit stream
  *
- * Random access:
- *   bits_per_int = left_width + right_width  (constant when no raw fallback)
- *   When one or both sides are raw the per-int bit width is still constant
- *   (raw side contributes exactly groupBytes*8 bits per int).
+ * ── Dictionary format ────────────────────────────────────────────────────────
  *
- * Special case: if BOTH sides fall back to raw, the data is stored as plain
- * int32_t values (identical to RawEncoder<int32_t> output), and the header
- * records fallback_flags = 0b11.
+ *   [code_width  : 1 byte ]
+ *   [num_entries : 4 bytes]
+ *   [key_0 … key_n : groupBytes bytes each, little-endian]
+ *
+ * ── Flat vs. HashMap lookup ──────────────────────────────────────────────────
+ *
+ *   Encode (value → code):
+ *     Groups 1–3 bytes: flat array indexed by value (max 16 M entries).
+ *     Groups 4–7 bytes: HashMap<uint64_t, uint32_t>.
+ *
+ *   Decode (code → value):
+ *     Groups 1–4 bytes (maxCodeWidth ≤ 16): flat vector indexed by code
+ *       (max 65 536 entries).
+ *     Groups 5–7 bytes (maxCodeWidth = 32): HashMap<uint32_t, uint64_t>.
+ *
+ * ── Shared-dict optimisation ─────────────────────────────────────────────────
+ *
+ *   When leftBytes == rightBytes (symmetric splits: {2,2}, {4,4}) the encoder
+ *   checks whether a single merged dictionary saves bytes overall.  If so,
+ *   only the left dict is written and shared_dict_flag is set to 1.
+ *
+ * ── Raw fallback ─────────────────────────────────────────────────────────────
+ *
+ *   If a group exceeds its max code capacity, values are stored verbatim
+ *   (groupBytes * 8 bits each).  If both groups fall back the stream is plain
+ *   sizeof(T)-byte integers (memcpy path).
+ *
+ * ── Random access ────────────────────────────────────────────────────────────
+ *
+ *   bitsPerInt = leftCW + rightCW  (constant; raw sides count as groupBytes*8).
+ *   Element i starts at bit offset i * bitsPerInt.
  */
-class SubIntEncoder : public encodings::Codec<int32_t> {
+template <typename T>
+    requires (std::is_same_v<T, int32_t> || std::is_same_v<T, int64_t>)
+class SubIntEncoder : public encodings::Codec<T> {
 public:
-    explicit SubIntEncoder(SubIntConfig cfg = {}) : cfg_(cfg) {}
+    using UnsignedT = std::make_unsigned_t<T>;
+
+    explicit SubIntEncoder(SubIntConfig<T> cfg = {}) : cfg_(cfg) {
+        const uint32_t total = cfg_.splitMode.leftBytes + cfg_.splitMode.rightBytes;
+        if (total != sizeof(T)) {
+            throw std::invalid_argument(
+                "SubIntEncoder: splitMode bytes (" +
+                std::to_string(cfg_.splitMode.leftBytes) + "+" +
+                std::to_string(cfg_.splitMode.rightBytes) +
+                ") do not sum to sizeof(T) = " + std::to_string(sizeof(T)));
+        }
+    }
 
     // -----------------------------------------------------------------------
-    // Codec<int32_t>
+    // Codec<T>
     // -----------------------------------------------------------------------
 
-    encodings::EncodedData encode(std::span<const int32_t> data) override {
+    encodings::EncodedData encode(std::span<const T> data) override {
         using namespace detail;
 
-        // computeHistograms(data, true); // For debugging/logging – not needed for encoding
-
-        const size_t N = data.size();
-
-        const uint32_t lb    = leftBytes(cfg_.splitMode);
-        const uint32_t rb    = rightBytes(cfg_.splitMode);
+        const size_t   N     = data.size();
+        const uint32_t lb    = cfg_.splitMode.leftBytes;
+        const uint32_t rb    = cfg_.splitMode.rightBytes;
         const uint32_t lMaxW = maxCodeWidth(lb);
         const uint32_t rMaxW = maxCodeWidth(rb);
 
         // ---- 1. Build dictionaries in a single scan ----------------------
         //
-        // We split and accumulate into the dicts in one pass, avoiding the
-        // allocation of separate leftVals / rightVals vectors.  We do still
-        // need the raw group values for the bit-writing pass, so we keep them
-        // but interleaved in one vector to improve locality.
-        //
-        // Layout: [left0, right0, left1, right1, ...]
-        std::vector<uint32_t> groups(N * 2);
-        HashMap<uint32_t, uint32_t> leftDict, rightDict;
-        leftDict.reserve(1u << lMaxW);
-        rightDict.reserve(1u << rMaxW);
+        // Groups are stored interleaved: [left0, right0, left1, right1, ...]
+        // for cache locality during the encoding pass.
+        std::vector<uint64_t> groups(N * 2);
+        HashMap<uint64_t, uint32_t> leftDict, rightDict;
+        // For groups with maxCodeWidth ≤ 16 we know the max capacity; reserve
+        // it.  For 32-bit maxCodeWidth, reserving 2^32 is impractical — let
+        // the map grow dynamically.
+        if (lMaxW <= 16) leftDict.reserve(size_t{1} << lMaxW);
+        if (rMaxW <= 16) rightDict.reserve(size_t{1} << rMaxW);
 
         for (size_t i = 0; i < N; ++i) {
-            const uint32_t raw = static_cast<uint32_t>(data[i]);
-            const uint32_t lv  = extractLeft (raw, cfg_.splitMode);
-            const uint32_t rv  = extractRight(raw, cfg_.splitMode);
+            const UnsignedT raw = static_cast<UnsignedT>(data[i]);
+            const uint64_t  lv  = extractLeft (raw, lb);
+            const uint64_t  rv  = extractRight(raw, lb);
             groups[2*i]   = lv;
             groups[2*i+1] = rv;
             leftDict.emplace (lv, static_cast<uint32_t>(leftDict.size()));
             rightDict.emplace(rv, static_cast<uint32_t>(rightDict.size()));
         }
 
-        uint32_t leftCW  = 0;
-        uint32_t rightCW = 0;
+        uint32_t leftCW   = 0;
+        uint32_t rightCW  = 0;
         bool     leftRaw  = false;
         bool     rightRaw = false;
         bool     shared   = false;
 
-        // Check overflow
+        // Check overflow.  Use uint64_t shift to avoid UB when maxW == 32.
         {
-            const uint32_t lCap = 1u << lMaxW;
-            const uint32_t rCap = 1u << rMaxW;
+            const uint64_t lCap = uint64_t{1} << lMaxW;
+            const uint64_t rCap = uint64_t{1} << rMaxW;
             if (leftDict.size() > lCap) {
                 std::cerr << "[SubIntEncoder] WARNING: left group overflow – raw fallback.\n";
                 leftDict.clear();
@@ -373,9 +470,28 @@ public:
         if (!leftRaw)  leftCW  = adaptiveWidth(static_cast<uint32_t>(leftDict.size()),  lMaxW);
         if (!rightRaw) rightCW = adaptiveWidth(static_cast<uint32_t>(rightDict.size()), rMaxW);
 
-        // Split22 shared-dict check
-        if (cfg_.splitMode == SplitMode::Split22 && !leftRaw && !rightRaw) {
-            shared = checkSharedBenefit(leftDict, rightDict, leftCW, rightCW, lMaxW, N);
+        // Size-benefit check: if the dictionary costs more than it saves,
+        // fall back to raw storage for that side.
+        if (!leftRaw && !dictWorthIt(N, leftDict.size(), leftCW, lb)) {
+            SUBINT_DBG("left dict not worth it (" << leftDict.size()
+                       << " entries, " << lb << "B groups, CW=" << leftCW
+                       << ") – raw fallback");
+            leftDict.clear();
+            leftRaw = true;
+            leftCW  = lb * 8u;
+        }
+        if (!rightRaw && !dictWorthIt(N, rightDict.size(), rightCW, rb)) {
+            SUBINT_DBG("right dict not worth it (" << rightDict.size()
+                       << " entries, " << rb << "B groups, CW=" << rightCW
+                       << ") – raw fallback");
+            rightDict.clear();
+            rightRaw = true;
+            rightCW  = rb * 8u;
+        }
+
+        // Shared-dict check: only for symmetric splits (leftBytes == rightBytes).
+        if (lb == rb && !leftRaw && !rightRaw) {
+            shared = checkSharedBenefit(leftDict, rightDict, leftCW, rightCW, lMaxW, lb, N);
             if (shared) {
                 buildMergedDict(leftDict, rightDict, lMaxW, leftCW);
                 rightDict.clear();
@@ -385,38 +501,31 @@ public:
 
         const bool bothRaw = leftRaw && rightRaw;
 
-        // ---- 2. Build flat code-lookup arrays (value → code) --------------
+        // ---- 2. Build encode lookup tables (value → code) ----------------
         //
-        // For the non-raw sides we replace HashMap::at() in the hot loop with
-        // a direct array lookup.  Max capacity is bounded by the max code width
-        // (16 values for 1-byte, 256 for 2-byte, 65536 for 3-byte group).
-        //
-        // For 1-byte groups  (lb==1): values ∈ [0,255]   → array[256]
-        // For 2-byte groups  (lb==2): values ∈ [0,65535] → array[65536]
-        // For 3-byte groups  (lb==3): values ∈ [0,16M-1] → too large for flat;
-        //                              fall back to the hash map (rare).
-        //
-        // The array is sized to the maximum possible value + 1, filled via the
-        // dict, so lookup is: code = leftCodeArr[value].
-        const bool useFlatLeft  = !leftRaw  && lb  <= 2u;
-        const bool useFlatRight = !rightRaw && rb  <= 2u;
-        const uint32_t lArrSize = useFlatLeft  ? (1u << (lb  * 8u)) : 0u;
-        const uint32_t rArrSize = useFlatRight ? (1u << (rb  * 8u)) : 0u;
-        std::vector<uint32_t> leftCodeArr(lArrSize, 0);
-        std::vector<uint32_t> rightCodeArr(rArrSize, 0);
-        if (useFlatLeft)
-            for (auto& [val, code] : leftDict)  leftCodeArr[val]  = code;
-        if (useFlatRight && !shared)
-            for (auto& [val, code] : rightDict) rightCodeArr[val] = code;
-        else if (useFlatRight && shared)
-            for (auto& [val, code] : leftDict)  rightCodeArr[val] = code;
+        // Flat arrays (indexed by value) are used for groups of 1–3 bytes
+        // where the value space is at most 2^24 = 16 M entries (64 MB).
+        // For groups of 4+ bytes the HashMap is used directly for encoding.
+        const bool useFlatEncLeft  = !leftRaw  && lb <= 3u;
+        const bool useFlatEncRight = !rightRaw && rb <= 3u;
+        const uint64_t lArrSize = useFlatEncLeft  ? (uint64_t{1} << (lb * 8u)) : 0u;
+        const uint64_t rArrSize = useFlatEncRight ? (uint64_t{1} << (rb * 8u)) : 0u;
+        std::vector<uint32_t> leftCodeArr (static_cast<size_t>(lArrSize), 0u);
+        std::vector<uint32_t> rightCodeArr(static_cast<size_t>(rArrSize), 0u);
+        if (useFlatEncLeft)
+            for (auto& [val, code] : leftDict)  leftCodeArr[static_cast<size_t>(val)]  = code;
+        if (useFlatEncRight && !shared)
+            for (auto& [val, code] : rightDict) rightCodeArr[static_cast<size_t>(val)] = code;
+        else if (useFlatEncRight && shared)
+            for (auto& [val, code] : leftDict)  rightCodeArr[static_cast<size_t>(val)] = code;
 
         // ---- 3. Serialise header ------------------------------------------
         std::vector<uint8_t> header;
-        header.reserve(32);
+        header.reserve(64);
         writeU64(header, static_cast<uint64_t>(N));
-        writeU8(header, static_cast<uint8_t>(cfg_.splitMode));
-        writeU8(header, (cfg_.bitOrder == BitOrder::MSB) ? 1u : 0u);
+        writeU8 (header, static_cast<uint8_t>(lb));
+        writeU8 (header, static_cast<uint8_t>(rb));
+        writeU8 (header, (cfg_.bitOrder == BitOrder::MSB) ? 1u : 0u);
 
         const uint8_t fallbackFlags =
             (leftRaw  ? 0x01u : 0x00u) |
@@ -433,7 +542,7 @@ public:
         std::vector<uint8_t> stream;
 
         if (bothRaw) {
-            stream.resize(N * sizeof(int32_t));
+            stream.resize(N * sizeof(T));
             std::memcpy(stream.data(), data.data(), stream.size());
         } else {
             const uint32_t lBits = leftRaw  ? (lb * 8u) : leftCW;
@@ -441,29 +550,45 @@ public:
             const size_t totalBits = N * (lBits + rBits);
             stream.reserve((totalBits + 7) / 8);
 
+            SUBINT_DBG("encode: lb=" << lb << " rb=" << rb
+                       << " leftCW=" << lBits << " rightCW=" << rBits
+                       << " leftRaw=" << leftRaw << " rightRaw=" << rightRaw
+                       << " shared=" << shared);
+
             BitWriter bw(stream, cfg_.bitOrder);
             for (size_t i = 0; i < N; ++i) {
-                const uint32_t lv = groups[2*i];
-                const uint32_t rv = groups[2*i+1];
+                const uint64_t lv = groups[2*i];
+                const uint64_t rv = groups[2*i+1];
 
                 // Left side
+                uint32_t lcode = 0;
                 if (leftRaw) {
-                    bw.write(lv, lb * 8u);
-                } else if (useFlatLeft) {
-                    bw.write(leftCodeArr[lv], leftCW);
+                    writeBits64(bw, lv, lb * 8u);
+                } else if (useFlatEncLeft) {
+                    lcode = leftCodeArr[static_cast<size_t>(lv)];
+                    bw.write(lcode, leftCW);
                 } else {
-                    bw.write(leftDict.at(lv), leftCW);
+                    lcode = leftDict.at(lv);
+                    bw.write(lcode, leftCW);
                 }
 
                 // Right side
+                uint32_t rcode = 0;
                 if (rightRaw) {
-                    bw.write(rv, rb * 8u);
-                } else if (useFlatRight) {
-                    bw.write(rightCodeArr[rv], rightCW);
+                    writeBits64(bw, rv, rb * 8u);
+                } else if (useFlatEncRight) {
+                    rcode = rightCodeArr[static_cast<size_t>(rv)];
+                    bw.write(rcode, rightCW);
                 } else {
                     const auto& rMap = shared ? leftDict : rightDict;
-                    bw.write(rMap.at(rv), rightCW);
+                    rcode = rMap.at(rv);
+                    bw.write(rcode, rightCW);
                 }
+
+                SUBINT_DBG("  enc[" << i << "]  lv=0x" << std::hex << lv
+                           << (leftRaw  ? " lraw" : (" lcode=" + std::to_string(lcode)))
+                           << "  rv=0x" << std::hex << rv
+                           << (rightRaw ? " rraw" : (" rcode=" + std::to_string(rcode))));
             }
             bw.flush();
         }
@@ -478,10 +603,10 @@ public:
         // ---- 6. Metadata -------------------------------------------------
         encodings::EncodingMetadata meta;
         meta.encodingName     = name();
-        meta.dataType         = encodings::DataType::Int32;
+        meta.dataType         = encodings::core::typeToDataType<T>;
         meta.elementCount     = N;
         meta.compressedSize   = out.size();
-        meta.uncompressedSize = N * sizeof(int32_t);
+        meta.uncompressedSize = N * sizeof(T);
         meta.supportsRandomAccess = !bothRaw;
 
         return encodings::EncodedData(std::move(out), std::move(meta));
@@ -489,21 +614,21 @@ public:
 
     // -----------------------------------------------------------------------
 
-    std::vector<int32_t> decodeAll(const encodings::EncodedData& encoded) override {
-        DecodeCtx ctx = parseHeader(encoded);
+    std::vector<T> decodeAll(const encodings::EncodedData& encoded) override {
+        const DecodeCtx& ctx = this->getCachedCtx(encoded);
         return decodeSequential(ctx, 0, ctx.N);
     }
 
-    std::optional<int32_t> decodeAt(const encodings::EncodedData& encoded,
-                                     size_t index) override {
-        DecodeCtx ctx = parseHeader(encoded);
+    std::optional<T> decodeAt(const encodings::EncodedData& encoded,
+                               size_t index) override {
+        const DecodeCtx& ctx = this->getCachedCtx(encoded);
         if (index >= ctx.N) return std::nullopt;
         return decodeOne(ctx, index);
     }
 
-    std::vector<int32_t> decodeRange(const encodings::EncodedData& encoded,
-                                      size_t start, size_t end) override {
-        DecodeCtx ctx = parseHeader(encoded);
+    std::vector<T> decodeRange(const encodings::EncodedData& encoded,
+                                size_t start, size_t end) override {
+        const DecodeCtx& ctx = this->getCachedCtx(encoded);
         if (start >= ctx.N) return {};
         end = std::min(end, ctx.N);
         return decodeSequential(ctx, start, end);
@@ -516,12 +641,9 @@ public:
     }
 
     std::string name() const override {
-        switch (cfg_.splitMode) {
-            case SplitMode::Split13: return "SubInt(1|3)";
-            case SplitMode::Split22: return "SubInt(2|2)";
-            case SplitMode::Split31: return "SubInt(3|1)";
-        }
-        return "SubInt";
+        return "SubInt(" +
+               std::to_string(cfg_.splitMode.leftBytes) + "|" +
+               std::to_string(cfg_.splitMode.rightBytes) + ")";
     }
 
     encodings::EncodingProperties properties() const override {
@@ -536,10 +658,12 @@ public:
 
     size_t estimateEncodedSize(size_t elementCount) const override {
         // Conservative upper bound: header ≈ 512 bytes + full bit stream
-        const uint32_t lb = detail::leftBytes (cfg_.splitMode);
-        const uint32_t rb = detail::rightBytes(cfg_.splitMode);
-        const uint32_t lBits = (cfg_.leftCodeWidth  != 0) ? cfg_.leftCodeWidth  : detail::maxCodeWidth(lb);
-        const uint32_t rBits = (cfg_.rightCodeWidth != 0) ? cfg_.rightCodeWidth : detail::maxCodeWidth(rb);
+        const uint32_t lb    = cfg_.splitMode.leftBytes;
+        const uint32_t rb    = cfg_.splitMode.rightBytes;
+        const uint32_t lBits = (cfg_.leftCodeWidth  != 0) ? cfg_.leftCodeWidth
+                                                           : detail::maxCodeWidth(lb);
+        const uint32_t rBits = (cfg_.rightCodeWidth != 0) ? cfg_.rightCodeWidth
+                                                           : detail::maxCodeWidth(rb);
         const size_t streamBytes = (elementCount * (lBits + rBits) + 7) / 8;
         return 512 + 8 + streamBytes;
     }
@@ -550,15 +674,11 @@ public:
 
     /**
      * @brief Frequency histogram for one group side (left or right).
-     *
-     * `counts` maps each distinct group value to the number of times it
-     * appears in the input passed to computeHistograms().
-     * `totalValues` is the total number of values seen (== input size).
      */
     struct GroupHistogram {
-        HashMap<uint32_t, size_t> counts;
+        HashMap<uint64_t, size_t> counts;
         size_t                    totalValues{0};
-        uint32_t                  groupBytes{0};  ///< 1, 2, or 3
+        uint32_t                  groupBytes{0};
     };
 
     struct Histograms {
@@ -572,29 +692,27 @@ public:
      *
      * @param data    Input integers to analyse.
      * @param verbose If true, also prints the histograms to stdout.
-     * @return        Pair of histograms (left, right).
+     * @return        Histograms struct with left and right GroupHistograms.
      */
-    Histograms computeHistograms(std::span<const int32_t> data,
+    Histograms computeHistograms(std::span<const T> data,
                                  bool verbose = false) const
     {
         using namespace detail;
+        const uint32_t lb = cfg_.splitMode.leftBytes;
 
         Histograms h;
         h.splitMode        = cfg_.splitMode;
-        h.left.groupBytes  = leftBytes (cfg_.splitMode);
-        h.right.groupBytes = rightBytes(cfg_.splitMode);
+        h.left.groupBytes  = lb;
+        h.right.groupBytes = cfg_.splitMode.rightBytes;
         h.left.totalValues = h.right.totalValues = data.size();
 
-        for (int32_t v : data) {
-            const uint32_t raw = static_cast<uint32_t>(v);
-            ++h.left.counts [extractLeft (raw, cfg_.splitMode)];
-            ++h.right.counts[extractRight(raw, cfg_.splitMode)];
+        for (T v : data) {
+            const UnsignedT raw = static_cast<UnsignedT>(v);
+            ++h.left.counts [extractLeft (raw, lb)];
+            ++h.right.counts[extractRight(raw, lb)];
         }
 
-        if (verbose) {
-            printHistograms(h, std::cout);
-        }
-
+        if (verbose) printHistograms(h, std::cout);
         return h;
     }
 
@@ -603,9 +721,6 @@ public:
      *
      * Entries are sorted by descending frequency, then ascending value.
      * A simple bar chart is rendered alongside the counts.
-     *
-     * @param h    Histograms produced by computeHistograms().
-     * @param out  Destination stream (default: std::cout).
      */
     static void printHistograms(const Histograms& h,
                                 std::ostream& out = std::cout)
@@ -619,8 +734,7 @@ public:
 
             if (gh.counts.empty()) { out << "  (empty)\n\n"; return; }
 
-            // Sort by descending count, then ascending value for ties
-            std::vector<std::pair<uint32_t, size_t>> entries(
+            std::vector<std::pair<uint64_t, size_t>> entries(
                 gh.counts.begin(), gh.counts.end());
             std::sort(entries.begin(), entries.end(),
                 [](const auto& a, const auto& b) {
@@ -631,18 +745,14 @@ public:
 
             const size_t maxCount = entries.front().second;
             constexpr int kBarWidth = 40;
-
-            // Column widths depend on group byte size
             const int valWidth = gh.groupBytes <= 1 ? 3
-                               : gh.groupBytes == 2 ? 5 : 8;
+                               : gh.groupBytes == 2 ? 5
+                               : gh.groupBytes <= 4 ? 8 : 14;
 
             size_t num_less_than = 0;
-            size_t num_to_be_less_than = 1000;
+            constexpr size_t num_to_be_less_than = 1000;
             for (const auto& [val, cnt] : entries) {
-                if (cnt < num_to_be_less_than) {
-                    ++num_less_than;
-                    continue; // skip some for now
-                }
+                if (cnt < num_to_be_less_than) { ++num_less_than; continue; }
                 const double pct  = gh.totalValues > 0
                     ? 100.0 * cnt / gh.totalValues : 0.0;
                 const int barLen  = maxCount > 0
@@ -654,13 +764,13 @@ public:
                     << "  " << std::setw(10) << cnt
                     << "  (" << std::fixed << std::setprecision(2)
                     << std::setw(6) << pct << "%)  |"
-                    << std::string(barLen, '#')
-                    << "\n";
+                    << std::string(barLen, '#') << "\n";
             }
             if (num_less_than > 0) {
                 const double pct = gh.totalValues > 0
                     ? 100.0 * num_less_than / gh.totalValues : 0.0;
-                out << "  (and " << num_less_than << " less than " << num_to_be_less_than << " occurrences, "
+                out << "  (and " << num_less_than << " less than "
+                    << num_to_be_less_than << " occurrences, "
                     << std::fixed << std::setprecision(2) << pct << "% of total)\n";
             }
             out << "\n";
@@ -671,114 +781,172 @@ public:
     }
 
 private:
-    SubIntConfig cfg_;
+    SubIntConfig<T> cfg_;
 
     // -----------------------------------------------------------------------
-    // Shared-dict benefit check (Split22 only)
+    // Decode context type (must be declared before the cache members below)
+    // -----------------------------------------------------------------------
+
+    struct DecodeCtx {
+        size_t   N{0};
+        uint32_t lb{0};        ///< left group bytes
+        uint32_t rb{0};        ///< right group bytes
+        BitOrder order{BitOrder::LSB};
+        bool     leftRaw{false};
+        bool     rightRaw{false};
+        bool     bothRaw{false};
+        bool     shared{false};
+
+        uint32_t leftCW{0};    ///< code width in bits (== lb*8 if raw)
+        uint32_t rightCW{0};
+        uint32_t bitsPerInt{0};
+
+        // ── Decode tables: code → group value ──────────────────────────────
+        //
+        // For groups 1–4 bytes (maxCodeWidth ≤ 16): flat vector<uint64_t>
+        //   indexed by code; size = 2^codeWidth (max 65 536 entries).
+        // For groups 5–7 bytes (maxCodeWidth = 32): HashMap<uint32_t,uint64_t>.
+        //
+        // Exactly one of {flatTable, hashTable} is populated per side.
+        std::vector<uint64_t>       leftFlatTable;
+        std::vector<uint64_t>       rightFlatTable;
+        HashMap<uint32_t, uint64_t> leftHashTable;
+        HashMap<uint32_t, uint64_t> rightHashTable;
+
+        bool useFlatLeft{false};   ///< true iff leftFlatTable is in use
+        bool useFlatRight{false};  ///< true iff rightFlatTable is in use
+
+        const uint8_t* streamPtr{nullptr};
+        size_t         streamBytes{0};
+    };
+
+    // -----------------------------------------------------------------------
+    // Cached decode context — avoids re-parsing the header on every decodeAt /
+    // decodeRange call when the same EncodedData object is reused (e.g. during
+    // random-access benchmarking).  Keyed by the raw data pointer + size so it
+    // is automatically invalidated if a new EncodedData is passed.
+    // mutable so that the const-correct decode path can update it.
+    // -----------------------------------------------------------------------
+    mutable const uint8_t* cachedPtr_  {nullptr};
+    mutable size_t         cachedSize_ {0};
+    mutable DecodeCtx      cachedCtx_;
+
+    const DecodeCtx& getCachedCtx(const encodings::EncodedData& encoded) const {
+        const uint8_t* ptr  = encoded.data().data();
+        const size_t   sz   = encoded.data().size();
+        if (ptr != cachedPtr_ || sz != cachedSize_) {
+            cachedCtx_  = parseHeader(encoded);
+            cachedPtr_  = ptr;
+            cachedSize_ = sz;
+        }
+        return cachedCtx_;
+    }
+
+    // -----------------------------------------------------------------------
+    // Shared-dict benefit check (symmetric splits only)
     // -----------------------------------------------------------------------
 
     /**
-     * Returns true if using a single merged dictionary for both left and right
-     * groups saves bits in the encoded stream compared to two separate dicts.
+     * Returns true if a single merged dictionary for both groups saves bytes
+     * compared to two separate dictionaries.
      *
-     * Savings analysis:
-     *   - Separate dicts: each int costs leftCW + rightCW bits
-     *   - Merged dict  : each int costs 2 * mergedCW bits
-     *   - Plus header overhead: a merged dict eliminates one dict block
+     * Only called for symmetric splits (leftBytes == rightBytes).
+     *
+     * @param groupBytes  Number of bytes in each group (lb == rb).
      */
     static bool checkSharedBenefit(
-        const HashMap<uint32_t,uint32_t>& leftDict,
-        const HashMap<uint32_t,uint32_t>& rightDict,
+        const HashMap<uint64_t, uint32_t>& leftDict,
+        const HashMap<uint64_t, uint32_t>& rightDict,
         uint32_t leftCW, uint32_t rightCW,
-        uint32_t maxW, size_t N)
+        uint32_t maxW, uint32_t groupBytes, size_t N)
     {
-        // Build union of left and right distinct values
-        HashSet<uint32_t> unionSet;
-        for (auto& [v,_] : leftDict)  unionSet.insert(v);
-        for (auto& [v,_] : rightDict) unionSet.insert(v);
+        HashSet<uint64_t> unionSet;
+        for (auto& [v, _] : leftDict)  unionSet.insert(v);
+        for (auto& [v, _] : rightDict) unionSet.insert(v);
         const uint32_t unionSize = static_cast<uint32_t>(unionSet.size());
 
-        // Would the union overflow the max code width?
-        const uint32_t capacity = 1u << maxW;
-        if (unionSize > capacity) return false;  // can't share anyway
+        // Use uint64_t shift to avoid UB when maxW == 32.
+        const uint64_t capacity = uint64_t{1} << maxW;
+        if (static_cast<uint64_t>(unionSize) > capacity) return false;
 
         const uint32_t mergedCW = detail::adaptiveWidth(unionSize, maxW);
 
-        // Bits saved in the stream per int: (leftCW + rightCW) - 2*mergedCW
-        // (positive = sharing is cheaper in the stream)
         const int64_t streamSavingBits =
             static_cast<int64_t>(leftCW + rightCW) -
             static_cast<int64_t>(2 * mergedCW);
         const int64_t streamSavingBytes =
             (static_cast<int64_t>(N) * streamSavingBits) / 8;
 
-        // Header cost of the eliminated right dict:
-        //   3 bytes fixed + num_entries * 2 bytes (2-byte groups)
+        // Header saving from eliminating the right dict
+        // (5 bytes fixed overhead + entries × groupBytes).
         const int64_t eliminatedDictBytes =
-            3 + static_cast<int64_t>(rightDict.size()) * 2;
+            5 + static_cast<int64_t>(rightDict.size()) * static_cast<int64_t>(groupBytes);
 
-        // Extra entries in the left dict due to merging:
         const int64_t extraLeftEntries =
-            static_cast<int64_t>(unionSize) -
-            static_cast<int64_t>(leftDict.size());
-        const int64_t extraLeftDictBytes = extraLeftEntries * 2;
+            static_cast<int64_t>(unionSize) - static_cast<int64_t>(leftDict.size());
+        const int64_t extraLeftDictBytes =
+            extraLeftEntries * static_cast<int64_t>(groupBytes);
 
-        const int64_t netSaving = streamSavingBytes
-                                + eliminatedDictBytes
-                                - extraLeftDictBytes;
-        return netSaving > 0;
+        return (streamSavingBytes + eliminatedDictBytes - extraLeftDictBytes) > 0;
     }
 
-    /// Rebuild leftDict as the merged dict for both sides (Split22).
-    /// Takes the existing left and right dicts directly — no extra allocation.
+    /// Rebuild leftDict as the merged dict for both sides.
     static void buildMergedDict(
-        HashMap<uint32_t,uint32_t>&       mergedDict,
-        const HashMap<uint32_t,uint32_t>& rightDict,
-        uint32_t                          maxW,
-        uint32_t&                         codeWidth)
+        HashMap<uint64_t, uint32_t>&       mergedDict,
+        const HashMap<uint64_t, uint32_t>& rightDict,
+        uint32_t                           maxW,
+        uint32_t&                          codeWidth)
     {
-        // Add any right-only values to the left dict with fresh codes.
-        // emplace() is a no-op when the key already exists, so left-side
-        // values keep their original insertion-order codes.
         uint32_t nextCode = static_cast<uint32_t>(mergedDict.size());
-        for (auto& [val, _] : rightDict) {
-            if (mergedDict.emplace(val, nextCode).second)
-                ++nextCode;
-        }
+        for (auto& [val, _] : rightDict)
+            if (mergedDict.emplace(val, nextCode).second) ++nextCode;
         const uint32_t n = static_cast<uint32_t>(mergedDict.size());
         codeWidth = detail::adaptiveWidth(n, maxW);
-        // Re-number all codes 0..n-1 preserving insertion order
         uint32_t c = 0;
         for (auto& [_, code] : mergedDict) code = c++;
     }
 
     // -----------------------------------------------------------------------
-    // Decode support
+    // Helpers for reading/writing more than 32 bits via BitWriter/BitReader
     // -----------------------------------------------------------------------
 
-    struct DecodeCtx {
-        size_t   N{0};
-        SplitMode mode{SplitMode::Split22};
-        BitOrder  order{BitOrder::LSB};
-        bool     leftRaw{false};
-        bool     rightRaw{false};
-        bool     bothRaw{false};
-        bool     shared{false};
+    /**
+     * @brief Write the lowest @p bits bits of @p value into @p bw.
+     *
+     * BitWriter::write() accepts at most 32-bit values.  For raw groups with
+     * lb or rb > 4 (i.e. 40, 48, or 56 bits) we split into two writes: the
+     * lower 32 bits first, then the remaining upper bits.
+     */
+    static void writeBits64(BitWriter& bw, uint64_t value, uint32_t bits) {
+        if (bits <= 32u) {
+            bw.write(static_cast<uint32_t>(value), bits);
+        } else {
+            // Write the lower 32 bits, then the upper (bits-32) bits.
+            bw.write(static_cast<uint32_t>(value & 0xFFFF'FFFFu), 32u);
+            bw.write(static_cast<uint32_t>(value >> 32u), bits - 32u);
+        }
+    }
 
-        uint32_t leftCW{0};   ///< code width in bits (0 if raw)
-        uint32_t rightCW{0};
-        uint32_t lb{0};       ///< left group bytes
-        uint32_t rb{0};       ///< right group bytes
-        uint32_t bitsPerInt{0};
+    /**
+     * @brief Read @p bits bits from @p br and return as uint64_t.
+     *
+     * BitReader::read() returns uint32_t (max 32 bits).  For raw groups with
+     * lb or rb > 4 we read in two calls and reassemble.
+     */
+    static uint64_t readBits64(BitReader& br, uint32_t bits) {
+        if (bits <= 32u) {
+            return static_cast<uint64_t>(br.read(bits));
+        } else {
+            // Read the lower 32 bits first, then the upper (bits-32) bits.
+            const uint64_t lo = static_cast<uint64_t>(br.read(32u));
+            const uint64_t hi = static_cast<uint64_t>(br.read(bits - 32u));
+            return lo | (hi << 32u);
+        }
+    }
 
-        // Decode tables: code → group value
-        std::vector<uint32_t> leftTable;   ///< indexed by code
-        std::vector<uint32_t> rightTable;  ///< indexed by code (empty if shared)
-
-        // Pointer into the encoded buffer where the packed stream begins
-        const uint8_t* streamPtr{nullptr};
-        size_t         streamBytes{0};
-    };
+    // -----------------------------------------------------------------------
+    // Decode support
+    // -----------------------------------------------------------------------
 
     static DecodeCtx parseHeader(const encodings::EncodedData& encoded) {
         using namespace detail;
@@ -791,65 +959,68 @@ private:
                     std::string("SubIntEncoder::decode: truncated at ") + ctx);
         };
 
-        // num_ints
         require(8, "num_ints");
         DecodeCtx ctx;
-        ctx.N    = static_cast<size_t>(readU64(p)); p += 8;
+        ctx.N = static_cast<size_t>(readU64(p)); p += 8;
 
-        // split_mode
-        require(1, "split_mode");
-        ctx.mode = static_cast<SplitMode>(readU8(p)); p += 1;
+        require(2, "group_bytes");
+        ctx.lb = readU8(p); p += 1;
+        ctx.rb = readU8(p); p += 1;
 
-        // bit_order
         require(1, "bit_order");
         ctx.order = readU8(p) ? BitOrder::MSB : BitOrder::LSB; p += 1;
 
-        // fallback_flags
         require(1, "fallback_flags");
         const uint8_t ff = readU8(p); p += 1;
         ctx.leftRaw  = (ff & 0x01) != 0;
         ctx.rightRaw = (ff & 0x02) != 0;
         ctx.bothRaw  = ctx.leftRaw && ctx.rightRaw;
 
-        // shared_dict_flag
         require(1, "shared_dict_flag");
         ctx.shared = readU8(p) != 0; p += 1;
 
-        ctx.lb = leftBytes (ctx.mode);
-        ctx.rb = rightBytes(ctx.mode);
+        ctx.useFlatLeft  = useFlatArray(ctx.lb);
+        ctx.useFlatRight = useFlatArray(ctx.rb);
 
-        // Left dict
+        // ---- Left dict / raw ----
         if (!ctx.leftRaw) {
-            require(3, "left_dict_header");
+            require(5, "left_dict_header");
             auto dr = readDict(p, ctx.lb);
             ctx.leftCW = dr.codeWidth;
-            ctx.leftTable.resize(static_cast<size_t>(1) << ctx.leftCW, 0);
-            for (auto& [code, val] : dr.codeToValue)
-                ctx.leftTable[code] = val;
+            if (ctx.useFlatLeft) {
+                ctx.leftFlatTable.assign(size_t{1} << ctx.leftCW, 0);
+                for (auto& [code, val] : dr.codeToValue)
+                    ctx.leftFlatTable[code] = val;
+            } else {
+                ctx.leftHashTable = std::move(dr.codeToValue);
+            }
             p += dr.bytesRead;
         } else {
             ctx.leftCW = ctx.lb * 8u;
         }
 
-        // Right dict
+        // ---- Right dict / raw / shared ----
         if (!ctx.rightRaw && !ctx.shared) {
-            require(3, "right_dict_header");
+            require(5, "right_dict_header");
             auto dr = readDict(p, ctx.rb);
             ctx.rightCW = dr.codeWidth;
-            ctx.rightTable.resize(static_cast<size_t>(1) << ctx.rightCW, 0);
-            for (auto& [code, val] : dr.codeToValue)
-                ctx.rightTable[code] = val;
+            if (ctx.useFlatRight) {
+                ctx.rightFlatTable.assign(size_t{1} << ctx.rightCW, 0);
+                for (auto& [code, val] : dr.codeToValue)
+                    ctx.rightFlatTable[code] = val;
+            } else {
+                ctx.rightHashTable = std::move(dr.codeToValue);
+            }
             p += dr.bytesRead;
         } else if (ctx.shared) {
             ctx.rightCW = ctx.leftCW;
-            // rightTable not needed; we'll use leftTable for both
+            // Right side reuses the left table — no separate allocation needed.
         } else {
             ctx.rightCW = ctx.rb * 8u;
         }
 
         ctx.bitsPerInt = ctx.leftCW + ctx.rightCW;
 
-        // encoded_ints_length
         require(8, "stream_length");
         ctx.streamBytes = static_cast<size_t>(readU64(p)); p += 8;
 
@@ -859,109 +1030,122 @@ private:
         return ctx;
     }
 
-    static int32_t decodeOne(const DecodeCtx& ctx, size_t index) {
-        using namespace detail;
+    // ---- Single-element decode (random access) ----------------------------
 
+    static T decodeOne(const DecodeCtx& ctx, size_t index) {
         if (ctx.bothRaw) {
-            int32_t v;
-            std::memcpy(&v,
-                ctx.streamPtr + index * sizeof(int32_t),
-                sizeof(int32_t));
+            T v;
+            std::memcpy(&v, ctx.streamPtr + index * sizeof(T), sizeof(T));
             return v;
         }
-
         const size_t bitPos = index * ctx.bitsPerInt;
         BitReader br(ctx.streamPtr, ctx.streamBytes, ctx.order);
         br.seekToBit(bitPos);
         return decodeNextFromReader(ctx, br);
     }
 
+    // ---- Sequential decode -----------------------------------------------
+
     /**
-     * @brief Decode a contiguous half-open range [start, end) in a single
-     *        sequential pass over the bit stream — no per-element seek.
-     *
-     * The decode variant (leftRaw / rightRaw / shared) is dispatched once
-     * outside the hot loop via a templated lambda, so the per-element body
-     * contains no branches on those flags.
+     * @brief Decode [start, end) in a single pass.
+     *        The decode variant is dispatched once outside the hot loop.
      */
-    static std::vector<int32_t> decodeSequential(
+    static std::vector<T> decodeSequential(
         const DecodeCtx& ctx, size_t start, size_t end)
     {
-        using namespace detail;
-
         const size_t count = end - start;
-        std::vector<int32_t> result;
+        std::vector<T> result;
         result.reserve(count);
 
         if (ctx.bothRaw) {
             result.resize(count);
             std::memcpy(result.data(),
-                        ctx.streamPtr + start * sizeof(int32_t),
-                        count * sizeof(int32_t));
+                        ctx.streamPtr + start * sizeof(T),
+                        count * sizeof(T));
             return result;
         }
-
-        // Precompute the shift used by reconstruct() so it's not recomputed
-        // inside the loop via a switch statement each iteration.
-        const uint32_t leftShift = ctx.lb * 8u;
 
         BitReader br(ctx.streamPtr, ctx.streamBytes, ctx.order);
         br.seekToBit(start * ctx.bitsPerInt);
 
-        // Dispatch once on the decode variant; each lambda captures only
-        // what it needs and has a branchless inner body.
-        auto runLoop = [&](auto decodeOne) {
-            for (size_t i = 0; i < count; ++i)
-                result.push_back(decodeOne(br));
+        // Resolve a left code to its group value.
+        auto resolveLeft = [&](uint32_t code) -> uint64_t {
+            if (ctx.useFlatLeft) return ctx.leftFlatTable[code];
+            return ctx.leftHashTable.at(code);
+        };
+        // Resolve a right code to its group value (shared uses left table).
+        auto resolveRight = [&](uint32_t code) -> uint64_t {
+            if (ctx.shared) {
+                if (ctx.useFlatLeft) return ctx.leftFlatTable[code];
+                return ctx.leftHashTable.at(code);
+            }
+            if (ctx.useFlatRight) return ctx.rightFlatTable[code];
+            return ctx.rightHashTable.at(code);
         };
 
-        if (!ctx.leftRaw && !ctx.rightRaw && !ctx.shared) {
-            // Common path: both sides dictionary-coded, separate dicts
-            const auto& lt = ctx.leftTable;
-            const auto& rt = ctx.rightTable;
-            const uint32_t lcw = ctx.leftCW;
-            const uint32_t rcw = ctx.rightCW;
-            runLoop([&](BitReader& r) -> int32_t {
-                const uint32_t lv = lt[r.read(lcw)];
-                const uint32_t rv = rt[r.read(rcw)];
-                return static_cast<int32_t>(lv | (rv << leftShift));
-            });
-        } else if (!ctx.leftRaw && !ctx.rightRaw && ctx.shared) {
-            // Split22 shared dict
-            const auto& lt = ctx.leftTable;
-            const uint32_t lcw = ctx.leftCW;
-            const uint32_t rcw = ctx.rightCW;
-            runLoop([&](BitReader& r) -> int32_t {
-                const uint32_t lv = lt[r.read(lcw)];
-                const uint32_t rv = lt[r.read(rcw)];
-                return static_cast<int32_t>(lv | (rv << leftShift));
+        auto runLoop = [&](auto decodeOneFn) {
+            for (size_t i = 0; i < count; ++i)
+                result.push_back(decodeOneFn(br, start + i));
+        };
+
+        const uint32_t lb = ctx.lb;
+
+        SUBINT_DBG("decode: lb=" << lb << " rb=" << ctx.rb
+                   << " leftCW=" << ctx.leftCW << " rightCW=" << ctx.rightCW
+                   << " bitsPerInt=" << ctx.bitsPerInt
+                   << " leftRaw=" << ctx.leftRaw << " rightRaw=" << ctx.rightRaw
+                   << " shared=" << ctx.shared
+                   << " useFlatLeft=" << ctx.useFlatLeft
+                   << " useFlatRight=" << ctx.useFlatRight);
+
+        if (!ctx.leftRaw && !ctx.rightRaw) {
+            const uint32_t lcw = ctx.leftCW, rcw = ctx.rightCW;
+            runLoop([&](BitReader& r, [[maybe_unused]] size_t idx) -> T {
+                uint32_t lcode = r.read(lcw);
+                uint32_t rcode = r.read(rcw);
+                uint64_t lval  = resolveLeft(lcode);
+                uint64_t rval  = resolveRight(rcode);
+                T result = static_cast<T>(detail::reconstruct(lval, rval, lb));
+                SUBINT_DBG("  dec[" << idx << "]  lcode=" << lcode << " lval=0x" << std::hex << lval
+                           << "  rcode=" << std::dec << rcode << " rval=0x" << std::hex << rval
+                           << "  result=0x" << (typename std::make_unsigned<T>::type)result << std::dec);
+                return result;
             });
         } else if (ctx.leftRaw && !ctx.rightRaw) {
-            const auto& rt = ctx.rightTable;
-            const uint32_t lbits = ctx.lb * 8u;
-            const uint32_t rcw   = ctx.rightCW;
-            runLoop([&](BitReader& r) -> int32_t {
-                const uint32_t lv = r.read(lbits);
-                const uint32_t rv = rt[r.read(rcw)];
-                return static_cast<int32_t>(lv | (rv << leftShift));
+            const uint32_t lbits = lb * 8u, rcw = ctx.rightCW;
+            runLoop([&](BitReader& r, [[maybe_unused]] size_t idx) -> T {
+                uint64_t lval  = r.read(lbits);
+                uint32_t rcode = r.read(rcw);
+                uint64_t rval  = resolveRight(rcode);
+                T result = static_cast<T>(detail::reconstruct(lval, rval, lb));
+                SUBINT_DBG("  dec[" << idx << "]  lval(raw)=0x" << std::hex << lval
+                           << "  rcode=" << std::dec << rcode << " rval=0x" << std::hex << rval
+                           << "  result=0x" << (typename std::make_unsigned<T>::type)result << std::dec);
+                return result;
             });
         } else if (!ctx.leftRaw && ctx.rightRaw) {
-            const auto& lt = ctx.leftTable;
-            const uint32_t lcw   = ctx.leftCW;
-            const uint32_t rbits = ctx.rb * 8u;
-            runLoop([&](BitReader& r) -> int32_t {
-                const uint32_t lv = lt[r.read(lcw)];
-                const uint32_t rv = r.read(rbits);
-                return static_cast<int32_t>(lv | (rv << leftShift));
+            const uint32_t lcw = ctx.leftCW, rbits = ctx.rb * 8u;
+            runLoop([&](BitReader& r, [[maybe_unused]] size_t idx) -> T {
+                uint32_t lcode = r.read(lcw);
+                uint64_t lval  = resolveLeft(lcode);
+                uint64_t rval  = r.read(rbits);
+                T result = static_cast<T>(detail::reconstruct(lval, rval, lb));
+                SUBINT_DBG("  dec[" << idx << "]  lcode=" << lcode << " lval=0x" << std::hex << lval
+                           << "  rval(raw)=0x" << rval
+                           << "  result=0x" << (typename std::make_unsigned<T>::type)result << std::dec);
+                return result;
             });
         } else {
-            // Both raw (but bitsPerInt != 0, so it's not the plain-memcpy case)
-            const uint32_t lbits = ctx.lb * 8u;
-            const uint32_t rbits = ctx.rb * 8u;
-            runLoop([&](BitReader& r) -> int32_t {
-                const uint32_t lv = r.read(lbits);
-                const uint32_t rv = r.read(rbits);
-                return static_cast<int32_t>(lv | (rv << leftShift));
+            // Both raw via bit stream (not the plain-memcpy bothRaw path)
+            const uint32_t lbits = lb * 8u, rbits = ctx.rb * 8u;
+            runLoop([&](BitReader& r, [[maybe_unused]] size_t idx) -> T {
+                uint64_t lval = r.read(lbits);
+                uint64_t rval = r.read(rbits);
+                T result = static_cast<T>(detail::reconstruct(lval, rval, lb));
+                SUBINT_DBG("  dec[" << idx << "]  lval(raw)=0x" << std::hex << lval
+                           << "  rval(raw)=0x" << rval
+                           << "  result=0x" << (typename std::make_unsigned<T>::type)result << std::dec);
+                return result;
             });
         }
 
@@ -969,38 +1153,69 @@ private:
     }
 
     /**
-     * @brief Decode a single integer from a BitReader that is already
-     *        positioned at the start of that integer's bits.
-     * Advances the reader by exactly ctx.bitsPerInt bits.
+     * @brief Decode a single integer from a BitReader already positioned at
+     *        the start of that integer's bits.  Advances by exactly bitsPerInt.
      */
-    static inline int32_t decodeNextFromReader(const DecodeCtx& ctx, BitReader& br) {
-        using namespace detail;
-
+    static T decodeNextFromReader(const DecodeCtx& ctx, BitReader& br) {
         // Left group
-        uint32_t leftVal;
+        uint64_t leftVal;
         if (ctx.leftRaw) {
-            leftVal = br.read(ctx.lb * 8u);
+            leftVal = readBits64(br, ctx.lb * 8u);
         } else {
             const uint32_t code = br.read(ctx.leftCW);
-            if (code >= ctx.leftTable.size())
-                throw std::runtime_error("SubIntEncoder::decode: left code out of range");
-            leftVal = ctx.leftTable[code];
+            if (ctx.useFlatLeft) {
+                if (code >= ctx.leftFlatTable.size())
+                    throw std::runtime_error("SubIntEncoder::decode: left code out of range");
+                leftVal = ctx.leftFlatTable[code];
+            } else {
+                auto it = ctx.leftHashTable.find(code);
+                if (it == ctx.leftHashTable.end())
+                    throw std::runtime_error("SubIntEncoder::decode: left code not found");
+                leftVal = it->second;
+            }
         }
 
         // Right group
-        uint32_t rightVal;
+        uint64_t rightVal;
         if (ctx.rightRaw) {
-            rightVal = br.read(ctx.rb * 8u);
+            rightVal = readBits64(br, ctx.rb * 8u);
         } else {
             const uint32_t code = br.read(ctx.rightCW);
-            const auto& tbl = ctx.shared ? ctx.leftTable : ctx.rightTable;
-            if (code >= tbl.size())
-                throw std::runtime_error("SubIntEncoder::decode: right code out of range");
-            rightVal = tbl[code];
+            if (ctx.shared) {
+                if (ctx.useFlatLeft) {
+                    if (code >= ctx.leftFlatTable.size())
+                        throw std::runtime_error("SubIntEncoder::decode: shared right code out of range");
+                    rightVal = ctx.leftFlatTable[code];
+                } else {
+                    auto it = ctx.leftHashTable.find(code);
+                    if (it == ctx.leftHashTable.end())
+                        throw std::runtime_error("SubIntEncoder::decode: shared right code not found");
+                    rightVal = it->second;
+                }
+            } else if (ctx.useFlatRight) {
+                if (code >= ctx.rightFlatTable.size())
+                    throw std::runtime_error("SubIntEncoder::decode: right code out of range");
+                rightVal = ctx.rightFlatTable[code];
+            } else {
+                auto it = ctx.rightHashTable.find(code);
+                if (it == ctx.rightHashTable.end())
+                    throw std::runtime_error("SubIntEncoder::decode: right code not found");
+                rightVal = it->second;
+            }
         }
 
-        return static_cast<int32_t>(reconstruct(leftVal, rightVal, ctx.mode));
+        return static_cast<T>(detail::reconstruct(leftVal, rightVal, ctx.lb));
     }
 };
+
+// ============================================================================
+// Convenience type aliases
+// ============================================================================
+
+/// SubIntEncoder specialised for int32_t (splits: {1,3}, {2,2}, {3,1})
+using SubInt32Encoder = SubIntEncoder<int32_t>;
+
+/// SubIntEncoder specialised for int64_t (splits: {1,7}–{7,1})
+using SubInt64Encoder = SubIntEncoder<int64_t>;
 
 } // namespace encodings::encoders
