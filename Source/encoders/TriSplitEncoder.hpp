@@ -1,0 +1,704 @@
+#pragma once
+
+#include <algorithm>
+#include <bit>
+#include <cstdint>
+#include <cstddef>
+#include <cstdlib>
+#include <cstring>
+#include <iostream>
+#include <limits>
+#include <memory>
+#include <optional>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <type_traits>
+#include <vector>
+
+#include "encodings/Encoder.hpp"
+#include "encodings/EncodedData.hpp"
+#include "encodings/EncodingProperty.hpp"
+#include "encodings/EncodingType.hpp"
+#include "encoders/DictionaryEncoder.hpp"
+#include "encoders/FOREncoder.hpp"
+#include "encoders/RawEncoder.hpp"
+#include "encoders/AdaptiveFOREncoder.hpp"
+
+namespace encodings::encoders {
+
+// ---------------------------------------------------------------------------
+// Bit split order
+// ---------------------------------------------------------------------------
+
+enum class BitSplitOrder : uint8_t {
+    LSB_TO_MSB = 0,  // A = lowest bits, then B, then C highest
+    MSB_TO_LSB = 1,  // A = highest bits, then B, then C lowest
+};
+
+// ---------------------------------------------------------------------------
+// Section codec type-erased adapter (API-B convenience)
+// ---------------------------------------------------------------------------
+
+class ISectionCodec64 {
+public:
+    virtual ~ISectionCodec64() = default;
+
+    virtual EncodedBuffer<uint8_t> encode(std::span<const uint64_t> data) = 0;
+    virtual std::vector<uint64_t> decodeAll(const EncodedBuffer<uint8_t>& enc) = 0;
+    virtual std::optional<uint64_t> decodeAt(const EncodedBuffer<uint8_t>& enc, size_t idx) = 0;
+    virtual std::vector<uint64_t> decodeRange(const EncodedBuffer<uint8_t>& enc, size_t start, size_t end) = 0;
+    virtual EncodingProperties properties() const = 0;
+    virtual std::string name() const = 0;
+};
+
+template <typename T>
+class TypedSectionCodecAdapter final : public ISectionCodec64 {
+    static_assert(std::is_integral_v<T>, "Section adapter expects integral type");
+
+public:
+    explicit TypedSectionCodecAdapter(std::shared_ptr<Codec<T, uint8_t>> impl, uint8_t bits)
+        : impl_(std::move(impl)), bits_(bits) {
+        if (!impl_) {
+            throw std::invalid_argument("TypedSectionCodecAdapter: impl must not be null");
+        }
+        if (bits_ == 0 || bits_ > 64) {
+            throw std::invalid_argument("TypedSectionCodecAdapter: bits must be in [1,64]");
+        }
+        if (bits_ > sizeof(T) * 8) {
+            throw std::invalid_argument("TypedSectionCodecAdapter: bits exceed underlying type width");
+        }
+    }
+
+    EncodedBuffer<uint8_t> encode(std::span<const uint64_t> data) override {
+        std::vector<T> narrowed;
+        narrowed.reserve(data.size());
+        const uint64_t mask = bits_ == 64 ? ~uint64_t{0} : ((uint64_t{1} << bits_) - 1);
+        for (uint64_t v : data) {
+            if ((v & ~mask) != 0) {
+                throw std::overflow_error("Section value does not fit in configured bit width");
+            }
+            if constexpr (std::is_signed_v<T>) {
+                constexpr uint64_t signedMax = static_cast<uint64_t>(std::numeric_limits<T>::max());
+                if (v > signedMax) {
+                    throw std::overflow_error("Section value exceeds signed range for underlying type");
+                }
+            }
+            narrowed.push_back(static_cast<T>(v));
+        }
+        return impl_->encode(std::span<const T>(narrowed.data(), narrowed.size()));
+    }
+
+    std::vector<uint64_t> decodeAll(const EncodedBuffer<uint8_t>& enc) override {
+        auto vals = impl_->decodeAll(enc);
+        std::vector<uint64_t> widened;
+        widened.reserve(vals.size());
+        for (T v : vals) widened.push_back(static_cast<uint64_t>(v));
+        return widened;
+    }
+
+    std::optional<uint64_t> decodeAt(const EncodedBuffer<uint8_t>& enc, size_t idx) override {
+        auto v = impl_->decodeAt(enc, idx);
+        if (!v) return std::nullopt;
+        return static_cast<uint64_t>(*v);
+    }
+
+    std::vector<uint64_t> decodeRange(const EncodedBuffer<uint8_t>& enc, size_t start, size_t end) override {
+        auto vals = impl_->decodeRange(enc, start, end);
+        std::vector<uint64_t> widened;
+        widened.reserve(vals.size());
+        for (T v : vals) widened.push_back(static_cast<uint64_t>(v));
+        return widened;
+    }
+
+    EncodingProperties properties() const override { return impl_->properties(); }
+    std::string name() const override { return impl_->name(); }
+
+private:
+    std::shared_ptr<Codec<T, uint8_t>> impl_;
+    uint8_t bits_{};
+};
+
+// Helper to choose underlying unsigned type based on bit width
+inline constexpr uint8_t chooseTypeBits(uint8_t bits) {
+    if (bits <= 8) return 8;
+    if (bits <= 16) return 16;
+    if (bits <= 32) return 32;
+    return 64;
+}
+
+template <typename T>
+std::shared_ptr<ISectionCodec64> makeSectionCodec(std::shared_ptr<Codec<T, uint8_t>> codec, uint8_t bits) {
+    return std::make_shared<TypedSectionCodecAdapter<T>>(std::move(codec), bits);
+}
+
+inline std::shared_ptr<ISectionCodec64> makeSectionCodecForBits(std::shared_ptr<Codec<uint8_t, uint8_t>> c, uint8_t bits) {
+    return makeSectionCodec<uint8_t>(std::move(c), bits);
+}
+inline std::shared_ptr<ISectionCodec64> makeSectionCodecForBits(std::shared_ptr<Codec<uint16_t, uint8_t>> c, uint8_t bits) {
+    return makeSectionCodec<uint16_t>(std::move(c), bits);
+}
+inline std::shared_ptr<ISectionCodec64> makeSectionCodecForBits(std::shared_ptr<Codec<uint32_t, uint8_t>> c, uint8_t bits) {
+    return makeSectionCodec<uint32_t>(std::move(c), bits);
+}
+inline std::shared_ptr<ISectionCodec64> makeSectionCodecForBits(std::shared_ptr<Codec<uint64_t, uint8_t>> c, uint8_t bits) {
+    return makeSectionCodec<uint64_t>(std::move(c), bits);
+}
+
+inline std::shared_ptr<ISectionCodec64> makeSectionCodecForBits(std::shared_ptr<Codec<int8_t, uint8_t>> c, uint8_t bits) {
+    return makeSectionCodec<int8_t>(std::move(c), bits);
+}
+inline std::shared_ptr<ISectionCodec64> makeSectionCodecForBits(std::shared_ptr<Codec<int16_t, uint8_t>> c, uint8_t bits) {
+    return makeSectionCodec<int16_t>(std::move(c), bits);
+}
+inline std::shared_ptr<ISectionCodec64> makeSectionCodecForBits(std::shared_ptr<Codec<int32_t, uint8_t>> c, uint8_t bits) {
+    return makeSectionCodec<int32_t>(std::move(c), bits);
+}
+inline std::shared_ptr<ISectionCodec64> makeSectionCodecForBits(std::shared_ptr<Codec<int64_t, uint8_t>> c, uint8_t bits) {
+    return makeSectionCodec<int64_t>(std::move(c), bits);
+}
+
+// ---------------------------------------------------------------------------
+// Config
+// ---------------------------------------------------------------------------
+
+struct TriSplitConfig64 {
+    uint8_t bitsA{0};
+    uint8_t bitsB{0};
+    uint8_t bitsC{0};
+    BitSplitOrder order{BitSplitOrder::LSB_TO_MSB};
+
+    std::shared_ptr<ISectionCodec64> codecA;
+    std::shared_ptr<ISectionCodec64> codecB;
+    std::shared_ptr<ISectionCodec64> codecC;
+};
+
+// ---------------------------------------------------------------------------
+// TriSplitEncoder64
+// ---------------------------------------------------------------------------
+
+class TriSplitEncoder64 final : public Codec<int64_t, uint8_t> {
+public:
+    explicit TriSplitEncoder64(TriSplitConfig64 cfg) : cfg_(std::move(cfg)) {
+        validateConfig();
+    }
+
+    EncodedBuffer<uint8_t> encode(std::span<const int64_t> data) override {
+        const size_t N = data.size();
+        if (N == 0) {
+            return makeEmpty();
+        }
+
+        std::vector<uint64_t> secA(N), secB(N), secC(N);
+        for (size_t i = 0; i < N; ++i) {
+            splitValue(static_cast<uint64_t>(data[i]), secA[i], secB[i], secC[i]);
+        }
+
+        auto encA = cfg_.codecA->encode(std::span<const uint64_t>(secA.data(), secA.size()));
+        auto encB = cfg_.codecB->encode(std::span<const uint64_t>(secB.data(), secB.size()));
+        auto encC = cfg_.codecC->encode(std::span<const uint64_t>(secC.data(), secC.size()));
+
+        const uint64_t bytesA = encA.data().size();
+        const uint64_t bytesB = encB.data().size();
+        const uint64_t bytesC = encC.data().size();
+
+        // Header: [N:8][bitsA:1][bitsB:1][bitsC:1][order:1][bytesA:8][bytesB:8][bytesC:8]
+        std::vector<uint8_t> out;
+        out.resize(headerSize());
+
+        uint8_t* p = out.data();
+        writeU64(p, static_cast<uint64_t>(N));
+        p += 8;
+        *p++ = cfg_.bitsA;
+        *p++ = cfg_.bitsB;
+        *p++ = cfg_.bitsC;
+        *p++ = static_cast<uint8_t>(cfg_.order);
+        writeU64(p, bytesA); p += 8;
+        writeU64(p, bytesB); p += 8;
+        writeU64(p, bytesC); p += 8;
+
+        out.insert(out.end(), encA.data().begin(), encA.data().end());
+        out.insert(out.end(), encB.data().begin(), encB.data().end());
+        out.insert(out.end(), encC.data().begin(), encC.data().end());
+
+        encodings::EncodingMetadata meta;
+        meta.encodingName         = name();
+        meta.dataType             = encodings::core::typeToDataType<int64_t>;
+        meta.elementCount         = N;
+        meta.compressedSize       = out.size();
+        meta.uncompressedSize     = N * sizeof(int64_t);
+        meta.supportsRandomAccess = allSectionsRandomAccess();
+
+        if (verboseEnabled()) {
+            const double bitsPerElemA = N ? (static_cast<double>(bytesA) * 8.0 / static_cast<double>(N)) : 0.0;
+            const double bitsPerElemB = N ? (static_cast<double>(bytesB) * 8.0 / static_cast<double>(N)) : 0.0;
+            const double bitsPerElemC = N ? (static_cast<double>(bytesC) * 8.0 / static_cast<double>(N)) : 0.0;
+            const double bitsPerElemTotal = N ? (static_cast<double>(out.size()) * 8.0 / static_cast<double>(N)) : 0.0;
+            std::cerr << "[TriSplit] N=" << N
+                      << " order=" << (cfg_.order == BitSplitOrder::LSB_TO_MSB ? "LSB" : "MSB")
+                      << " bits=" << static_cast<int>(cfg_.bitsA) << "|" << static_cast<int>(cfg_.bitsB)
+                      << "|" << static_cast<int>(cfg_.bitsC)
+                      << " A=" << bytesA << "B (~" << bitsPerElemA << " b/elem)"
+                      << " B=" << bytesB << "B (~" << bitsPerElemB << " b/elem)"
+                      << " C=" << bytesC << "B (~" << bitsPerElemC << " b/elem)"
+                      << " total=" << out.size() << "B (~" << bitsPerElemTotal << " b/elem)"
+                      << " ratio=" << (N ? (static_cast<double>(out.size()) / (N * sizeof(int64_t))) : 0.0)
+                      << "\n";
+        }
+
+        return encodings::EncodedData(std::move(out), std::move(meta));
+    }
+
+    std::vector<int64_t> decodeAll(const EncodedBuffer<uint8_t>& encoded) override {
+        const auto& h = getCachedHeader(encoded);
+        if (h.N == 0) return {};
+
+        auto secA = cfg_.codecA->decodeAll(h.viewA);
+        auto secB = cfg_.codecB->decodeAll(h.viewB);
+        auto secC = cfg_.codecC->decodeAll(h.viewC);
+
+        if (secA.size() != h.N || secB.size() != h.N || secC.size() != h.N) {
+            throw std::runtime_error("TriSplitEncoder64::decodeAll: section size mismatch");
+        }
+
+        std::vector<int64_t> out(h.N);
+        for (size_t i = 0; i < h.N; ++i) {
+            out[i] = static_cast<int64_t>(combine(secA[i], secB[i], secC[i]));
+        }
+        return out;
+    }
+
+    std::optional<int64_t> decodeAt(const EncodedBuffer<uint8_t>& encoded, size_t index) override {
+        const auto& h = getCachedHeader(encoded);
+        if (index >= h.N) return std::nullopt;
+
+        const uint64_t a = decodeOneSection(*cfg_.codecA, h.viewA, index);
+        const uint64_t b = decodeOneSection(*cfg_.codecB, h.viewB, index);
+        const uint64_t c = decodeOneSection(*cfg_.codecC, h.viewC, index);
+
+        return static_cast<int64_t>(combine(a, b, c));
+    }
+
+    std::vector<int64_t> decodeRange(const EncodedBuffer<uint8_t>& encoded, size_t start, size_t end) override {
+        const auto& h = getCachedHeader(encoded);
+        if (start >= h.N) return {};
+        end = std::min(end, h.N);
+        if (start >= end) return {};
+        const size_t count = end - start;
+
+        const auto secA = decodeSectionRange(*cfg_.codecA, h.viewA, start, end);
+        const auto secB = decodeSectionRange(*cfg_.codecB, h.viewB, start, end);
+        const auto secC = decodeSectionRange(*cfg_.codecC, h.viewC, start, end);
+
+        if (secA.size() != count || secB.size() != count || secC.size() != count) {
+            throw std::runtime_error("TriSplitEncoder64::decodeRange: section size mismatch");
+        }
+
+        std::vector<int64_t> out;
+        out.reserve(count);
+        for (size_t i = 0; i < count; ++i) {
+            out.push_back(static_cast<int64_t>(combine(secA[i], secB[i], secC[i])));
+        }
+        return out;
+    }
+
+    EncodingType encodingType() const override { return EncodingType::Structural; }
+
+    std::string name() const override {
+        return "TriSplit(" + std::to_string(cfg_.bitsA) + "|" +
+               std::to_string(cfg_.bitsB) + "|" + std::to_string(cfg_.bitsC) +
+               (cfg_.order == BitSplitOrder::LSB_TO_MSB ? ",LSB" : ",MSB") + ")";
+    }
+
+    EncodingProperties properties() const override {
+        using EP = EncodingProperty;
+        EncodingProperties props;
+        props.add(EP::Lossless)
+             .add(EP::PreservesOrder)
+             .add(EP::Composable);
+        if (allSectionsRandomAccess()) props.add(EP::RandomAccess);
+        return props;
+    }
+
+private:
+    // -------------------------------------------------------------------
+    // Header helpers
+    // -------------------------------------------------------------------
+    struct ParsedHeader {
+        size_t N{};
+        uint8_t bitsA{};
+        uint8_t bitsB{};
+        uint8_t bitsC{};
+        BitSplitOrder order{BitSplitOrder::LSB_TO_MSB};
+        uint64_t bytesA{};
+        uint64_t bytesB{};
+        uint64_t bytesC{};
+        EncodedBuffer<uint8_t> viewA;
+        EncodedBuffer<uint8_t> viewB;
+        EncodedBuffer<uint8_t> viewC;
+    };
+
+    static constexpr size_t headerSize() {
+        return 8 + 1 + 1 + 1 + 1 + 8 + 8 + 8; // 36 bytes
+    }
+
+    static void writeU64(uint8_t* dst, uint64_t v) {
+        std::memcpy(dst, &v, sizeof(uint64_t));
+    }
+    static uint64_t readU64(const uint8_t* src) {
+        uint64_t v; std::memcpy(&v, src, sizeof(uint64_t)); return v; }
+
+    const ParsedHeader& getCachedHeader(const EncodedBuffer<uint8_t>& encoded) const {
+        const uint8_t* basePtr = encoded.data().data();
+        const size_t totalSize = encoded.data().size();
+
+        if (cachedOuterPtr_ != basePtr || cachedOuterSize_ != totalSize) {
+            cachedHeader_ = parseHeader(encoded);
+            cachedOuterPtr_ = basePtr;
+            cachedOuterSize_ = totalSize;
+        }
+        return cachedHeader_;
+    }
+
+    ParsedHeader parseHeader(const EncodedBuffer<uint8_t>& encoded) const {
+        if (encoded.data().size() < headerSize()) {
+            throw std::runtime_error("TriSplitEncoder64: buffer too small for header");
+        }
+
+        const uint8_t* p = encoded.data().data();
+        const size_t totalSize = encoded.data().size();
+
+        ParsedHeader h;
+        h.N     = static_cast<size_t>(readU64(p)); p += 8;
+        h.bitsA = *p++;
+        h.bitsB = *p++;
+        h.bitsC = *p++;
+        h.order = static_cast<BitSplitOrder>(*p++);
+        h.bytesA = readU64(p); p += 8;
+        h.bytesB = readU64(p); p += 8;
+        h.bytesC = readU64(p); p += 8;
+
+        if (h.bitsA + h.bitsB + h.bitsC != 64) {
+            throw std::runtime_error("TriSplitEncoder64: invalid header bit sum");
+        }
+
+        const size_t offA = headerSize();
+        const size_t offB = offA + static_cast<size_t>(h.bytesA);
+        const size_t offC = offB + static_cast<size_t>(h.bytesB);
+        if (offC + static_cast<size_t>(h.bytesC) > totalSize) {
+            throw std::runtime_error("TriSplitEncoder64: payload sizes exceed buffer");
+        }
+
+        h.viewA = slice(encoded, offA, h.bytesA, h.N);
+        h.viewB = slice(encoded, offB, h.bytesB, h.N);
+        h.viewC = slice(encoded, offC, h.bytesC, h.N);
+        return h;
+    }
+
+    static EncodedBuffer<uint8_t> slice(const EncodedBuffer<uint8_t>& base, size_t off, size_t len, size_t elementCount) {
+        const uint8_t* src = base.data().data() + off;
+        std::vector<uint8_t> payload(src, src + len);
+        encodings::EncodingMetadata meta;
+        meta.encodingName         = "TriSplitSection";
+        meta.dataType             = encodings::core::typeToDataType<uint64_t>;
+        meta.elementCount         = elementCount;
+        meta.compressedSize       = len;
+        meta.uncompressedSize     = 0;
+        // RA flag is determined by the section codec itself.
+        return encodings::EncodedData(std::move(payload), std::move(meta));
+    }
+
+    // -------------------------------------------------------------------
+    // Split/combine helpers
+    // -------------------------------------------------------------------
+    void validateConfig() const {
+        if (cfg_.bitsA == 0 || cfg_.bitsB == 0 || cfg_.bitsC == 0) {
+            throw std::invalid_argument("TriSplitEncoder64: bits for each section must be > 0");
+        }
+        if (static_cast<uint16_t>(cfg_.bitsA) + cfg_.bitsB + cfg_.bitsC != 64) {
+            throw std::invalid_argument("TriSplitEncoder64: bitsA+bitsB+bitsC must equal 64");
+        }
+        if (!cfg_.codecA || !cfg_.codecB || !cfg_.codecC) {
+            throw std::invalid_argument("TriSplitEncoder64: codecs must not be null");
+        }
+    }
+
+    void splitValue(uint64_t v, uint64_t& a, uint64_t& b, uint64_t& c) const {
+        if (cfg_.order == BitSplitOrder::LSB_TO_MSB) {
+            const uint64_t maskA = cfg_.bitsA == 64 ? ~uint64_t{0} : ((uint64_t{1} << cfg_.bitsA) - 1);
+            const uint64_t maskB = cfg_.bitsB == 64 ? ~uint64_t{0} : ((uint64_t{1} << cfg_.bitsB) - 1);
+            a = v & maskA;
+            v >>= cfg_.bitsA;
+            b = v & maskB;
+            v >>= cfg_.bitsB;
+            c = v; // remaining bits
+        } else {
+            const uint8_t highShift = 64 - cfg_.bitsA;
+            a = v >> highShift;
+            v &= ((uint64_t{1} << highShift) - 1);
+            const uint8_t midShift = highShift - cfg_.bitsB;
+            b = v >> midShift;
+            c = v & ((uint64_t{1} << midShift) - 1);
+        }
+    }
+
+    uint64_t combine(uint64_t a, uint64_t b, uint64_t c) const {
+        if (cfg_.order == BitSplitOrder::LSB_TO_MSB) {
+            uint64_t v = a;
+            v |= (b << cfg_.bitsA);
+            v |= (c << (cfg_.bitsA + cfg_.bitsB));
+            return v;
+        } else {
+            uint64_t v = a;
+            v <<= cfg_.bitsB;
+            v |= b;
+            v <<= cfg_.bitsC;
+            v |= c;
+            return v;
+        }
+    }
+
+    bool allSectionsRandomAccess() const {
+        auto has = [](const EncodingProperties& p) {
+            return p.has(EncodingProperty::RandomAccess);
+        };
+        return has(cfg_.codecA->properties()) && has(cfg_.codecB->properties()) && has(cfg_.codecC->properties());
+    }
+
+    static uint64_t decodeOneSection(ISectionCodec64& c, const EncodedBuffer<uint8_t>& view, size_t idx) {
+    if (c.properties().has(EncodingProperty::RandomAccess)) {
+            auto v = c.decodeAt(view, idx);
+            if (!v) throw std::runtime_error("TriSplitEncoder64::decodeAt: subcodec returned null");
+            return *v;
+        }
+        // No RA: decodeAll then index (no persistent caching by design; could be optimized later).
+        auto all = c.decodeAll(view);
+        if (idx >= all.size()) throw std::runtime_error("TriSplitEncoder64::decodeAt: index out of range after full decode");
+        return all[idx];
+    }
+
+    static std::vector<uint64_t> decodeSectionRange(ISectionCodec64& c, const EncodedBuffer<uint8_t>& view, size_t start, size_t end) {
+    if (c.properties().has(EncodingProperty::RandomAccess)) {
+            return c.decodeRange(view, start, end);
+        }
+        auto all = c.decodeAll(view);
+        if (start > all.size()) return {};
+        end = std::min(end, all.size());
+        return std::vector<uint64_t>(all.begin() + static_cast<ptrdiff_t>(start), all.begin() + static_cast<ptrdiff_t>(end));
+    }
+
+    static EncodedBuffer<uint8_t> makeEmpty() {
+        std::vector<uint8_t> out(headerSize(), 0);
+        encodings::EncodingMetadata meta;
+        meta.encodingName         = "TriSplit(empty)";
+        meta.elementCount         = 0;
+        meta.compressedSize       = out.size();
+        meta.uncompressedSize     = 0;
+        meta.supportsRandomAccess = true;
+        return encodings::EncodedData(std::move(out), std::move(meta));
+    }
+
+    static bool verboseEnabled() {
+        static bool v = (std::getenv("TRISPLIT_VERBOSE") != nullptr);
+        return true || v;
+    }
+
+private:
+    TriSplitConfig64 cfg_;
+    // Cache of parsed header and section views keyed by outer encoded buffer identity.
+    mutable const uint8_t* cachedOuterPtr_{nullptr};
+    mutable size_t cachedOuterSize_{0};
+    mutable ParsedHeader cachedHeader_{};
+};
+
+// ---------------------------------------------------------------------------
+// Helpers / presets (Snowflake-friendly)
+// ---------------------------------------------------------------------------
+
+namespace detail_trisplit {
+
+inline constexpr uint64_t maxValueForBits(uint8_t bits) {
+    return bits == 64 ? ~uint64_t{0} : ((uint64_t{1} << bits) - 1);
+}
+
+inline constexpr uint8_t chooseSignedWidthForBits(uint8_t bits) {
+    const uint64_t maxVal = maxValueForBits(bits);
+    if (maxVal <= static_cast<uint64_t>(std::numeric_limits<int8_t>::max()))  return 8;
+    if (maxVal <= static_cast<uint64_t>(std::numeric_limits<int16_t>::max())) return 16;
+    if (maxVal <= static_cast<uint64_t>(std::numeric_limits<int32_t>::max())) return 32;
+    return 64;
+}
+
+inline std::shared_ptr<ISectionCodec64> makeDictionarySection(uint8_t bits) {
+    const uint8_t w = chooseTypeBits(bits);
+    switch (w) {
+        case 8:  return makeSectionCodecForBits(std::make_shared<DictionaryEncoder<uint8_t>>(), bits);
+        case 16: return makeSectionCodecForBits(std::make_shared<DictionaryEncoder<uint16_t>>(), bits);
+        case 32: return makeSectionCodecForBits(std::make_shared<DictionaryEncoder<uint32_t>>(), bits);
+        default: return makeSectionCodecForBits(std::make_shared<DictionaryEncoder<uint64_t>>(), bits);
+    }
+}
+
+inline std::shared_ptr<ISectionCodec64> makeRawSection(uint8_t bits) {
+    const uint8_t w = chooseTypeBits(bits);
+    switch (w) {
+        case 8:  return makeSectionCodecForBits(std::make_shared<RawEncoder<uint8_t>>(), bits);
+        case 16: return makeSectionCodecForBits(std::make_shared<RawEncoder<uint16_t>>(), bits);
+        case 32: return makeSectionCodecForBits(std::make_shared<RawEncoder<uint32_t>>(), bits);
+        default: return makeSectionCodecForBits(std::make_shared<RawEncoder<uint64_t>>(), bits);
+    }
+}
+
+// Adaptive FOR section: picks frame size + residual width at runtime (MIN policy)
+inline std::shared_ptr<ISectionCodec64> makeAdaptiveFORSection(uint8_t bits) {
+    // Residual width is chosen internally; bits only gates the narrowing adapter.
+    return makeSectionCodecForBits(std::make_shared<AdaptiveFOREncoder<int64_t>>(), bits);
+}
+
+template <size_t FrameSize = 512>
+inline std::shared_ptr<ISectionCodec64> makeFORSection(uint8_t bits,
+                                                FORReferencePolicy policy = FORReferencePolicy::MIN) {
+    const uint8_t w = chooseSignedWidthForBits(bits);
+
+    if (w == 8) {
+        using T = int8_t;
+        FORConfig<T, T> cfg{.policy = policy, .subEncoder = std::make_shared<RawEncoder<T>>()};
+        return makeSectionCodecForBits(std::make_shared<FOREncoder<T, T, FrameSize>>(cfg), bits);
+    }
+    if (w == 16) {
+        using T = int16_t;
+        FORConfig<T, T> cfg{.policy = policy, .subEncoder = std::make_shared<RawEncoder<T>>()};
+        return makeSectionCodecForBits(std::make_shared<FOREncoder<T, T, FrameSize>>(cfg), bits);
+    }
+    if (w == 32) {
+        using T = int32_t;
+        FORConfig<T, T> cfg{.policy = policy, .subEncoder = std::make_shared<RawEncoder<T>>()};
+        return makeSectionCodecForBits(std::make_shared<FOREncoder<T, T, FrameSize>>(cfg), bits);
+    }
+    {
+        using T = int64_t;
+        FORConfig<T, T> cfg{.policy = policy, .subEncoder = std::make_shared<RawEncoder<T>>()};
+        return makeSectionCodecForBits(std::make_shared<FOREncoder<T, T, FrameSize>>(cfg), bits);
+    }
+}
+
+struct SnowflakeLayout {
+    static constexpr uint8_t timestampBits = 41; // Instagram/Snowflake style
+    static constexpr uint8_t machineBits   = 13;
+    static constexpr uint8_t sequenceBits  = 10;
+};
+
+TriSplitConfig64 makeSnowflakeConfig(std::shared_ptr<ISectionCodec64> codecA,
+                                     std::shared_ptr<ISectionCodec64> codecB,
+                                     std::shared_ptr<ISectionCodec64> codecC,
+                                     BitSplitOrder order = BitSplitOrder::MSB_TO_LSB) {
+    const uint8_t baseBitsA = SnowflakeLayout::timestampBits;
+    const uint8_t baseBitsB = SnowflakeLayout::machineBits;
+    const uint8_t baseBitsC = SnowflakeLayout::sequenceBits;
+
+    const uint16_t total = static_cast<uint16_t>(baseBitsA) + baseBitsB + baseBitsC;
+    const uint8_t pad = static_cast<uint8_t>(64 - total);
+
+    return TriSplitConfig64{
+        .bitsA  = baseBitsA,
+        .bitsB  = baseBitsB,
+        // Add any remaining pad bits to the sequence partition to satisfy 64-bit total.
+        .bitsC  = static_cast<uint8_t>(baseBitsC + pad),
+        .order  = order,
+        .codecA = std::move(codecA),
+        .codecB = std::move(codecB),
+        .codecC = std::move(codecC),
+    };
+}
+
+} // namespace detail_trisplit
+
+// ---------------------------------------------------------------------------
+// Convenience factory
+// ---------------------------------------------------------------------------
+
+inline std::shared_ptr<TriSplitEncoder64> makeTriSplitEncoder64(TriSplitConfig64 cfg) {
+    return std::make_shared<TriSplitEncoder64>(std::move(cfg));
+}
+
+// ---------------------------------------------------------------------------
+// Ready-made TriSplit variants (Snowflake-friendly)
+// ---------------------------------------------------------------------------
+
+inline std::shared_ptr<TriSplitEncoder64> makeTriSplitAllDict(uint8_t bitsA, uint8_t bitsB, uint8_t bitsC,
+                                                             BitSplitOrder order = BitSplitOrder::LSB_TO_MSB) {
+    auto cfg = TriSplitConfig64{
+        .bitsA  = bitsA,
+        .bitsB  = bitsB,
+        .bitsC  = bitsC,
+        .order  = order,
+        .codecA = detail_trisplit::makeDictionarySection(bitsA),
+        .codecB = detail_trisplit::makeDictionarySection(bitsB),
+        .codecC = detail_trisplit::makeDictionarySection(bitsC),
+    };
+    return makeTriSplitEncoder64(std::move(cfg));
+}
+
+inline std::shared_ptr<TriSplitEncoder64> makeSnowflakeTriSplitAllDict(BitSplitOrder order = BitSplitOrder::MSB_TO_LSB) {
+    using detail_trisplit::SnowflakeLayout;
+    auto cfg = detail_trisplit::makeSnowflakeConfig(
+        detail_trisplit::makeDictionarySection(SnowflakeLayout::timestampBits),
+        detail_trisplit::makeDictionarySection(SnowflakeLayout::machineBits),
+        detail_trisplit::makeDictionarySection(SnowflakeLayout::sequenceBits),
+        order);
+    return makeTriSplitEncoder64(std::move(cfg));
+}
+
+// Backwards-compatible alias used by benchmarks
+inline std::shared_ptr<TriSplitEncoder64> makeSnowflakeTriSplitDictOnly(BitSplitOrder order = BitSplitOrder::MSB_TO_LSB) {
+    return makeSnowflakeTriSplitAllDict(order);
+}
+
+inline std::shared_ptr<TriSplitEncoder64> makeSnowflakeTriSplitFORDictFOR(
+    BitSplitOrder order = BitSplitOrder::MSB_TO_LSB) {
+    using detail_trisplit::SnowflakeLayout;
+    auto cfg = detail_trisplit::makeSnowflakeConfig(
+        detail_trisplit::makeAdaptiveFORSection(SnowflakeLayout::timestampBits),
+        detail_trisplit::makeDictionarySection(SnowflakeLayout::machineBits),
+        detail_trisplit::makeAdaptiveFORSection(SnowflakeLayout::sequenceBits),
+        order);
+    return makeTriSplitEncoder64(std::move(cfg));
+}
+
+// Variant: FOR on timestamp, dictionary on machine, dictionary on sequence (cheap + RA)
+inline std::shared_ptr<TriSplitEncoder64> makeSnowflakeTriSplitFORDictDict(
+    BitSplitOrder order = BitSplitOrder::MSB_TO_LSB) {
+    using detail_trisplit::SnowflakeLayout;
+    auto cfg = detail_trisplit::makeSnowflakeConfig(
+        detail_trisplit::makeAdaptiveFORSection(SnowflakeLayout::timestampBits),
+        detail_trisplit::makeDictionarySection(SnowflakeLayout::machineBits),
+        detail_trisplit::makeDictionarySection(SnowflakeLayout::sequenceBits),
+        order);
+    return makeTriSplitEncoder64(std::move(cfg));
+}
+
+// Variant: FOR on timestamp, dictionary on machine, raw on sequence (fast decode baseline)
+inline std::shared_ptr<TriSplitEncoder64> makeSnowflakeTriSplitFORDictRaw(
+    BitSplitOrder order = BitSplitOrder::MSB_TO_LSB) {
+    using detail_trisplit::SnowflakeLayout;
+    auto cfg = detail_trisplit::makeSnowflakeConfig(
+        detail_trisplit::makeAdaptiveFORSection(SnowflakeLayout::timestampBits),
+        detail_trisplit::makeDictionarySection(SnowflakeLayout::machineBits),
+        detail_trisplit::makeRawSection(SnowflakeLayout::sequenceBits),
+        order);
+    return makeTriSplitEncoder64(std::move(cfg));
+}
+
+// All-FOR preset (timestamp/machine/sequence) when per-section deltas are small.
+inline std::shared_ptr<TriSplitEncoder64> makeSnowflakeTriSplitFOROnly(
+    BitSplitOrder order = BitSplitOrder::MSB_TO_LSB) {
+    using detail_trisplit::SnowflakeLayout;
+    auto cfg = detail_trisplit::makeSnowflakeConfig(
+        detail_trisplit::makeAdaptiveFORSection(SnowflakeLayout::timestampBits),
+        detail_trisplit::makeAdaptiveFORSection(SnowflakeLayout::machineBits),
+        detail_trisplit::makeAdaptiveFORSection(SnowflakeLayout::sequenceBits),
+        order);
+    return makeTriSplitEncoder64(std::move(cfg));
+}
+
+} // namespace encodings::encoders
