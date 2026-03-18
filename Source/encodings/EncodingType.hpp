@@ -23,7 +23,8 @@ namespace encodings {
         VarIntEncoding,      // LEB128 variable-length integer with optional ZigZag
         DeltaVarIntEncoding, // Delta pre-pass then LEB128 VarInt
         Composed,            // Sequential composition (e.g., Delta | RLE)
-        Structural       // Structural composition (e.g., different encoders per field)
+        Structural,      // Structural composition (e.g., different encoders per field)
+        FrameOfReference // Frame-of-reference: store residuals relative to a per-frame ref
     };
 
     /** Convert EncodingType enum to human-readable string */
@@ -41,6 +42,7 @@ namespace encodings {
             case EncodingType::DeltaVarIntEncoding:  return "DeltaVarIntEncoding";
             case EncodingType::Composed:             return "Composed";
             case EncodingType::Structural:           return "Structural";
+            case EncodingType::FrameOfReference:     return "FrameOfReference";
         }
         return "Unknown";
     }
