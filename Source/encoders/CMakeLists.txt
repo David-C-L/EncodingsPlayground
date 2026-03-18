@@ -56,6 +56,7 @@ target_sources(encodings_encoders INTERFACE
         RawEncoder.hpp
         RunLengthEncoder.hpp
         DeltaEncoder.hpp
+        DeltaCodec.hpp
         DictionaryEncoder.hpp
         ZstdEncoder.hpp
         SphericalEncoder.hpp
@@ -63,6 +64,7 @@ target_sources(encodings_encoders INTERFACE
         SubIntEncoder.hpp
         VarIntEncoder.hpp
         DeltaVarIntEncoder.hpp
+        FOREncoder.hpp
 )
 
 target_include_directories(encodings_encoders INTERFACE
