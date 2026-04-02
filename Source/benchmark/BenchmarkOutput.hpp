@@ -113,7 +113,22 @@ public:
         ss << "    \"timing\": " << toJSON(metrics.timing) << ",\n";
         ss << "    \"memory\": " << toJSON(metrics.memory, metrics.elementCount) << ",\n";
         ss << "    \"accuracy\": " << toJSON(metrics.accuracy) << ",\n";
-        ss << "    \"randomAccess\": " << toJSON(metrics.randomAccess) << "\n";
+        ss << "    \"randomAccess\": " << toJSON(metrics.randomAccess);
+        if (!metrics.customMetrics.empty()) {
+            ss << ",\n    \"customMetrics\": {\n";
+            size_t idx = 0;
+            for (const auto& [key, value] : metrics.customMetrics) {
+                ss << "      \"" << escape(key) << "\": " << value;
+                if (idx + 1 < metrics.customMetrics.size()) {
+                    ss << ",";
+                }
+                ss << "\n";
+                ++idx;
+            }
+            ss << "    }\n";
+        } else {
+            ss << "\n";
+        }
         ss << "  }";
         return ss.str();
     }

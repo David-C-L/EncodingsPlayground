@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cmath>
 #include <iostream>
+#include <utility>
 #include "BenchmarkMetrics.hpp"
 #include "encodings/Encoder.hpp"
 #include "generators/DataGenerator.hpp"
@@ -176,6 +177,15 @@ public:
             encoded = encoder->encode(result.originalData);
             auto encodeEnd = high_resolution_clock::now();
             encodeTimes.push_back(duration_cast<nanoseconds>(encodeEnd - encodeStart));
+
+            auto selectionIt = encoded.metadata().customMetadata.find("selectionTime_ns");
+            if (selectionIt != encoded.metadata().customMetadata.end()) {
+                try {
+                    result.metrics.customMetrics["selectionTime_ns"] = std::stod(selectionIt->second);
+                } catch (const std::exception&) {
+                    // ignore parse errors
+                }
+            }
             
             // Measure decoding
             auto decodeStart = high_resolution_clock::now();
@@ -300,12 +310,21 @@ private:
             return;
         }
         
-        // Generate random indices
-        std::vector<size_t> indices(original.size());
-        std::iota(indices.begin(), indices.end(), 0);
-        std::shuffle(indices.begin(), indices.end(), rng_);
-        
-        size_t samplesToTest = std::min(config_.randomAccessSamples, original.size());
+        // Determine indices to probe: explicit trace overrides sampled indices.
+        std::vector<size_t> indices;
+        if (!config_.randomAccessIndices.empty()) {
+            indices = config_.randomAccessIndices;
+        } else {
+            indices.resize(original.size());
+            std::iota(indices.begin(), indices.end(), 0);
+            std::shuffle(indices.begin(), indices.end(), rng_);
+        }
+
+        size_t samplesToTest = std::min(config_.randomAccessSamples, indices.size());
+        samplesToTest = std::min(samplesToTest, original.size());
+        if (samplesToTest == 0) {
+            return;
+        }
         std::vector<nanoseconds> accessTimes;
         accessTimes.reserve(samplesToTest);
         
@@ -326,12 +345,12 @@ private:
             }
         }
         
-        // Calculate statistics
-        auto totalTime = std::accumulate(accessTimes.begin(), accessTimes.end(), nanoseconds{0});
-        metrics.randomAccess.averageRandomAccessTime = totalTime / accessTimes.size();
-        metrics.randomAccess.minRandomAccessTime = *std::min_element(accessTimes.begin(), accessTimes.end());
-        metrics.randomAccess.maxRandomAccessTime = *std::max_element(accessTimes.begin(), accessTimes.end());
-        metrics.randomAccess.randomAccessCount = samplesToTest;
+    // Calculate statistics
+    auto totalTime = std::accumulate(accessTimes.begin(), accessTimes.end(), nanoseconds{0});
+    metrics.randomAccess.averageRandomAccessTime = totalTime / accessTimes.size();
+    metrics.randomAccess.minRandomAccessTime = *std::min_element(accessTimes.begin(), accessTimes.end());
+    metrics.randomAccess.maxRandomAccessTime = *std::max_element(accessTimes.begin(), accessTimes.end());
+    metrics.randomAccess.randomAccessCount = samplesToTest;
         
         if (!accessCorrect) {
             metrics.accuracy.isLossless = false;
@@ -351,26 +370,39 @@ private:
         std::vector<nanoseconds> accessTimes;
         size_t count = 0;
         
-        for (size_t idx = 0; idx < original.size(); idx += config_.stride) {
-            auto start = high_resolution_clock::now();
-            auto value = encoder->decodeAt(encoded, idx);
-            auto end = high_resolution_clock::now();
-            
-            accessTimes.push_back(duration_cast<nanoseconds>(end - start));
-            count++;
-            
-            (void)value;  // Suppress unused warning
-            
-            if (count >= config_.stridedAccessSamples) {
-                break;
+        if (!config_.stridedAccessIndices.empty()) {
+            for (size_t idx : config_.stridedAccessIndices) {
+                if (idx >= original.size()) continue;
+                auto start = high_resolution_clock::now();
+                auto value = encoder->decodeAt(encoded, idx);
+                auto end = high_resolution_clock::now();
+                accessTimes.push_back(duration_cast<nanoseconds>(end - start));
+                ++count;
+                (void)value;
+                if (count >= config_.stridedAccessSamples) break;
+            }
+        } else {
+            for (size_t idx = 0; idx < original.size(); idx += config_.stride) {
+                auto start = high_resolution_clock::now();
+                auto value = encoder->decodeAt(encoded, idx);
+                auto end = high_resolution_clock::now();
+                
+                accessTimes.push_back(duration_cast<nanoseconds>(end - start));
+                count++;
+                
+                (void)value;  // Suppress unused warning
+                
+                if (count >= config_.stridedAccessSamples) {
+                    break;
+                }
             }
         }
-        
+
         if (!accessTimes.empty()) {
             auto totalTime = std::accumulate(accessTimes.begin(), accessTimes.end(), nanoseconds{0});
             metrics.randomAccess.averageStridedAccessTime = totalTime / accessTimes.size();
             metrics.randomAccess.stridedAccessCount = count;
-            metrics.randomAccess.stride = config_.stride;
+            metrics.randomAccess.stride = config_.stridedAccessIndices.empty() ? config_.stride : 0;
         }
     }
     
@@ -386,22 +418,41 @@ private:
         size_t totalRangeSize = 0;
         size_t queryCount = 0;
         
-        for (size_t rangeSize : config_.rangeSizes) {
-            if (rangeSize > original.size()) continue;
-            
-            for (size_t q = 0; q < config_.rangeQueryCount; ++q) {
-                // Random start position
-                std::uniform_int_distribution<size_t> dist(0, original.size() - rangeSize);
-                size_t start = dist(rng_);
-                size_t end = start + rangeSize;
-                
+        if (!config_.rangeAccesses.empty()) {
+            for (const auto& [startRaw, endRaw] : config_.rangeAccesses) {
+                if (startRaw >= endRaw) continue;
+                size_t start = std::min(startRaw, original.size());
+                size_t end = std::min(endRaw, original.size());
+                if (start >= end) continue;
+                size_t rangeSize = end - start;
+
                 auto accessStart = high_resolution_clock::now();
                 auto range = encoder->decodeRange(encoded, start, end);
                 auto accessEnd = high_resolution_clock::now();
-                
+
                 accessTimes.push_back(duration_cast<nanoseconds>(accessEnd - accessStart));
                 totalRangeSize += rangeSize;
                 queryCount++;
+                if (queryCount >= config_.rangeQueryCount) break;
+            }
+        } else {
+            for (size_t rangeSize : config_.rangeSizes) {
+                if (rangeSize > original.size()) continue;
+                
+                for (size_t q = 0; q < config_.rangeQueryCount; ++q) {
+                    // Random start position
+                    std::uniform_int_distribution<size_t> dist(0, original.size() - rangeSize);
+                    size_t start = dist(rng_);
+                    size_t end = start + rangeSize;
+                    
+                    auto accessStart = high_resolution_clock::now();
+                    auto range = encoder->decodeRange(encoded, start, end);
+                    auto accessEnd = high_resolution_clock::now();
+                    
+                    accessTimes.push_back(duration_cast<nanoseconds>(accessEnd - accessStart));
+                    totalRangeSize += rangeSize;
+                    queryCount++;
+                }
             }
         }
         

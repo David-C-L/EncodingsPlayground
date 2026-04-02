@@ -173,16 +173,22 @@ struct BenchmarkConfig {
     // Random access testing
     bool testRandomAccess{true};
     size_t randomAccessSamples{100};     // Number of random reads to test
+    // Optional explicit random-access trace. If non-empty, this overrides sampling.
+    std::vector<size_t> randomAccessIndices;
     
     // Strided access testing
     bool testStridedAccess{true};
     size_t stridedAccessSamples{100};
     size_t stride{10};                   // Access every Nth element
+    // Optional explicit strided-access trace. If non-empty, this overrides stride sampling.
+    std::vector<size_t> stridedAccessIndices;
     
     // Range query testing
     bool testRangeAccess{true};
     size_t rangeQueryCount{10};
     std::vector<size_t> rangeSizes{10, 100, 1000};  // Different range sizes to test
+    // Optional explicit range-access trace (start, end) with end exclusive.
+    std::vector<std::pair<size_t, size_t>> rangeAccesses;
     
     // Validation
     bool validateCorrectness{true};      // Verify decoded data matches original
