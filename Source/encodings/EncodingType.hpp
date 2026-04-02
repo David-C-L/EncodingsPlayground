@@ -24,25 +24,31 @@ namespace encodings {
         DeltaVarIntEncoding, // Delta pre-pass then LEB128 VarInt
         Composed,            // Sequential composition (e.g., Delta | RLE)
         Structural,      // Structural composition (e.g., different encoders per field)
-        FrameOfReference // Frame-of-reference: store residuals relative to a per-frame ref
+        FrameOfReference, // Frame-of-reference: store residuals relative to a per-frame ref
+        AdaptiveFramedBitPrefix, // Adaptive framed bit-prefix encoding
+        AdaptiveFrameOfReference, // Adaptive frame-of-reference: dynamic per-frame ref selection and residual width
+        OpenZL            // OpenZL external codec
     };
 
     /** Convert EncodingType enum to human-readable string */
     constexpr const char* encodingTypeToString(EncodingType type) {
         switch (type) {
-            case EncodingType::RawEncoding:          return "RawEncoding";
-            case EncodingType::RunLengthEncoding:    return "RunLengthEncoding";
-            case EncodingType::DeltaEncoding:        return "DeltaEncoding";
-            case EncodingType::DictionaryEncoding:   return "DictionaryEncoding";
-            case EncodingType::BitPacking:           return "BitPacking";
-            case EncodingType::Zstd:                 return "Zstd";
-            case EncodingType::SphericalEncoding:    return "SphericalEncoding";
-            case EncodingType::SubIntEncoding:       return "SubIntEncoding";
-            case EncodingType::VarIntEncoding:       return "VarIntEncoding";
-            case EncodingType::DeltaVarIntEncoding:  return "DeltaVarIntEncoding";
-            case EncodingType::Composed:             return "Composed";
-            case EncodingType::Structural:           return "Structural";
-            case EncodingType::FrameOfReference:     return "FrameOfReference";
+            case EncodingType::RawEncoding:              return "RawEncoding";
+            case EncodingType::RunLengthEncoding:        return "RunLengthEncoding";
+            case EncodingType::DeltaEncoding:            return "DeltaEncoding";
+            case EncodingType::DictionaryEncoding:       return "DictionaryEncoding";
+            case EncodingType::BitPacking:               return "BitPacking";
+            case EncodingType::Zstd:                     return "Zstd";
+            case EncodingType::SphericalEncoding:        return "SphericalEncoding";
+            case EncodingType::SubIntEncoding:           return "SubIntEncoding";
+            case EncodingType::VarIntEncoding:           return "VarIntEncoding";
+            case EncodingType::DeltaVarIntEncoding:      return "DeltaVarIntEncoding";
+            case EncodingType::Composed:                 return "Composed";
+            case EncodingType::Structural:               return "Structural";
+            case EncodingType::FrameOfReference:         return "FrameOfReference";
+            case EncodingType::AdaptiveFramedBitPrefix: return "AdaptiveFramedBitPrefix";
+            case EncodingType::AdaptiveFrameOfReference: return "AdaptiveFrameOfReference";
+            case EncodingType::OpenZL:                   return "OpenZL";
         }
         return "Unknown";
     }
