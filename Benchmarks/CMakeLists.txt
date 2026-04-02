@@ -19,6 +19,25 @@ target_include_directories(run_benchmarks
         ${CMAKE_SOURCE_DIR}/Source
 )
 
+# Create sweep executable for SubInt auto sample size study
+add_executable(sweep_subint_samples
+    sweep_subint_samples.cpp
+)
+
+target_link_libraries(sweep_subint_samples
+    PRIVATE
+        encodings_core
+        encodings_encodings
+        encodings_generators
+        encodings_encoders
+        encodings_benchmark
+)
+
+target_include_directories(sweep_subint_samples
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/Source
+)
+
 # Create map benchmark executable
 add_executable(map_benchmarks
     map_benchmarks.cpp
@@ -80,7 +99,7 @@ target_include_directories(vector_benchmarks
 file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/benchmark_results)
 
 # Set output directory for the executables
-set_target_properties(run_benchmarks map_benchmarks map_benchmarks_refactored vector_benchmarks PROPERTIES
+set_target_properties(run_benchmarks sweep_subint_samples map_benchmarks map_benchmarks_refactored vector_benchmarks PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 
