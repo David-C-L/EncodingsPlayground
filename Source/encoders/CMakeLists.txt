@@ -47,17 +47,33 @@ if(NOT ZSTD_FOUND)
     endif()
 endif()
 
+# Assumes a prebuilt openzl lib is available and provided
+if (NOT DEFINED OPENZL_REPO)
+    set(OPENZL_REPO "/home/david/Documents/PhD/symbol-store/openzl")
+endif()
+set(OPENZL_INCLUDE_DIR "${OPENZL_REPO}/include")
+set(OPENZL_LIB_DIR "${OPENZL_REPO}")
+
+
 add_library(encodings_encoders INTERFACE)
+
+add_library(OpenZL::openzl SHARED IMPORTED)
+set_target_properties(OpenZL::openzl PROPERTIES
+    IMPORTED_LOCATION "${OPENZL_LIB_DIR}/libopenzl${CMAKE_SHARED_LIBRARY_SUFFIX}"
+    INTERFACE_INCLUDE_DIRECTORIES "${OPENZL_INCLUDE_DIR}"
+)
 
 target_sources(encodings_encoders INTERFACE
     FILE_SET HEADERS
     BASE_DIRS ${PROJECT_SOURCE_DIR}/Source
     FILES
         RawEncoder.hpp
+        RawBitPackedEncoder.hpp
         RunLengthEncoder.hpp
         DeltaEncoder.hpp
         DeltaCodec.hpp
         DictionaryEncoder.hpp
+        AdaptiveFramedBitPrefixEncoder.hpp
         ZstdEncoder.hpp
         SphericalEncoder.hpp
         MapEncoders.hpp
@@ -65,6 +81,7 @@ target_sources(encodings_encoders INTERFACE
         VarIntEncoder.hpp
         DeltaVarIntEncoder.hpp
         FOREncoder.hpp
+        OpenZLEncoder.hpp
 )
 
 target_include_directories(encodings_encoders INTERFACE
@@ -76,6 +93,7 @@ target_link_libraries(encodings_encoders INTERFACE
     encodings_core
     encodings_encodings
     ZSTD::libzstd
+    OpenZL::openzl
     unordered_dense
 )
 
@@ -87,3 +105,5 @@ if(MSVC)
 else()
     target_compile_options(encodings_encoders INTERFACE -Wall -Wextra -Wpedantic -Werror)
 endif()
+
+add_subdirectory(selectors)
