@@ -9,6 +9,8 @@
 #include <concepts>
 #include <type_traits>
 #include <numeric>
+#include <span>
+#include <ranges>
 
 namespace encodings::core {
 
