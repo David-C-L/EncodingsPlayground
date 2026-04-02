@@ -3,14 +3,17 @@
 #include <span>
 #include <vector>
 #include <unordered_map>
+#include <optional>
 
 #include <ankerl/unordered_dense.h>
 #include <cstring>
 #include <algorithm>
+#include <bit>
 #include "encodings/Encoder.hpp"
 #include "encodings/EncodedData.hpp"
 #include "encodings/EncodingProperty.hpp"
 #include "encodings/EncodingType.hpp"
+#include "core/BitPacker.hpp"
 
 namespace encodings::encoders {
 
@@ -23,19 +26,22 @@ namespace encodings::encoders {
  * 
  * Format: [size_of_dict (8 bytes),
  *          size_of_dict_keys_in_bytes (8 bytes),
+ *          key_bit_width (1 byte),
  *          dict_entries (size_of_dict * sizeof(T)),
- *          keys (num_elements * sizeof(DictKeyType))]
+ *          bit-packed keys (num_elements * key_bit_width bits, LSB order)]
  * 
- * DictKeyType is chosen based on dictionary size:
- * - uint8_t for dict size <= 256
- * - uint16_t for dict size <= 65536
- * - uint32_t otherwise
+ * Key bit width is chosen based on dictionary size (ceil(log2(dict_size))
+ * snapped to {1, 2, 4, 8, 16}; larger dictionaries fall back to 32-bit
+ * uncompressed keys for simplicity.
  * 
  * @tparam T The type to encode
  */
 template<typename T>
 class DictionaryEncoder : public Codec<T> {
 public:
+    explicit DictionaryEncoder(bool allowNonPowerOfTwoKeyWidths = true)
+        : allowNonPowerOfTwoKeyWidths_(allowNonPowerOfTwoKeyWidths) {}
+
     EncodedData encode(std::span<const T> data) override {
         if (data.empty()) {
             return createEmptyEncoding();
@@ -60,19 +66,17 @@ public:
         }
         
         const size_t dictSize = dictionary.size();
-        
-        // Choose appropriate key type based on dictionary size
-        if (dictSize <= 256) {
-            return encodeWithKeyType<uint8_t>(dictionary, keys, data.size());
-        } else if (dictSize <= 65536) {
-            return encodeWithKeyType<uint16_t>(dictionary, keys, data.size());
-        } else {
-            return encodeWithKeyType<uint32_t>(dictionary, keys, data.size());
+        const uint32_t keyBitWidth = chooseKeyBitWidth(dictSize);
+
+        if (keyBitWidth == 32) {
+            return encodeRawKeys<uint32_t>(dictionary, keys, data.size(), keyBitWidth);
         }
+
+        return encodeBitPacked(dictionary, keys, data.size(), keyBitWidth);
     }
     
     std::vector<T> decodeAll(const EncodedData& encoded) override {
-        if (encoded.size() < 2 * sizeof(size_t)) {
+        if (encoded.size() < 2 * sizeof(size_t) + sizeof(uint8_t)) {
             return {};
         }
         
@@ -85,6 +89,8 @@ public:
         
         std::memcpy(&dictKeysSize, readPtr, sizeof(size_t));
         readPtr += sizeof(size_t);
+        const uint32_t keyBitWidth = *readPtr;
+        readPtr += sizeof(uint8_t);
         
         if (dictSize == 0) {
             return {};
@@ -94,20 +100,17 @@ public:
         std::vector<T> dictionary = readDictionary(readPtr, dictSize);
         readPtr += dictSize * getElementSize();
         
-        // Determine key type and decode
         const size_t numElements = encoded.metadata().elementCount;
-        
-        if (dictKeysSize == numElements * sizeof(uint8_t)) {
-            return decodeWithKeyType<uint8_t>(dictionary, readPtr, numElements);
-        } else if (dictKeysSize == numElements * sizeof(uint16_t)) {
-            return decodeWithKeyType<uint16_t>(dictionary, readPtr, numElements);
-        } else {
-            return decodeWithKeyType<uint32_t>(dictionary, readPtr, numElements);
+
+        if (keyBitWidth == 32) {
+            return decodeRawKeys<uint32_t>(dictionary, readPtr, numElements);
         }
+
+        return decodeBitPacked(dictionary, readPtr, numElements, dictKeysSize, keyBitWidth);
     }
     
     std::optional<T> decodeAt(const EncodedData& encoded, size_t index) override {
-        if (encoded.size() < 2 * sizeof(size_t)) {
+        if (encoded.size() < 2 * sizeof(size_t) + sizeof(uint8_t)) {
             return std::nullopt;
         }
         
@@ -120,6 +123,8 @@ public:
         
         std::memcpy(&dictKeysSize, readPtr, sizeof(size_t));
         readPtr += sizeof(size_t);
+        const uint32_t keyBitWidth = *readPtr;
+        readPtr += sizeof(uint8_t);
         
         const size_t numElements = encoded.metadata().elementCount;
         
@@ -131,31 +136,24 @@ public:
         std::vector<T> dictionary = readDictionary(readPtr, dictSize);
         readPtr += dictSize * getElementSize();
         
-        // Read the key at the specified index
-        size_t key;
-        if (dictKeysSize == numElements * sizeof(uint8_t)) {
-            uint8_t k;
-            std::memcpy(&k, readPtr + index * sizeof(uint8_t), sizeof(uint8_t));
-            key = k;
-        } else if (dictKeysSize == numElements * sizeof(uint16_t)) {
-            uint16_t k;
-            std::memcpy(&k, readPtr + index * sizeof(uint16_t), sizeof(uint16_t));
-            key = k;
-        } else {
+        if (keyBitWidth == 32) {
             uint32_t k;
             std::memcpy(&k, readPtr + index * sizeof(uint32_t), sizeof(uint32_t));
-            key = k;
+            return k < dictionary.size() ? std::optional<T>(dictionary[k]) : std::nullopt;
         }
-        
-        if (key >= dictionary.size()) {
+
+        const size_t bitOffset = index * keyBitWidth;
+        encodings::core::BitReader reader(readPtr, dictKeysSize, encodings::core::BitOrder::LSB);
+        reader.seekToBit(bitOffset);
+        const uint32_t k = reader.read(keyBitWidth);
+        if (k >= dictionary.size()) {
             return std::nullopt;
         }
-        
-        return dictionary[key];
+        return dictionary[k];
     }
     
     std::vector<T> decodeRange(const EncodedData& encoded, size_t start, size_t end) override {
-        if (encoded.size() < 2 * sizeof(size_t)) {
+        if (encoded.size() < 2 * sizeof(size_t) + sizeof(uint8_t)) {
             return {};
         }
         
@@ -168,6 +166,8 @@ public:
         
         std::memcpy(&dictKeysSize, readPtr, sizeof(size_t));
         readPtr += sizeof(size_t);
+        const uint32_t keyBitWidth = *readPtr;
+        readPtr += sizeof(uint8_t);
         
         const size_t numElements = encoded.metadata().elementCount;
         
@@ -180,15 +180,12 @@ public:
         // Read dictionary
         std::vector<T> dictionary = readDictionary(readPtr, dictSize);
         readPtr += dictSize * getElementSize();
-        
-        // Decode range based on key type
-        if (dictKeysSize == numElements * sizeof(uint8_t)) {
-            return decodeRangeWithKeyType<uint8_t>(dictionary, readPtr, start, end);
-        } else if (dictKeysSize == numElements * sizeof(uint16_t)) {
-            return decodeRangeWithKeyType<uint16_t>(dictionary, readPtr, start, end);
-        } else {
-            return decodeRangeWithKeyType<uint32_t>(dictionary, readPtr, start, end);
+
+        if (keyBitWidth == 32) {
+            return decodeRangeRawKeys<uint32_t>(dictionary, readPtr, start, end);
         }
+
+        return decodeRangeBitPacked(dictionary, readPtr, dictKeysSize, start, end, keyBitWidth);
     }
     
     EncodingType encodingType() const override {
@@ -211,44 +208,71 @@ public:
     }
     
     size_t estimateEncodedSize(size_t elementCount) const override {
-        // Pessimistic: assume unique values, uint32_t keys
-        return 2 * sizeof(size_t) + elementCount * (sizeof(T) + sizeof(uint32_t));
+        // Pessimistic: assume unique values, 32-bit keys (no compression)
+        return 2 * sizeof(size_t) + sizeof(uint8_t) + elementCount * (sizeof(T) + sizeof(uint32_t));
     }
     
 private:
-    template<typename KeyType>
-    EncodedData encodeWithKeyType(const std::vector<T>& dictionary, 
-                                   const std::vector<size_t>& keys,
-                                   size_t numElements) {
+    bool allowNonPowerOfTwoKeyWidths_{true};
+
+    uint32_t chooseKeyBitWidth(size_t dictSize) const {
+        if (dictSize <= 1) return 1; // still write one bit per entry
+        const uint32_t bits = static_cast<uint32_t>(std::max<size_t>(1, std::bit_width(dictSize - 1)));
+
+        if (!allowNonPowerOfTwoKeyWidths_) {
+            if (bits <= 1) return 1;
+            if (bits <= 2) return 2;
+            if (bits <= 4) return 4;
+            if (bits <= 8) return 8;
+            if (bits <= 16) return 16;
+            return 32;
+        }
+
+        return bits <= 32 ? bits : 32;
+    }
+
+    EncodedData encodeBitPacked(const std::vector<T>& dictionary,
+                                 const std::vector<size_t>& keys,
+                                 size_t numElements,
+                                 uint32_t keyBitWidth) {
         const size_t dictSize = dictionary.size();
         const size_t dictBytesSize = dictSize * getElementSize();
-        const size_t keysBytesSize = numElements * sizeof(KeyType);
-        const size_t headerSize = 2 * sizeof(size_t);
+        const size_t keysBitsSize = numElements * static_cast<size_t>(keyBitWidth);
+        const size_t keysBytesSize = (keysBitsSize + 7) / 8;
+        const size_t headerSize = 2 * sizeof(size_t) + sizeof(uint8_t);
         const size_t totalSize = headerSize + dictBytesSize + keysBytesSize;
-        
+
         EncodedData result;
         result.data().resize(totalSize);
-        
+
         uint8_t* writePtr = result.data().data();
-        
+
         // Write header
         std::memcpy(writePtr, &dictSize, sizeof(size_t));
         writePtr += sizeof(size_t);
-        
+
         std::memcpy(writePtr, &keysBytesSize, sizeof(size_t));
         writePtr += sizeof(size_t);
-        
+
+        *writePtr = static_cast<uint8_t>(keyBitWidth);
+        writePtr += sizeof(uint8_t);
+
         // Write dictionary
         writeDictionary(dictionary, writePtr);
         writePtr += dictBytesSize;
-        
-        // Write keys
+
+        // Bit-pack keys
+        std::vector<uint8_t> keyBuffer;
+        keyBuffer.reserve(keysBytesSize);
+        encodings::core::BitWriter writer(keyBuffer, encodings::core::BitOrder::LSB);
         for (size_t key : keys) {
-            KeyType compactKey = static_cast<KeyType>(key);
-            std::memcpy(writePtr, &compactKey, sizeof(KeyType));
-            writePtr += sizeof(KeyType);
+            writer.write(static_cast<uint32_t>(key), keyBitWidth);
         }
-        
+        writer.flush();
+
+        // Copy packed keys
+        std::memcpy(writePtr, keyBuffer.data(), keyBuffer.size());
+
         // Set metadata
         result.metadata().encodingName = name();
         result.metadata().dataType = this->dataType();
@@ -257,45 +281,130 @@ private:
         result.metadata().uncompressedSize = numElements * sizeof(T);
         result.metadata().supportsRandomAccess = true;
         result.metadata().customMetadata["dict_size"] = std::to_string(dictSize);
-        result.metadata().customMetadata["key_type_bytes"] = std::to_string(sizeof(KeyType));
+        result.metadata().customMetadata["key_bits"] = std::to_string(keyBitWidth);
         result.metadata().customMetadata["cardinality_ratio"] = 
             std::to_string(static_cast<double>(dictSize) / numElements);
-        
+
+        return result;
+    }
+
+    template<typename KeyType>
+    EncodedData encodeRawKeys(const std::vector<T>& dictionary,
+                               const std::vector<size_t>& keys,
+                               size_t numElements,
+                               uint32_t keyBitWidth) {
+        const size_t dictSize = dictionary.size();
+        const size_t dictBytesSize = dictSize * getElementSize();
+        const size_t keysBytesSize = numElements * sizeof(KeyType);
+        const size_t headerSize = 2 * sizeof(size_t) + sizeof(uint8_t);
+        const size_t totalSize = headerSize + dictBytesSize + keysBytesSize;
+
+        EncodedData result;
+        result.data().resize(totalSize);
+
+        uint8_t* writePtr = result.data().data();
+
+        std::memcpy(writePtr, &dictSize, sizeof(size_t));
+        writePtr += sizeof(size_t);
+
+        std::memcpy(writePtr, &keysBytesSize, sizeof(size_t));
+        writePtr += sizeof(size_t);
+
+        *writePtr = static_cast<uint8_t>(keyBitWidth);
+        writePtr += sizeof(uint8_t);
+
+        writeDictionary(dictionary, writePtr);
+        writePtr += dictBytesSize;
+
+        for (size_t key : keys) {
+            KeyType compactKey = static_cast<KeyType>(key);
+            std::memcpy(writePtr, &compactKey, sizeof(KeyType));
+            writePtr += sizeof(KeyType);
+        }
+
+        result.metadata().encodingName = name();
+        result.metadata().dataType = this->dataType();
+        result.metadata().elementCount = numElements;
+        result.metadata().compressedSize = totalSize;
+        result.metadata().uncompressedSize = numElements * sizeof(T);
+        result.metadata().supportsRandomAccess = true;
+        result.metadata().customMetadata["dict_size"] = std::to_string(dictSize);
+        result.metadata().customMetadata["key_bits"] = std::to_string(keyBitWidth);
+        result.metadata().customMetadata["cardinality_ratio"] = 
+            std::to_string(static_cast<double>(dictSize) / numElements);
+
         return result;
     }
     
-    template<typename KeyType>
-    std::vector<T> decodeWithKeyType(const std::vector<T>& dictionary,
-                                      const uint8_t* keysPtr,
-                                      size_t numElements) {
+    std::vector<T> decodeBitPacked(const std::vector<T>& dictionary,
+                                    const uint8_t* keysPtr,
+                                    size_t numElements,
+                                    size_t keysBytesSize,
+                                    uint32_t keyBitWidth) {
         std::vector<T> result;
         result.reserve(numElements);
-        
+
+        encodings::core::BitReader reader(keysPtr, keysBytesSize, encodings::core::BitOrder::LSB);
+        for (size_t i = 0; i < numElements; ++i) {
+            const uint32_t key = reader.read(keyBitWidth);
+            result.push_back(dictionary[key]);
+        }
+
+        return result;
+    }
+
+    template<typename KeyType>
+    std::vector<T> decodeRawKeys(const std::vector<T>& dictionary,
+                                  const uint8_t* keysPtr,
+                                  size_t numElements) {
+        std::vector<T> result;
+        result.reserve(numElements);
+
         for (size_t i = 0; i < numElements; ++i) {
             KeyType key;
             std::memcpy(&key, keysPtr + i * sizeof(KeyType), sizeof(KeyType));
             result.push_back(dictionary[key]);
         }
-        
+
         return result;
     }
     
-    template<typename KeyType>
-    std::vector<T> decodeRangeWithKeyType(const std::vector<T>& dictionary,
-                                           const uint8_t* keysPtr,
-                                           size_t start,
-                                           size_t end) {
+    std::vector<T> decodeRangeBitPacked(const std::vector<T>& dictionary,
+                                         const uint8_t* keysPtr,
+                                         size_t keysBytesSize,
+                                         size_t start,
+                                         size_t end,
+                                         uint32_t keyBitWidth) {
         std::vector<T> result;
         result.reserve(end - start);
-        
+
+        encodings::core::BitReader reader(keysPtr, keysBytesSize, encodings::core::BitOrder::LSB);
+        reader.seekToBit(start * keyBitWidth);
+
+        for (size_t i = start; i < end; ++i) {
+            const uint32_t key = reader.read(keyBitWidth);
+            result.push_back(dictionary[key]);
+        }
+
+        return result;
+    }
+
+    template<typename KeyType>
+    std::vector<T> decodeRangeRawKeys(const std::vector<T>& dictionary,
+                                      const uint8_t* keysPtr,
+                                      size_t start,
+                                      size_t end) {
+        std::vector<T> result;
+        result.reserve(end - start);
+
         const uint8_t* rangePtr = keysPtr + start * sizeof(KeyType);
-        
+
         for (size_t i = 0; i < (end - start); ++i) {
             KeyType key;
             std::memcpy(&key, rangePtr + i * sizeof(KeyType), sizeof(KeyType));
             result.push_back(dictionary[key]);
         }
-        
+
         return result;
     }
     
@@ -353,19 +462,25 @@ private:
     
     EncodedData createEmptyEncoding() {
         EncodedData result;
-        result.data().resize(2 * sizeof(size_t));
-        
+        const size_t headerSize = 2 * sizeof(size_t) + sizeof(uint8_t);
+        result.data().resize(headerSize);
+
         size_t zero = 0;
-        std::memcpy(result.data().data(), &zero, sizeof(size_t));
-        std::memcpy(result.data().data() + sizeof(size_t), &zero, sizeof(size_t));
-        
+        uint8_t keyBits = 0;
+        uint8_t* ptr = result.data().data();
+        std::memcpy(ptr, &zero, sizeof(size_t));
+        ptr += sizeof(size_t);
+        std::memcpy(ptr, &zero, sizeof(size_t));
+        ptr += sizeof(size_t);
+        std::memcpy(ptr, &keyBits, sizeof(uint8_t));
+
         result.metadata().encodingName = name();
         result.metadata().dataType = this->dataType();
         result.metadata().elementCount = 0;
-        result.metadata().compressedSize = 2 * sizeof(size_t);
+        result.metadata().compressedSize = headerSize;
         result.metadata().uncompressedSize = 0;
         result.metadata().supportsRandomAccess = true;
-        
+
         return result;
     }
 };
