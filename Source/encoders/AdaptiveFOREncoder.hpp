@@ -57,7 +57,7 @@ class AdaptiveFOREncoder : public Codec<TIn, uint8_t> {
 
     static bool verboseEnabled() {
         static bool v = (std::getenv("ADAPTIVEFOR_VERBOSE") != nullptr);
-        return true || v;
+        return v;
     }
 
     static const char* widthName(ResidualWidth w) {
@@ -204,7 +204,7 @@ public:
     }
 
     // Identity ---------------------------------------------------------------
-    EncodingType encodingType() const override { return EncodingType::FrameOfReference; }
+    EncodingType encodingType() const override { return EncodingType::AdaptiveFrameOfReference; }
 
     std::string name() const override {
         return "AdaptiveFOR<" + std::string(typeid(TIn).name()) + ">";
@@ -271,8 +271,8 @@ private:
 
     static std::pair<ResidualWidth, uint8_t> estimateResidualWidth(std::span<const TIn> data, size_t frameSize) {
         using std::numeric_limits;
-        size_t N = data.size();
-        size_t numFrames = (N + frameSize - 1) / frameSize;
+        const size_t N = data.size();
+        const size_t numFrames = (N + frameSize - 1) / frameSize;
 
         TIn globalMin = numeric_limits<TIn>::max();
         TIn globalMax = numeric_limits<TIn>::min();
@@ -295,24 +295,22 @@ private:
         }
 
         const uint64_t maxResidual = static_cast<uint64_t>(static_cast<int64_t>(globalMax));
-        uint8_t bits = 0;
-        if (maxResidual > 0) {
-            bits = static_cast<uint8_t>(64 - std::countl_zero(maxResidual));
+        const uint8_t neededBits = maxResidual == 0 ? 1 : static_cast<uint8_t>(64 - std::countl_zero(maxResidual));
+
+        // Compare bit-packed vs typed storage and pick the smaller payload.
+        size_t packedBytes = std::numeric_limits<size_t>::max();
+        if (neededBits <= 32) {
+            packedBytes = ((static_cast<size_t>(neededBits) * N) + 7) / 8;
         }
 
-        // If residuals fit in <32 bits, prefer bit-packing to avoid byte padding.
-        const uint8_t bitsForPack = bits == 0 ? 1 : bits; // 1 bit to represent all-zero residuals
-        if (bitsForPack < 32) {
-            return {ResidualWidth::W32, bitsForPack};
+        const uint8_t widthBytes = (neededBits <= 8) ? 1 : (neededBits <= 16) ? 2 : (neededBits <= 32) ? 4 : 8;
+        const size_t typedBytes = N * static_cast<size_t>(widthBytes);
+
+        if (packedBytes < typedBytes && packedBytes != std::numeric_limits<size_t>::max()) {
+            return {ResidualWidth::W32, neededBits}; // resWidth ignored when resBits>0
         }
 
-        if (globalMin >= numeric_limits<int8_t>::min() && globalMax <= numeric_limits<int8_t>::max()) {
-            return {ResidualWidth::W8, 0};
-        }
-        if (globalMin >= numeric_limits<int16_t>::min() && globalMax <= numeric_limits<int16_t>::max()) {
-            return {ResidualWidth::W16, 0};
-        }
-        if (globalMin >= numeric_limits<int32_t>::min() && globalMax <= numeric_limits<int32_t>::max()) {
+        if (neededBits <= 32) {
             return {ResidualWidth::W32, 0};
         }
         return {ResidualWidth::W64, 0};
@@ -377,7 +375,9 @@ private:
         if (bw == 0) {
             bw = maxResidual == 0 ? 1 : static_cast<uint8_t>(64 - std::countl_zero(maxResidual));
         }
-        if (bw == 0) bw = 1; // all zeros
+        if (bw > 32) {
+            throw std::runtime_error("AdaptiveFOR: bitpacked residual width exceeds 32 bits");
+        }
 
         std::vector<uint8_t> buf;
         buf.reserve((residuals.size() * bw + 7) / 8);
