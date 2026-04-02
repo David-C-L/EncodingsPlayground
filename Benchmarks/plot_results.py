@@ -9,8 +9,15 @@ to a linear scale with a warning.
 """
 
 import json
+import colorsys
+import re
+from dataclasses import dataclass
+from typing import Callable, Iterable, List
+
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
+import matplotlib.cm as cm
+import matplotlib.lines as mlines
 import numpy as np
 from pathlib import Path
 import argparse
@@ -23,6 +30,150 @@ _PALETTE = plt.rcParams['axes.prop_cycle'].by_key()['color']
 
 def _encoder_colours(encoders):
     return {enc: _PALETTE[i % len(_PALETTE)] for i, enc in enumerate(encoders)}
+
+
+@dataclass(frozen=True)
+class GroupRule:
+    name: str
+    predicate: Callable[[str], bool]
+    sort_key: Callable[[str], tuple]
+
+
+def _default_group_rules() -> List[GroupRule]:
+    openzl_re = re.compile(r'^OpenZL(?P<num>\d+)?$')
+    subint_re = re.compile(r'^(?P<prefix>.*)SubInt(?P<num>\d+)?$')
+    varint_re = re.compile(r'.*VarInt$')
+    raw_re = re.compile(r'^Raw')
+    trisplit_re = re.compile(r'^TriSplit')
+    trisplit_openzlonly_re = re.compile(r'^TriSplitOpenZLOnly(?P<num>\d+)?$')
+
+    def openzl_key(name: str) -> tuple:
+        match = openzl_re.match(name)
+        num = int(match.group('num')) if match and match.group('num') else -1
+        return (num, name)
+
+    def raw_key(name: str) -> tuple:
+        return (0 if name == 'Raw' else 1, name)
+
+    def varint_key(name: str) -> tuple:
+        return (0 if name == 'VarInt' else 1, name)
+
+    def subint_key(name: str) -> tuple:
+        match = subint_re.match(name)
+        num = int(match.group('num')) if match and match.group('num') else -1
+        exact_name = f'SubInt{num}' if num >= 0 else 'SubInt'
+        exact_first = 0 if name == exact_name else 1
+        return (num, exact_first, name)
+
+    def trisplit_key(name: str) -> tuple:
+        # TriSplitOpenZLOnly should be first, then its numeric variants ascending
+        m_only = trisplit_openzlonly_re.match(name)
+        if m_only:
+            num = int(m_only.group('num')) if m_only.group('num') else -1
+            exact_first = 0 if m_only.group('num') is None else 1
+            return (0, exact_first, num, name)
+
+        # If TriSplit includes OpenZL-style suffix, order by that numeric
+        m = re.search(r'OpenZL(?P<num>\d+)?$', name)
+        if m:
+            num = int(m.group('num')) if m.group('num') else -1
+            return (1, num, name)
+        return (2, name)
+
+    return [
+        GroupRule(
+            name='AutoSubIntSplit',
+            predicate=lambda n: n.startswith('AutoSubIntSplit'),
+            sort_key=lambda n: (n,)
+        ),
+        GroupRule(
+            name='Raw',
+            predicate=lambda n: bool(raw_re.match(n)),
+            sort_key=raw_key
+        ),
+        GroupRule(
+            name='SubInt',
+            predicate=lambda n: ('SubInt' in n) and (not n.startswith('AutoSubIntSplit')),
+            sort_key=subint_key
+        ),
+        GroupRule(
+            name='TriSplit',
+            predicate=lambda n: bool(trisplit_re.match(n)),
+            sort_key=trisplit_key
+        ),
+        GroupRule(
+            name='OpenZL',
+            predicate=lambda n: bool(openzl_re.match(n)),
+            sort_key=openzl_key
+        ),
+        GroupRule(
+            name='VarInt',
+            predicate=lambda n: bool(varint_re.match(n)),
+            sort_key=varint_key
+        ),
+    ]
+
+
+def _group_encoders(encoders: Iterable[str], rules: List[GroupRule]) -> List[tuple[str, List[str]]]:
+    remaining = list(dict.fromkeys(encoders))
+    grouped: List[tuple[str, List[str]]] = []
+    for rule in rules:
+        matches = [e for e in remaining if rule.predicate(e)]
+        if matches:
+            ordered = sorted(matches, key=rule.sort_key)
+            grouped.append((rule.name, ordered))
+            remaining = [e for e in remaining if e not in matches]
+
+    if remaining:
+        grouped.append(("Other", sorted(remaining)))
+    return grouped
+
+
+def _grouped_encoder_order(encoders: Iterable[str], rules: List[GroupRule]) -> List[str]:
+    grouped = _group_encoders(encoders, rules)
+    return [enc for _, encs in grouped for enc in encs]
+
+
+def _grouped_encoder_colours(encoders: Iterable[str], rules: List[GroupRule]) -> dict:
+    grouped = _group_encoders(encoders, rules)
+    group_count = max(len(grouped), 1)
+    cmap = cm.get_cmap('tab10', group_count)
+    colours = {}
+    for idx, (_, encs) in enumerate(grouped):
+        group_name = grouped[idx][0]
+        if group_name == 'VarInt':
+            base = (1.0, 0.55, 0.0, 1.0)  # orange
+        else:
+            base = cmap(idx)
+        h, l, s = colorsys.rgb_to_hls(base[0], base[1], base[2])
+        count = max(len(encs), 1)
+        for j, enc in enumerate(encs):
+            # Vary lightness within group for a gentle gradient
+            if count == 1:
+                l_j = l
+                s_j = s
+            else:
+                spread = 0.6
+                l_min = max(0.08, l - spread / 2)
+                l_max = min(0.94, l + spread / 2)
+                l_j = l_min + (l_max - l_min) * (j / (count - 1))
+                s_min = max(0.25, s * 0.7)
+                s_max = min(1.0, s * 1.25)
+                s_j = s_min + (s_max - s_min) * (j / (count - 1))
+            r, g, b = colorsys.hls_to_rgb(h, l_j, s_j)
+            colours[enc] = (r, g, b)
+    return colours
+
+
+def _sorted_encoders(results, group_encoders: bool = False, group_rules: List[GroupRule] | None = None):
+    """Alphabetical encoder order but keep Raw at the top for readability."""
+    encoders = sorted(set(r['encoderName'] for r in results['results']),
+                      key=lambda n: (0, n) if n == 'Raw' else (1, n))
+    if not group_encoders:
+        return encoders
+
+    rules = group_rules if group_rules is not None else _default_group_rules()
+    return _grouped_encoder_order(encoders, rules)
 
 
 # ---------------------------------------------------------------------------
@@ -52,6 +203,15 @@ def _row(results, encoder, dataset, size):
                and r['datasetName'] == dataset
                and r['dataSize'] == size]
     return matches[0] if matches else None
+
+
+def _has_custom_metric(results, key: str) -> bool:
+    for r in results['results']:
+        metrics = r.get('metrics', {})
+        custom = metrics.get('customMetrics', {})
+        if key in custom:
+            return True
+    return False
 
 
 def _safe_log_scale(ax, axis='x'):
@@ -97,15 +257,42 @@ def _hbar(ax, encoders, values, colours, unit='', fmt='.3g', log=True):
     return bars
 
 
+def _lighten_color(color, amount=0.35):
+    r, g, b = color
+    h, l, s = colorsys.rgb_to_hls(r, g, b)
+    l = min(1.0, l + (1.0 - l) * amount)
+    return colorsys.hls_to_rgb(h, l, s)
+
+
+def _darken_color(color, amount=0.25):
+    r, g, b = color
+    h, l, s = colorsys.rgb_to_hls(r, g, b)
+    l = max(0.0, l * (1.0 - amount))
+    return colorsys.hls_to_rgb(h, l, s)
+
+
+def _is_light_color(color) -> bool:
+    r, g, b = color
+    # Relative luminance
+    luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b
+    return luminance > 0.6
+
+
 # ---------------------------------------------------------------------------
 # Individual plot functions
 # ---------------------------------------------------------------------------
 
-def plot_compression(results, output_dir, colours):
+def _annotate_source(fig, source_label: str):
+    """Place the source JSON filename at the top-left of the figure."""
+    if source_label:
+        fig.text(0.01, 0.995, source_label, ha='left', va='top', fontsize=8, alpha=0.7)
+
+
+def plot_compression(results, output_dir, colours, source_label, group_encoders=False):
     """Inverted compression ratio (higher = better) and bits-per-element."""
     size     = _pick_size(results)
     datasets = sorted(set(r['datasetName'] for r in results['results']))
-    encoders = sorted(set(r['encoderName'] for r in results['results']))
+    encoders = _sorted_encoders(results, group_encoders=group_encoders)
 
     for dataset in datasets:
         size = _pick_size_for_dataset(results, dataset)
@@ -122,7 +309,8 @@ def plot_compression(results, output_dir, colours):
                 bpe_vals.append(0)
 
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, max(4, len(encoders) * 0.7 + 1.5)))
-        fig.suptitle(f'Compression — {dataset}  (n={size:,})', fontsize=13)
+        fig.suptitle(f'Compression — {dataset}  (n={size:,})', fontsize=13, y=1.04)
+        _annotate_source(fig, source_label)
 
         _hbar(ax1, encoders, inv_ratios, colours, unit='×', fmt='.3f', log=False)
         ax1.axvline(x=1.0, color='red', linestyle='--', linewidth=1, alpha=0.6,
@@ -132,8 +320,8 @@ def plot_compression(results, output_dir, colours):
         ax1.legend(fontsize=8)
 
         _hbar(ax2, encoders, bpe_vals, colours, unit='bits', fmt='.2f', log=False)
-        ax2.axvline(x=32, color='red', linestyle='--', linewidth=1, alpha=0.6,
-                    label='Raw int32 (32 bits)')
+        ax2.axvline(x=64, color='red', linestyle='--', linewidth=1, alpha=0.6,
+                    label='Raw int64 (64 bits)')
         ax2.set_xlabel('Bits per element (lower = better)')
         ax2.set_title('Bits per element')
         ax2.legend(fontsize=8)
@@ -145,15 +333,53 @@ def plot_compression(results, output_dir, colours):
         plt.close()
 
 
-def plot_encode_decode_time(results, output_dir, colours):
-    """Encode + bulk decode time in ms, with throughput (M elem/s) on a twin axis."""
+def plot_compression_overhead(results, output_dir, colours, source_label, group_encoders=False):
+    """Compression ratio normalized to the best (smallest) ratio per dataset/size."""
+    datasets = sorted(set(r['datasetName'] for r in results['results']))
+    encoders = _sorted_encoders(results, group_encoders=group_encoders)
+
+    for dataset in datasets:
+        size = _pick_size_for_dataset(results, dataset)
+        ratios = []
+        for enc in encoders:
+            row = _row(results, enc, dataset, size)
+            if row:
+                ratios.append(row['metrics']['memory']['compressionRatio'])
+            else:
+                ratios.append(0)
+
+        positive = [r for r in ratios if r and r > 0]
+        best_ratio = min(positive) if positive else 0
+        overhead = [(r / best_ratio) if (r and r > 0 and best_ratio > 0) else 0 for r in ratios]
+
+        fig, ax = plt.subplots(figsize=(10, max(4, len(encoders) * 0.7 + 1.5)))
+        fig.suptitle(f'Compression overhead — {dataset}  (n={size:,})', fontsize=13, y=1.04)
+        _annotate_source(fig, source_label)
+
+        _hbar(ax, encoders, overhead, colours, unit='×', fmt='.3f', log=False)
+        ax.axvline(x=1.0, color='red', linestyle='--', linewidth=1, alpha=0.6,
+                    label='Best compression (1×)')
+        ax.set_xlabel('Compression ratio relative to best (lower = better)')
+        ax.set_title('Normalized compression ratio (overhead)')
+        ax.legend(fontsize=8)
+
+        plt.tight_layout()
+        fname = output_dir / f'compression_overhead_{dataset.replace(" ", "_")}.png'
+        plt.savefig(fname, dpi=150)
+        print(f"Saved: {fname}")
+        plt.close()
+
+
+def plot_encode_decode_time(results, output_dir, colours, source_label, group_encoders=False):
+    """Encode + bulk decode time in ms."""
     size     = _pick_size(results)
     datasets = sorted(set(r['datasetName'] for r in results['results']))
-    encoders = sorted(set(r['encoderName'] for r in results['results']))
+    encoders = _sorted_encoders(results, group_encoders=group_encoders)
 
     for dataset in datasets:
         size = _pick_size_for_dataset(results, dataset)
         enc_ms, enc_tp = [], []
+        selection_ms = []
         dec_ms, dec_tp = [], []
         for enc in encoders:
             row = _row(results, enc, dataset, size)
@@ -163,31 +389,84 @@ def plot_encode_decode_time(results, output_dir, colours):
                 dec_ms.append(t['decodeBulkTime_ns'] / 1e6)
                 enc_tp.append(t['encodeElementsPerSecond']      / 1e6)
                 dec_tp.append(t['decodeBulkElementsPerSecond']  / 1e6)
+                custom = row.get('metrics', {}).get('customMetrics', {})
+                selection_ns = custom.get('selectionTime_ns', 0)
+                selection_ms.append(selection_ns / 1e6 if selection_ns else 0)
             else:
                 enc_ms.append(0); enc_tp.append(0)
                 dec_ms.append(0); dec_tp.append(0)
+                selection_ms.append(0)
 
         h = max(4, len(encoders) * 0.7 + 1.5)
         fig, axes = plt.subplots(1, 2, figsize=(14, h))
-        fig.suptitle(f'Encode / Decode time — {dataset}  (n={size:,})', fontsize=13)
+        fig.suptitle(f'Encode / Decode time — {dataset}  (n={size:,})', fontsize=13, y=1.04)
+        _annotate_source(fig, source_label)
 
-        for ax, times, tps, title, tp_label in [
-            (axes[0], enc_ms, enc_tp, 'Encode time', 'Encode throughput (M elem/s)'),
-            (axes[1], dec_ms, dec_tp, 'Bulk decode time', 'Decode throughput (M elem/s)'),
-        ]:
-            _hbar(ax, encoders, times, colours, unit='ms', fmt='.1f', log=True)
-            ax.set_xlabel('Time (ms, log scale, lower = better)')
-            ax.set_title(title)
+        # Encode time plot with optional selection-time stack
+        ax = axes[0]
+        y = np.arange(len(encoders))
+        bar_h = 0.6
+        has_selection = any(v > 0 for v in selection_ms)
+        x_max = max((v for v in enc_ms if v and v > 0), default=1)
+        min_label_width = x_max * 0.05
+        label_x_offset = x_max * 0.01
+        if has_selection:
+            encode_only = [max(e - s, 0) for e, s in zip(enc_ms, selection_ms)]
+            selection_colors = [_lighten_color(colours[e], 0.45) for e in encoders]
+            encode_colors = [_darken_color(colours[e], 0.2) for e in encoders]
+            ax.barh(y, selection_ms, height=bar_h, color=selection_colors,
+                    label='Selection', hatch='///', edgecolor='black', linewidth=0.5)
+            ax.barh(y, encode_only, left=selection_ms, height=bar_h, color=encode_colors, label='Encode')
+            total_vals = enc_ms
+            # Label selection and encode-only segments (if non-zero)
+            for idx, (sel, enc_only) in enumerate(zip(selection_ms, encode_only)):
+                if sel > 0:
+                    x_sel = sel * 0.5
+                    if sel >= min_label_width:
+                        sel_text_color = 'black' if _is_light_color(selection_colors[idx]) else 'white'
+                        ax.text(x_sel, y[idx], f'{sel:.1f} ms', va='center', ha='center',
+                                fontsize=7, color=sel_text_color, fontweight='bold')
+                    else:
+                        ax.text(sel + label_x_offset, y[idx], f'{sel:.1f} ms', va='center', ha='left',
+                                fontsize=7, color='black', fontweight='bold')
+                if enc_only > 0:
+                    x_enc = sel + enc_only * 0.5
+                    if enc_only >= min_label_width:
+                        enc_text_color = 'black' if _is_light_color(encode_colors[idx]) else 'white'
+                        ax.text(x_enc, y[idx], f'{enc_only:.1f} ms', va='center', ha='center',
+                                fontsize=7, color=enc_text_color, fontweight='bold')
+                    else:
+                        ax.text(sel + enc_only + label_x_offset, y[idx], f'{enc_only:.1f} ms',
+                                va='center', ha='left', fontsize=7, color='black', fontweight='bold')
+        else:
+            total_vals = enc_ms
+            ax.barh(y, total_vals, height=bar_h, color=[colours[e] for e in encoders], label='Encode')
+            for idx, val in enumerate(total_vals):
+                if val > 0:
+                    if val >= min_label_width:
+                        enc_text_color = 'black' if _is_light_color(colours[encoders[idx]]) else 'white'
+                        ax.text(val * 0.5, y[idx], f'{val:.1f} ms', va='center', ha='center',
+                                fontsize=7, color=enc_text_color, fontweight='bold')
+                    else:
+                        ax.text(val + label_x_offset, y[idx], f'{val:.1f} ms', va='center', ha='left',
+                                fontsize=7, color='black', fontweight='bold')
 
-            # Twin axis for throughput
-            ax2 = ax.twiny()
-            y   = np.arange(len(encoders))
-            ax2.plot(tps, y, marker='D', linestyle='none',
-                     color='black', markersize=5, label=tp_label)
-            ax2.set_xlabel(tp_label, fontsize=8)
-            ax2.tick_params(axis='x', labelsize=7)
-            _safe_log_scale(ax2, 'x')
-            ax2.legend(fontsize=7, loc='lower right')
+        ax.set_yticks(y)
+        ax.set_yticklabels(encoders)
+        ax.invert_yaxis()
+        ax.grid(axis='x', alpha=0.3)
+        if any(v > 0 for v in total_vals):
+            ax.set_xscale('log')
+        ax.set_xlabel('Time (ms, log scale, lower = better)')
+        ax.set_title('Encode time')
+        if has_selection:
+            ax.legend(fontsize=8, loc='lower right')
+
+        # Decode plot (unchanged)
+        ax = axes[1]
+        _hbar(ax, encoders, dec_ms, colours, unit='ms', fmt='.1f', log=True)
+        ax.set_xlabel('Time (ms, log scale, lower = better)')
+        ax.set_title('Bulk decode time')
 
         plt.tight_layout()
         fname = output_dir / f'encode_decode_time_{dataset.replace(" ", "_")}.png'
@@ -196,11 +475,11 @@ def plot_encode_decode_time(results, output_dir, colours):
         plt.close()
 
 
-def plot_random_access(results, output_dir, colours):
+def plot_random_access(results, output_dir, colours, source_label, group_encoders=False):
     """Average, min, and max single-element random access time (ns)."""
     size     = _pick_size(results)
     datasets = sorted(set(r['datasetName'] for r in results['results']))
-    encoders = sorted(set(r['encoderName'] for r in results['results']))
+    encoders = _sorted_encoders(results, group_encoders=group_encoders)
 
     for dataset in datasets:
         size = _pick_size_for_dataset(results, dataset)
@@ -219,7 +498,8 @@ def plot_random_access(results, output_dir, colours):
 
         h = max(4, len(encoders) * 0.7 + 1.5)
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, h))
-        fig.suptitle(f'Random / Strided access — {dataset}  (n={size:,})', fontsize=13)
+        fig.suptitle(f'Random / Strided access — {dataset}  (n={size:,})', fontsize=13, y=1.04)
+        _annotate_source(fig, source_label)
 
         # Left: average random access with min/max error bars
         y      = np.arange(len(encoders))
@@ -228,6 +508,18 @@ def plot_random_access(results, output_dir, colours):
 
         bars = ax1.barh(y, avg_ns, height=bar_h,
                         color=[colours[e] for e in encoders])
+        # Label each bar with its value (ns) similar to _hbar helper
+        x_max = max((v for v in avg_ns if v and v > 0), default=1)
+        for bar, val in zip(bars, avg_ns):
+            if val and val > 0:
+                ax1.text(val + x_max * 0.01,
+                         bar.get_y() + bar.get_height() / 2,
+                         f"{val:.0f} ns",
+                         va='center', fontsize=8)
+            else:
+                ax1.text(x_max * 0.01,
+                         bar.get_y() + bar.get_height() / 2,
+                         'N/A', va='center', fontsize=8, color='grey')
         # # Error bars (xerr = [left_err, right_err])
         # x_lo = [max(0, a - lo) for a, lo in zip(avg_ns, min_ns)]
         # x_hi = [hi - a          for a, hi in zip(avg_ns, max_ns)]
@@ -253,11 +545,11 @@ def plot_random_access(results, output_dir, colours):
         plt.close()
 
 
-def plot_range_access(results, output_dir, colours):
+def plot_range_access(results, output_dir, colours, source_label, group_encoders=False):
     """Average range-query time (ms) and implied throughput (M elem/s)."""
     size     = _pick_size(results)
     datasets = sorted(set(r['datasetName'] for r in results['results']))
-    encoders = sorted(set(r['encoderName'] for r in results['results']))
+    encoders = _sorted_encoders(results, group_encoders=group_encoders)
 
     for dataset in datasets:
         size = _pick_size_for_dataset(results, dataset)
@@ -283,7 +575,8 @@ def plot_range_access(results, output_dir, colours):
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, h))
         fig.suptitle(
             f'Range access (avg range = {rng_label} elems) — {dataset}  (n={size:,})',
-            fontsize=13)
+            fontsize=13, y=1.04)
+        _annotate_source(fig, source_label)
 
         _hbar(ax1, encoders, avg_ms, colours, unit='ms', fmt='.2f', log=True)
         ax1.set_xlabel('Time (ms, log scale, lower = better)')
@@ -300,11 +593,11 @@ def plot_range_access(results, output_dir, colours):
         plt.close()
 
 
-def plot_throughput_summary(results, output_dir, colours):
+def plot_throughput_summary(results, output_dir, colours, source_label, group_encoders=False):
     """Single summary chart: encode + decode throughput side-by-side."""
     size     = _pick_size(results)
     datasets = sorted(set(r['datasetName'] for r in results['results']))
-    encoders = sorted(set(r['encoderName'] for r in results['results']))
+    encoders = _sorted_encoders(results, group_encoders=group_encoders)
 
     for dataset in datasets:
         size = _pick_size_for_dataset(results, dataset)
@@ -323,7 +616,8 @@ def plot_throughput_summary(results, output_dir, colours):
         bh = 0.35
 
         fig, ax = plt.subplots(figsize=(10, h))
-        fig.suptitle(f'Throughput summary — {dataset}  (n={size:,})', fontsize=13)
+        fig.suptitle(f'Throughput summary — {dataset}  (n={size:,})', fontsize=13, y=1.04)
+        _annotate_source(fig, source_label)
 
         ax.barh(y - bh/2, enc_tp, height=bh,
                 color=[colours[e] for e in encoders], label='Encode', alpha=0.85)
@@ -353,6 +647,110 @@ def plot_throughput_summary(results, output_dir, colours):
         plt.close()
 
 
+def plot_compression_vs_random_access(results, output_dir, colours, source_label, group_encoders=False):
+    """Scatter of compression ratio vs random access time, with Pareto frontier."""
+    datasets = sorted(set(r['datasetName'] for r in results['results']))
+    encoders = _sorted_encoders(results, group_encoders=group_encoders)
+
+    for dataset in datasets:
+        size = _pick_size_for_dataset(results, dataset)
+        points = []
+        for enc in encoders:
+            row = _row(results, enc, dataset, size)
+            if not row:
+                continue
+            ratio = row['metrics']['memory']['compressionRatio']
+            ra = row['metrics']['randomAccess'].get('averageRandomAccessTime_ns', 0)
+            if ratio <= 0 or ra <= 0:
+                continue
+            points.append((enc, 1.0 / ratio, ra))
+
+        if not points:
+            continue
+
+        fig, ax = plt.subplots(figsize=(8, 6))
+        fig.suptitle(f'Compression vs random access — {dataset}  (n={size:,})', fontsize=13, y=0.98)
+        _annotate_source(fig, source_label)
+
+        for enc, ratio, ra in points:
+            ax.scatter(ratio, ra, color=colours.get(enc, 'tab:blue'), s=40)
+
+        # Label points with staggered offsets then drop overlapping labels
+        offsets = [(6, 4), (6, -6), (-6, 4), (-6, -6), (10, 0), (-10, 0), (0, 8), (0, -8)]
+
+        # Pareto frontier (higher compression_x and lower access time is better)
+        frontier = []
+        for _, compression_x, ra in sorted(points, key=lambda t: t[1], reverse=True):
+            if not frontier or ra < frontier[-1][1]:
+                frontier.append((compression_x, ra))
+
+        texts = []
+        for idx, (enc, ratio, ra) in enumerate(points):
+            dx, dy = offsets[idx % len(offsets)]
+            txt = ax.annotate(enc, (ratio, ra), textcoords="offset points", xytext=(dx, dy), fontsize=7,
+                              bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="none", alpha=0.7))
+            texts.append(txt)
+
+        pareto_handle = None
+        if len(frontier) >= 2:
+            line = ax.plot([p[0] for p in frontier], [p[1] for p in frontier],
+                           color='black', linestyle='--', linewidth=1, label='Pareto frontier')
+            pareto_handle = line[0]
+
+        # Remove overlapping labels after layout is known
+        fig.canvas.draw()
+        renderer_fn = getattr(fig.canvas, "get_renderer", None)
+        renderer = renderer_fn() if callable(renderer_fn) else None
+        if renderer is not None:
+            placed_bboxes = []
+            for txt in texts:
+                bbox = txt.get_window_extent(renderer=renderer).expanded(1.05, 1.1)
+                if any(bbox.overlaps(prev) for prev in placed_bboxes):
+                    txt.set_visible(False)
+                else:
+                    placed_bboxes.append(bbox)
+
+        # Group color legend when grouping is enabled
+        group_handles = []
+        group_labels = []
+        if group_encoders:
+            group_rules = _default_group_rules()
+            groups = _group_encoders([p[0] for p in points], group_rules)
+            for group_name, encs in groups:
+                if not encs:
+                    continue
+                color = colours.get(encs[0], 'tab:blue')
+                group_handles.append(mlines.Line2D([0], [0], marker='o', color='w', markerfacecolor=color, markersize=6))
+                group_labels.append(group_name)
+
+        # Place legends at the top, below title, above plot area
+        legend_y = 0.94
+        if group_handles:
+            fig.legend(group_handles, group_labels, fontsize=7, loc='upper center',
+                       bbox_to_anchor=(0.5, legend_y), ncol=min(len(group_handles), 4), title='Encoder groups')
+            legend_y -= 0.05
+        if pareto_handle is not None:
+            fig.legend([pareto_handle], ['Pareto frontier'], fontsize=7, loc='upper right',
+                       bbox_to_anchor=(0.97, legend_y), ncol=1)
+
+        ax.set_xlabel('Compression (× smaller than raw, higher = better)')
+        ax.set_ylabel('Avg random access time (ns, lower = better)')
+        ax.set_xscale('linear')
+        ax.set_yscale('log')
+        ax.grid(True, alpha=0.3)
+
+        plt.tight_layout(rect=[0, 0, 1, 0.88])
+        fname = output_dir / f'compression_vs_random_access_{dataset.replace(" ", "_")}.png'
+        plt.savefig(fname, dpi=150)
+        print(f"Saved: {fname}")
+        plt.close()
+
+
+def plot_selection_time(results, output_dir, colours, source_label, group_encoders=False):
+    """Deprecated: selection time is now rendered in the encode plot."""
+    return
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -362,23 +760,33 @@ def main():
     parser.add_argument('input',  type=Path, help='Input JSON benchmark results file')
     parser.add_argument('-o', '--output', type=Path, default=Path('plots'),
                         help='Output directory for plots (default: plots/)')
+    parser.add_argument('--group-encoders', action='store_true',
+                        help='Group encoders by scheme family (AutoSubIntSplit, Raw, SubInt, TriSplit, OpenZL, VarInt)')
     args = parser.parse_args()
 
     print(f"Loading results from: {args.input}")
     results = load_results(args.input)
 
+    source_label = f"Source: {args.input.name}"
+
     args.output.mkdir(exist_ok=True, parents=True)
 
     # Stable colour map across all charts
-    encoders = sorted(set(r['encoderName'] for r in results['results']))
-    colours  = _encoder_colours(encoders)
+    encoders = _sorted_encoders(results, group_encoders=args.group_encoders)
+    if args.group_encoders:
+        colours = _grouped_encoder_colours(encoders, _default_group_rules())
+    else:
+        colours = _encoder_colours(encoders)
 
     print("\nGenerating plots...")
-    plot_compression(results, args.output, colours)
-    plot_encode_decode_time(results, args.output, colours)
-    plot_random_access(results, args.output, colours)
-    plot_range_access(results, args.output, colours)
-    plot_throughput_summary(results, args.output, colours)
+    plot_compression(results, args.output, colours, source_label, group_encoders=args.group_encoders)
+    plot_compression_overhead(results, args.output, colours, source_label, group_encoders=args.group_encoders)
+    plot_encode_decode_time(results, args.output, colours, source_label, group_encoders=args.group_encoders)
+    plot_random_access(results, args.output, colours, source_label, group_encoders=args.group_encoders)
+    plot_range_access(results, args.output, colours, source_label, group_encoders=args.group_encoders)
+    plot_throughput_summary(results, args.output, colours, source_label, group_encoders=args.group_encoders)
+    plot_compression_vs_random_access(results, args.output, colours, source_label, group_encoders=args.group_encoders)
+    # selection time (if present) is shown inside the encode plot
 
     print(f"\n✓ All plots saved to: {args.output}")
     print(f"\nBenchmark Summary:")
