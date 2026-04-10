@@ -43,8 +43,13 @@ def _clean_series(samples, compression_x, encode_ms, selection_ms):
 
     mask = finite_mask & positive_mask & ratio_mask
     if mask.sum() >= 3:
-        mask &= _mad_mask(compression_x[mask])
-        mask &= _mad_mask(encode_ms[mask])
+        idx = np.where(mask)[0]
+        comp_keep = _mad_mask(compression_x[mask])
+        enc_keep = _mad_mask(encode_ms[mask])
+        keep = comp_keep & enc_keep
+        keep_mask = np.zeros_like(mask, dtype=bool)
+        keep_mask[idx] = keep
+        mask &= keep_mask
 
     # Enforce monotonic non-decreasing compression with increasing samples
     if mask.sum() >= 2:
