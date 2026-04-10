@@ -8,6 +8,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 #include <algorithm>
@@ -22,6 +23,7 @@
 #include "encoders/selectors/IDSubStreamEncodingSelector.hpp"
 #include "encoders/selectors/costs/EncodingCostModel.hpp"
 #include "generators/samplers/StreamSampling.hpp"
+
 using encodings::encoders::selectors::costs::RawCostModel;
 using encodings::encoders::selectors::costs::RawBitPackedCostModel;
 using encodings::encoders::selectors::costs::AdaptiveFORCostModel;
@@ -32,53 +34,63 @@ using encodings::encoders::selectors::costs::RLECostModel;
 
 namespace encodings::encoders {
 
-// Generic sub-integer split encoder (N-way split where sum(bits)=64)
-class SubIntSplitEncoder64 final : public Codec<int64_t, uint8_t> {
+// Generic sub-integer split encoder (N-way split where sum(bits)=bit-width of T)
+template <typename T>
+    requires (std::is_same_v<T, int64_t> || std::is_same_v<T, int32_t>)
+class SubIntSplitEncoder final : public Codec<T, uint8_t> {
 public:
-    explicit SubIntSplitEncoder64(SubIntSplitConfig64 cfg) : cfg_(std::move(cfg)) {
+    using ValueT = T;
+    using SectionT = std::conditional_t<(sizeof(T) <= 4), uint32_t, uint64_t>;
+    static constexpr uint8_t kTotalBits = static_cast<uint8_t>(sizeof(T) * 8);
+
+    explicit SubIntSplitEncoder(SubIntSplitConfigIntegral<SectionT> cfg) : cfg_(std::move(cfg)) {
         cfg_.validate();
     }
 
-    EncodedBuffer<uint8_t> encode(std::span<const int64_t> data) override {
+    EncodedBuffer<uint8_t> encode(std::span<const T> data) override {
         const size_t N = data.size();
         if (N == 0) {
             return makeEmpty();
         }
 
         const size_t splits = cfg_.splitCount();
-        std::vector<std::vector<uint64_t>> sections(splits);
+        std::vector<std::vector<SectionT>> sections(splits);
         for (auto& sec : sections) sec.resize(N);
 
         // Split values into sections according to order
         if (cfg_.order == BitSplitOrder::LSB_TO_MSB) {
             for (size_t i = 0; i < N; ++i) {
-                uint64_t v = static_cast<uint64_t>(data[i]);
+                uint64_t v = static_cast<uint64_t>(static_cast<std::make_unsigned_t<T>>(data[i]));
                 uint64_t shifted = v;
                 for (size_t s = 0; s < splits; ++s) {
                     const uint8_t bits = cfg_.bits[s];
-                    const uint64_t mask = bits == 64 ? ~uint64_t{0} : ((uint64_t{1} << bits) - 1);
-                    sections[s][i] = shifted & mask;
-                    if (bits < 64) shifted >>= bits;
+                    const uint64_t mask = (bits == 64)
+                        ? ~uint64_t{0}
+                        : ((uint64_t{1} << bits) - 1);
+                    sections[s][i] = static_cast<SectionT>(shifted & mask);
+                    if (bits < kTotalBits) shifted >>= bits;
                 }
             }
         } else { // MSB_TO_LSB
             // Precompute starting shifts from MSB side
             std::vector<uint8_t> shiftStart(splits, 0);
-            uint8_t remaining = 64;
+            uint8_t remaining = kTotalBits;
             for (size_t s = 0; s < splits; ++s) {
                 const uint8_t bits = cfg_.bits[s];
                 if (bits > remaining) {
-                    throw std::invalid_argument("SubIntSplitEncoder64: bits exceed width when splitting");
+                    throw std::invalid_argument("SubIntSplitEncoder: bits exceed width when splitting");
                 }
                 remaining = static_cast<uint8_t>(remaining - bits);
                 shiftStart[s] = remaining; // shift to align MSB block
             }
             for (size_t i = 0; i < N; ++i) {
-                uint64_t v = static_cast<uint64_t>(data[i]);
+                uint64_t v = static_cast<uint64_t>(static_cast<std::make_unsigned_t<T>>(data[i]));
                 for (size_t s = 0; s < splits; ++s) {
                     const uint8_t bits = cfg_.bits[s];
-                    const uint64_t mask = bits == 64 ? ~uint64_t{0} : ((uint64_t{1} << bits) - 1);
-                    sections[s][i] = (v >> shiftStart[s]) & mask;
+                    const uint64_t mask = (bits == 64)
+                        ? ~uint64_t{0}
+                        : ((uint64_t{1} << bits) - 1);
+                    sections[s][i] = static_cast<SectionT>((v >> shiftStart[s]) & mask);
                 }
             }
         }
@@ -90,7 +102,7 @@ public:
         sectionSizes.reserve(splits);
 
         for (size_t s = 0; s < splits; ++s) {
-            auto enc = cfg_.codecs[s]->encode(std::span<const uint64_t>(sections[s].data(), sections[s].size()));
+            auto enc = cfg_.codecs[s]->encode(std::span<const SectionT>(sections[s].data(), sections[s].size()));
             sectionSizes.push_back(enc.data().size());
             encodedSections.push_back(std::move(enc));
         }
@@ -117,48 +129,48 @@ public:
 
         encodings::EncodingMetadata meta;
         meta.encodingName         = name();
-        meta.dataType             = encodings::core::typeToDataType<int64_t>;
+        meta.dataType             = encodings::core::typeToDataType<T>;
         meta.elementCount         = N;
         meta.compressedSize       = out.size();
-        meta.uncompressedSize     = N * sizeof(int64_t);
+        meta.uncompressedSize     = N * sizeof(T);
         meta.supportsRandomAccess = allSectionsRandomAccess();
 
         return encodings::EncodedData(std::move(out), std::move(meta));
     }
 
-    std::vector<int64_t> decodeAll(const EncodedBuffer<uint8_t>& encoded) override {
+    std::vector<T> decodeAll(const EncodedBuffer<uint8_t>& encoded) override {
         const auto& h = getCachedHeader(encoded);
         if (h.N == 0) return {};
 
         const size_t splits = h.bits.size();
-        std::vector<std::vector<uint64_t>> sections(splits);
+        std::vector<std::vector<SectionT>> sections(splits);
         for (size_t s = 0; s < splits; ++s) {
             sections[s] = cfg_.codecs[s]->decodeAll(h.views[s]);
             if (sections[s].size() != h.N) {
-                throw std::runtime_error("SubIntSplitEncoder64::decodeAll: section size mismatch");
+                throw std::runtime_error("SubIntSplitEncoder::decodeAll: section size mismatch");
             }
         }
 
-        std::vector<int64_t> out(h.N);
+        std::vector<T> out(h.N);
         for (size_t i = 0; i < h.N; ++i) {
-            out[i] = static_cast<int64_t>(combine(sections, h.bits, h.order, i));
+            out[i] = static_cast<T>(combine(sections, h.bits, h.order, i));
         }
         return out;
     }
 
-    std::optional<int64_t> decodeAt(const EncodedBuffer<uint8_t>& encoded, size_t index) override {
+    std::optional<T> decodeAt(const EncodedBuffer<uint8_t>& encoded, size_t index) override {
         const auto& h = getCachedHeader(encoded);
         if (index >= h.N) return std::nullopt;
 
         const size_t splits = h.bits.size();
-        std::vector<uint64_t> parts(splits);
+        std::vector<SectionT> parts(splits);
         for (size_t s = 0; s < splits; ++s) {
             parts[s] = decodeOneSection(*cfg_.codecs[s], h.views[s], index);
         }
-        return static_cast<int64_t>(combine(parts, h.bits, h.order));
+        return static_cast<T>(combine(parts, h.bits, h.order));
     }
 
-    std::vector<int64_t> decodeRange(const EncodedBuffer<uint8_t>& encoded, size_t start, size_t end) override {
+    std::vector<T> decodeRange(const EncodedBuffer<uint8_t>& encoded, size_t start, size_t end) override {
         const auto& h = getCachedHeader(encoded);
         if (start >= h.N) return {};
         end = std::min(end, h.N);
@@ -166,20 +178,20 @@ public:
         const size_t count = end - start;
 
         const size_t splits = h.bits.size();
-        std::vector<std::vector<uint64_t>> sections(splits);
+        std::vector<std::vector<SectionT>> sections(splits);
         for (size_t s = 0; s < splits; ++s) {
             sections[s] = decodeSectionRange(*cfg_.codecs[s], h.views[s], start, end);
             if (sections[s].size() != count) {
-                throw std::runtime_error("SubIntSplitEncoder64::decodeRange: section size mismatch");
+                throw std::runtime_error("SubIntSplitEncoder::decodeRange: section size mismatch");
             }
         }
 
-        std::vector<int64_t> out;
+        std::vector<T> out;
         out.reserve(count);
         for (size_t i = 0; i < count; ++i) {
-            std::vector<uint64_t> parts(splits);
+            std::vector<SectionT> parts(splits);
             for (size_t s = 0; s < splits; ++s) parts[s] = sections[s][i];
-            out.push_back(static_cast<int64_t>(combine(parts, h.bits, h.order)));
+            out.push_back(static_cast<T>(combine(parts, h.bits, h.order)));
         }
         return out;
     }
@@ -233,25 +245,25 @@ private:
     ParsedHeader parseHeader(const EncodedBuffer<uint8_t>& encoded) const {
         const auto& buf = encoded.data();
         if (buf.size() < 10) {
-            throw std::runtime_error("SubIntSplitEncoder64: buffer too small for header");
+            throw std::runtime_error("SubIntSplitEncoder: buffer too small for header");
         }
         const uint8_t* p = buf.data();
         ParsedHeader h;
         h.N = static_cast<size_t>(readU64(p)); p += 8;
         const uint8_t splits = *p++;
         h.order = static_cast<BitSplitOrder>(*p++);
-        if (splits == 0 || splits > 64) {
-            throw std::runtime_error("SubIntSplitEncoder64: invalid split count in header");
+        if (splits == 0 || splits > kTotalBits) {
+            throw std::runtime_error("SubIntSplitEncoder: invalid split count in header");
         }
         if (cfg_.splitCount() != splits) {
-            throw std::runtime_error("SubIntSplitEncoder64: header split count does not match config");
+            throw std::runtime_error("SubIntSplitEncoder: header split count does not match config");
         }
         if (cfg_.order != h.order) {
-            throw std::runtime_error("SubIntSplitEncoder64: header order does not match config");
+            throw std::runtime_error("SubIntSplitEncoder: header order does not match config");
         }
         const size_t expectedHeader = headerSizeBytes(splits);
         if (buf.size() < expectedHeader) {
-            throw std::runtime_error("SubIntSplitEncoder64: buffer too small for split metadata");
+            throw std::runtime_error("SubIntSplitEncoder: buffer too small for split metadata");
         }
         h.bits.resize(splits);
         h.bytes.resize(splits);
@@ -260,16 +272,16 @@ private:
             h.bytes[s] = readU64(p); p += 8;
         }
         if (h.bits != cfg_.bits) {
-            throw std::runtime_error("SubIntSplitEncoder64: header bits do not match config");
+            throw std::runtime_error("SubIntSplitEncoder: header bits do not match config");
         }
         // Validate bit sum
         uint16_t totalBits = 0;
         for (uint8_t b : h.bits) {
-            if (b == 0 || b > 64) throw std::runtime_error("SubIntSplitEncoder64: invalid bit width in header");
+            if (b == 0 || b > kTotalBits) throw std::runtime_error("SubIntSplitEncoder: invalid bit width in header");
             totalBits = static_cast<uint16_t>(totalBits + b);
         }
-        if (totalBits != 64) {
-            throw std::runtime_error("SubIntSplitEncoder64: header bits do not sum to 64");
+        if (totalBits != kTotalBits) {
+            throw std::runtime_error("SubIntSplitEncoder: header bits do not sum to expected width");
         }
         // Build section views
         h.views.reserve(splits);
@@ -277,7 +289,7 @@ private:
         for (size_t s = 0; s < splits; ++s) {
             const uint64_t len = h.bytes[s];
             if (offset + len > buf.size()) {
-                throw std::runtime_error("SubIntSplitEncoder64: payload sizes exceed buffer");
+                throw std::runtime_error("SubIntSplitEncoder: payload sizes exceed buffer");
             }
             h.views.push_back(slice(encoded, offset, len, h.N, h.bits[s]));
             offset += static_cast<size_t>(len);
@@ -321,46 +333,46 @@ private:
         return true;
     }
 
-    static uint64_t decodeOneSection(ISectionCodec64& c, const EncodedBuffer<uint8_t>& view, size_t idx) {
+    static SectionT decodeOneSection(ISectionCodecIntegral<SectionT>& c, const EncodedBuffer<uint8_t>& view, size_t idx) {
         if (c.properties().has(EncodingProperty::RandomAccess)) {
             auto v = c.decodeAt(view, idx);
-            if (!v) throw std::runtime_error("SubIntSplitEncoder64::decodeAt: subcodec returned null");
+            if (!v) throw std::runtime_error("SubIntSplitEncoder::decodeAt: subcodec returned null");
             return *v;
         }
         auto all = c.decodeAll(view);
-        if (idx >= all.size()) throw std::runtime_error("SubIntSplitEncoder64::decodeAt: index out of range");
+        if (idx >= all.size()) throw std::runtime_error("SubIntSplitEncoder::decodeAt: index out of range");
         return all[idx];
     }
 
-    static std::vector<uint64_t> decodeSectionRange(ISectionCodec64& c, const EncodedBuffer<uint8_t>& view, size_t start, size_t end) {
+    static std::vector<SectionT> decodeSectionRange(ISectionCodecIntegral<SectionT>& c, const EncodedBuffer<uint8_t>& view, size_t start, size_t end) {
         if (c.properties().has(EncodingProperty::RandomAccess)) {
             return c.decodeRange(view, start, end);
         }
         auto all = c.decodeAll(view);
         if (start > all.size()) return {};
         end = std::min(end, all.size());
-        return std::vector<uint64_t>(all.begin() + static_cast<ptrdiff_t>(start), all.begin() + static_cast<ptrdiff_t>(end));
+        return std::vector<SectionT>(all.begin() + static_cast<ptrdiff_t>(start), all.begin() + static_cast<ptrdiff_t>(end));
     }
 
-    static uint64_t combine(const std::vector<std::vector<uint64_t>>& sections,
+    static uint64_t combine(const std::vector<std::vector<SectionT>>& sections,
                             const std::vector<uint8_t>& bits,
                             BitSplitOrder order,
                             size_t idx) {
-        std::vector<uint64_t> parts(sections.size());
+        std::vector<SectionT> parts(sections.size());
         for (size_t s = 0; s < sections.size(); ++s) parts[s] = sections[s][idx];
         return combine(parts, bits, order);
     }
 
-    static uint64_t combine(const std::vector<uint64_t>& parts, const std::vector<uint8_t>& bits, BitSplitOrder order) {
+    static uint64_t combine(const std::vector<SectionT>& parts, const std::vector<uint8_t>& bits, BitSplitOrder order) {
         const size_t splits = parts.size();
         if (splits != bits.size()) {
-            throw std::invalid_argument("SubIntSplitEncoder64::combine: size mismatch");
+            throw std::invalid_argument("SubIntSplitEncoder::combine: size mismatch");
         }
         uint64_t v = 0;
         if (splits == 0) return v;
         uint16_t sum = 0;
         for (uint8_t b : bits) sum = static_cast<uint16_t>(sum + b);
-        if (sum != 64) throw std::invalid_argument("SubIntSplitEncoder64::combine: bits do not sum to 64");
+        if (sum != kTotalBits) throw std::invalid_argument("SubIntSplitEncoder::combine: bits do not sum to expected width");
 
         if (order == BitSplitOrder::LSB_TO_MSB) {
             uint8_t shift = 0;
@@ -380,7 +392,7 @@ private:
     EncodedBuffer<uint8_t> makeEmpty() const {
         const size_t splits = cfg_.splitCount();
         if (splits == 0) {
-            throw std::invalid_argument("SubIntSplitEncoder64: cannot encode empty config with zero splits");
+            throw std::invalid_argument("SubIntSplitEncoder: cannot encode empty config with zero splits");
         }
         const size_t headerSize = headerSizeBytes(splits);
         std::vector<uint8_t> out(headerSize, 0);
@@ -395,7 +407,7 @@ private:
         }
         encodings::EncodingMetadata meta;
         meta.encodingName         = name();
-        meta.dataType             = encodings::core::typeToDataType<int64_t>;
+        meta.dataType             = encodings::core::typeToDataType<T>;
         meta.elementCount         = 0;
         meta.compressedSize       = out.size();
         meta.uncompressedSize     = 0;
@@ -404,7 +416,7 @@ private:
     }
 
 private:
-    SubIntSplitConfig64 cfg_;
+    SubIntSplitConfigIntegral<SectionT> cfg_;
     mutable const uint8_t* cachedOuterPtr_{nullptr};
     mutable size_t cachedOuterSize_{0};
     mutable ParsedHeader cachedHeader_{};
@@ -414,48 +426,142 @@ private:
 // Factories
 // ---------------------------------------------------------------------------
 
-inline std::shared_ptr<SubIntSplitEncoder64> makeSubIntSplitEncoder(SubIntSplitConfig64 cfg) {
-    return std::make_shared<SubIntSplitEncoder64>(std::move(cfg));
+template <typename T>
+inline std::shared_ptr<SubIntSplitEncoder<T>> makeSubIntSplitEncoder(SubIntSplitConfigIntegral<std::conditional_t<(sizeof(T) <= 4), uint32_t, uint64_t>> cfg) {
+    return std::make_shared<SubIntSplitEncoder<T>>(std::move(cfg));
+}
+
+template <typename T>
+inline std::shared_ptr<SubIntSplitEncoder<T>> makeSubIntSplitEncoderFromSegments(
+    const std::vector<selectors::SegmentPlan>& segments) {
+    using SectionT = std::conditional_t<(sizeof(T) <= 4), uint32_t, uint64_t>;
+    auto cfg = SubIntSplitConfigIntegral<SectionT>::fromSegments(segments);
+    return makeSubIntSplitEncoder<T>(std::move(cfg));
+}
+
+template <typename T>
+inline std::shared_ptr<SubIntSplitEncoder<T>> makeSubIntSplitEncoderFromSegments(
+    const std::vector<selectors::SegmentPlan>& segments,
+    BitSplitOrder orderHint) {
+    using SectionT = std::conditional_t<(sizeof(T) <= 4), uint32_t, uint64_t>;
+    auto cfg = SubIntSplitConfigIntegral<SectionT>::fromSegments(segments, orderHint);
+    return makeSubIntSplitEncoder<T>(std::move(cfg));
+}
+
+// ---------------------------------------------------------------------------
+// Manual configuration helpers
+// ---------------------------------------------------------------------------
+
+template <typename T>
+inline std::shared_ptr<SubIntSplitEncoder<T>> makeSubIntSplitEncoderManual(
+    const std::vector<uint8_t>& bits,
+    const std::vector<encodings::EncodingType>& encodings,
+    BitSplitOrder orderHint = BitSplitOrder::LSB_TO_MSB) {
+    using SectionT = std::conditional_t<(sizeof(T) <= 4), uint32_t, uint64_t>;
+    if (bits.size() != encodings.size()) {
+        throw std::invalid_argument("makeSubIntSplitEncoderManual: bits/encodings size mismatch");
+    }
+
+    SubIntSplitConfigIntegral<SectionT> cfg;
+    cfg.order = orderHint;
+    cfg.bits = bits;
+    cfg.codecs.reserve(bits.size());
+
+    for (size_t i = 0; i < bits.size(); ++i) {
+        const uint8_t width = bits[i];
+        switch (encodings[i]) {
+            case encodings::EncodingType::RawEncoding:
+                cfg.codecs.push_back(detail_trisplit::makeRawSection<SectionT>(width));
+                break;
+            case encodings::EncodingType::DictionaryEncoding:
+                cfg.codecs.push_back(detail_trisplit::makeDictionarySection<SectionT>(width));
+                break;
+            case encodings::EncodingType::FrameOfReference:
+                cfg.codecs.push_back(detail_trisplit::makeFORSection<512, SectionT>(width));
+                break;
+            case encodings::EncodingType::AdaptiveFrameOfReference:
+                cfg.codecs.push_back(detail_trisplit::makeAdaptiveFORSection<SectionT>(width));
+                break;
+            case encodings::EncodingType::OpenZL:
+                cfg.codecs.push_back(detail_trisplit::makeOpenZLSection<0, SectionT>(width));
+                break;
+            case encodings::EncodingType::BitPacking:
+                cfg.codecs.push_back(detail_trisplit::makeRawBitPackedSection<SectionT>(width));
+                break;
+            case encodings::EncodingType::AdaptiveFramedBitPrefix:
+                cfg.codecs.push_back(detail_trisplit::makeAdaptiveFramedBitPrefixSection<SectionT>(width));
+                break;
+            case encodings::EncodingType::RunLengthEncoding:
+                cfg.codecs.push_back(detail_trisplit::makeRLESection<SectionT>(width));
+                break;
+            default:
+                throw std::invalid_argument("makeSubIntSplitEncoderManual: unsupported encoding type");
+        }
+    }
+
+    cfg.validate();
+    return makeSubIntSplitEncoder<T>(std::move(cfg));
+}
+
+template <typename T>
+inline std::shared_ptr<SubIntSplitEncoder<T>> makeSubIntSplitEncoderManual(
+    const std::vector<uint8_t>& bits,
+    std::vector<std::shared_ptr<ISectionCodecIntegral<std::conditional_t<(sizeof(T) <= 4), uint32_t, uint64_t>>>> codecs,
+    BitSplitOrder orderHint = BitSplitOrder::LSB_TO_MSB) {
+    using SectionT = std::conditional_t<(sizeof(T) <= 4), uint32_t, uint64_t>;
+    SubIntSplitConfigIntegral<SectionT> cfg;
+    cfg.order = orderHint;
+    cfg.bits = bits;
+    cfg.codecs = std::move(codecs);
+    cfg.validate();
+    return makeSubIntSplitEncoder<T>(std::move(cfg));
+}
+
+using SubIntSplitEncoder64 = SubIntSplitEncoder<int64_t>;
+using SubIntSplitEncoder32 = SubIntSplitEncoder<int32_t>;
+
+inline std::shared_ptr<SubIntSplitEncoder64> makeSubIntSplitEncoder(SubIntSplitConfigIntegral<uint64_t> cfg) {
+    return makeSubIntSplitEncoder<int64_t>(std::move(cfg));
 }
 
 inline std::shared_ptr<SubIntSplitEncoder64> makeSubIntSplitEncoderFromSegments(
     const std::vector<selectors::SegmentPlan>& segments) {
-    auto cfg = SubIntSplitConfig64::fromSegments(segments);
-    return makeSubIntSplitEncoder(std::move(cfg));
+    return makeSubIntSplitEncoderFromSegments<int64_t>(segments);
 }
 
 inline std::shared_ptr<SubIntSplitEncoder64> makeSubIntSplitEncoderFromSegments(
     const std::vector<selectors::SegmentPlan>& segments,
     BitSplitOrder orderHint) {
-    auto cfg = SubIntSplitConfig64::fromSegments(segments, orderHint);
-    return makeSubIntSplitEncoder(std::move(cfg));
+    return makeSubIntSplitEncoderFromSegments<int64_t>(segments, orderHint);
 }
 
 // ---------------------------------------------------------------------------
 // Auto-selecting wrapper (lazy instantiation via sampling + selector)
 // ---------------------------------------------------------------------------
 
-class SubIntSplitAutoEncoder64 final : public Codec<int64_t, uint8_t> {
+template <typename T>
+    requires (std::is_same_v<T, int64_t> || std::is_same_v<T, int32_t>)
+class SubIntSplitAutoEncoder final : public Codec<T, uint8_t> {
 public:
     struct Config {
         selectors::IDSubStreamEncodingSelector::Config selectorConfig{};
-        generators::samplers::StreamSampler<int64_t>::Config samplerConfig{};
+        generators::samplers::StreamSampler<T>::Config samplerConfig{};
         std::vector<std::unique_ptr<selectors::costs::EncodingCostModel>> costModels;
         std::optional<BitSplitOrder> orderHint{}; // allow forcing MSB/LSB ordering
         bool debugLogging{true};
         bool enableSelectionTiming{false};
     };
 
-    explicit SubIntSplitAutoEncoder64(Config cfg)
+    explicit SubIntSplitAutoEncoder(Config cfg)
         : selector_(cfg.selectorConfig), samplerCfg_(cfg.samplerConfig), orderHint_(cfg.orderHint), debugLogging_(cfg.debugLogging),
           selectionTimingEnabled_(cfg.enableSelectionTiming) {
         if (cfg.costModels.empty()) {
-            throw std::invalid_argument("SubIntSplitAutoEncoder64: costModels must not be empty");
+            throw std::invalid_argument("SubIntSplitAutoEncoder: costModels must not be empty");
         }
         costModels_ = std::move(cfg.costModels);
     }
 
-    EncodedBuffer<uint8_t> encode(std::span<const int64_t> data) override {
+    EncodedBuffer<uint8_t> encode(std::span<const T> data) override {
         ensureEncoder(data);
         auto enc = impl_->encode(data);
         if (selectionTimingEnabled_ && lastSelectionTimeNs_.has_value()) {
@@ -467,17 +573,17 @@ public:
         return enc;
     }
 
-    std::vector<int64_t> decodeAll(const EncodedBuffer<uint8_t>& encoded) override {
+    std::vector<T> decodeAll(const EncodedBuffer<uint8_t>& encoded) override {
         ensureDecoderInitialized();
         return impl_->decodeAll(encoded);
     }
 
-    std::optional<int64_t> decodeAt(const EncodedBuffer<uint8_t>& encoded, size_t index) override {
+    std::optional<T> decodeAt(const EncodedBuffer<uint8_t>& encoded, size_t index) override {
         ensureDecoderInitialized();
         return impl_->decodeAt(encoded, index);
     }
 
-    std::vector<int64_t> decodeRange(const EncodedBuffer<uint8_t>& encoded, size_t start, size_t end) override {
+    std::vector<T> decodeRange(const EncodedBuffer<uint8_t>& encoded, size_t start, size_t end) override {
         ensureDecoderInitialized();
         return impl_->decodeRange(encoded, start, end);
     }
@@ -499,10 +605,13 @@ public:
     }
 
 private:
-    void ensureEncoder(std::span<const int64_t> data) {
+    using UnsignedT = std::make_unsigned_t<T>;
+    static constexpr uint8_t kTotalBits = static_cast<uint8_t>(sizeof(T) * 8);
+
+    void ensureEncoder(std::span<const T> data) {
         if (impl_) return;
         if (data.empty()) {
-            throw std::invalid_argument("SubIntSplitAutoEncoder64: cannot auto-select on empty input");
+            throw std::invalid_argument("SubIntSplitAutoEncoder: cannot auto-select on empty input");
         }
 
         const auto selectionStart = std::chrono::high_resolution_clock::now();
@@ -522,7 +631,7 @@ private:
             effectiveCfg.stride = std::max<size_t>(1, n / target);
         }
 
-        auto sample = generators::samplers::StreamSampler<int64_t>::sample(data, effectiveCfg);
+        auto sample = generators::samplers::StreamSampler<T>::sample(data, effectiveCfg);
         if (sample.empty()) {
             // Fallback to a minimal sample (first element)
             sample.push_back(data.front());
@@ -530,11 +639,11 @@ private:
 
         // If MSB order is requested, mirror bits in the sample so the selector's LSB-oriented DP
         // sees the highest bits first. Later we map segment positions back to the original domain.
-        std::vector<int64_t> transformedSample;
+        std::vector<T> transformedSample;
         if (orderHint_.has_value() && *orderHint_ == BitSplitOrder::MSB_TO_LSB) {
             transformedSample.reserve(sample.size());
             for (auto v : sample) {
-                transformedSample.push_back(static_cast<int64_t>(mirrorBits64(static_cast<uint64_t>(v))));
+                transformedSample.push_back(static_cast<T>(mirrorBits(static_cast<UnsignedT>(v))));
             }
         }
 
@@ -544,7 +653,7 @@ private:
                                         : sample;
         lastSelection_ = selector_.select(selectorInput, costModels_, data.size());
         if (lastSelection_.segments.empty()) {
-            throw std::runtime_error("SubIntSplitAutoEncoder64: selector returned no segments");
+            throw std::runtime_error("SubIntSplitAutoEncoder: selector returned no segments");
         }
 
         if (selectionTimingEnabled_) {
@@ -568,37 +677,38 @@ private:
             segments = remapMirroredSegmentsToOriginal(segments);
         }
 
+        using SectionT = std::conditional_t<(sizeof(T) <= 4), uint32_t, uint64_t>;
         const auto cfg = orderHint_.has_value()
-            ? SubIntSplitConfig64::fromSegments(segments, *orderHint_)
-            : SubIntSplitConfig64::fromSegments(segments);
+            ? SubIntSplitConfigIntegral<SectionT>::fromSegments(segments, *orderHint_)
+            : SubIntSplitConfigIntegral<SectionT>::fromSegments(segments);
         // Reflect remapped segments in the cached selection for accurate logging
         lastSelection_.segments = segments;
-        impl_ = makeSubIntSplitEncoder(std::move(cfg));
+        impl_ = makeSubIntSplitEncoder<T>(std::move(cfg));
     }
 
     void ensureDecoderInitialized() const {
         if (!impl_) {
-            throw std::runtime_error("SubIntSplitAutoEncoder64: encoder not initialized; call encode first");
+            throw std::runtime_error("SubIntSplitAutoEncoder: encoder not initialized; call encode first");
         }
     }
 
 private:
     selectors::IDSubStreamEncodingSelector selector_{};
-    generators::samplers::StreamSampler<int64_t>::Config samplerCfg_{};
+    generators::samplers::StreamSampler<T>::Config samplerCfg_{};
     std::optional<BitSplitOrder> orderHint_{};
     std::vector<std::unique_ptr<selectors::costs::EncodingCostModel>> costModels_;
-    std::shared_ptr<SubIntSplitEncoder64> impl_{};
+    std::shared_ptr<SubIntSplitEncoder<T>> impl_{};
     bool debugLogging_{true};
     bool selectionTimingEnabled_{false};
     std::optional<std::chrono::nanoseconds> lastSelectionTimeNs_{};
     selectors::IDSubStreamEncodingSelector::Result lastSelection_{};
 
-    static uint64_t mirrorBits64(uint64_t x) {
+    static UnsignedT mirrorBits(UnsignedT x) {
         // simple bit-reversal; sample sizes are small
-        uint64_t y = 0;
-        for (int i = 0; i < 64; ++i) {
+        UnsignedT y = 0;
+        for (int i = 0; i < kTotalBits; ++i) {
             y <<= 1;
-            y |= (x & 1);
+            y |= (x & 1U);
             x >>= 1;
         }
         return y;
@@ -607,10 +717,11 @@ private:
     static std::vector<selectors::SegmentPlan> remapMirroredSegmentsToOriginal(const std::vector<selectors::SegmentPlan>& segments) {
         std::vector<selectors::SegmentPlan> out;
         out.reserve(segments.size());
+        const int maxBitIndex = static_cast<int>(kTotalBits - 1);
         for (const auto& seg : segments) {
             selectors::SegmentPlan mapped = seg;
-            mapped.bitStart = 63 - seg.bitEnd;
-            mapped.bitEnd   = 63 - seg.bitStart;
+            mapped.bitStart = maxBitIndex - seg.bitEnd;
+            mapped.bitEnd   = maxBitIndex - seg.bitStart;
             out.push_back(mapped);
         }
         return out;
@@ -668,22 +779,25 @@ private:
     }
 };
 
-inline std::shared_ptr<SubIntSplitAutoEncoder64> makeAutoSubIntSplitEncoder(SubIntSplitAutoEncoder64::Config cfg) {
-    return std::make_shared<SubIntSplitAutoEncoder64>(std::move(cfg));
+template <typename T>
+inline std::shared_ptr<SubIntSplitAutoEncoder<T>> makeAutoSubIntSplitEncoder(typename SubIntSplitAutoEncoder<T>::Config cfg) {
+    return std::make_shared<SubIntSplitAutoEncoder<T>>(std::move(cfg));
 }
 
-inline SubIntSplitAutoEncoder64::Config makeDefaultAutoSubIntSplitConfig(BitSplitOrder order = BitSplitOrder::LSB_TO_MSB,
+template <typename T>
+inline typename SubIntSplitAutoEncoder<T>::Config makeDefaultAutoSubIntSplitConfig(BitSplitOrder order = BitSplitOrder::LSB_TO_MSB,
                                                                          bool enableSelectionTiming = false) {
-    SubIntSplitAutoEncoder64::Config cfg;
+    typename SubIntSplitAutoEncoder<T>::Config cfg;
     cfg.selectorConfig = selectors::IDSubStreamEncodingSelector::Config{}; // defaults
-    cfg.selectorConfig.verboseLevel = 0; // leave quiet by default; enable when debugging
+    cfg.selectorConfig.verboseLevel = 1; // leave quiet by default; enable when debugging
     cfg.selectorConfig.minSegmentWidth = 1; // avoid tiny slices that inflate headers/rounding
     cfg.selectorConfig.splitPenalty = 10.0; // discourage excessive splitting (heavier for MSB)
     cfg.selectorConfig.enableMergePhase = false; // merge adjacent in MSB mode to reduce fragmentation
-    cfg.samplerConfig.maxSamples = 10000;   // cap total sampled points
-    cfg.samplerConfig.stride = 0;           // auto-compute stride to span the domain
-    cfg.samplerConfig.maxPercentage = 0.01; // or maxSamples, whichever is smaller
-    cfg.debugLogging = false;                // enable instrumentation by default for now
+    cfg.samplerConfig.maxSamples = 10'000;   // cap total sampled points
+    cfg.samplerConfig.stride = 0;           // unused when blockSize > 0
+    cfg.samplerConfig.blockSize = 128;      // 78 blocks × 128 elements — preserves local temporal structure
+    cfg.samplerConfig.maxPercentage = 0; // or maxSamples, whichever is smaller
+    cfg.debugLogging = false;                 // enable instrumentation by default for now
     cfg.enableSelectionTiming = enableSelectionTiming;
     cfg.orderHint = order;
 
@@ -693,20 +807,40 @@ inline SubIntSplitAutoEncoder64::Config makeDefaultAutoSubIntSplitConfig(BitSpli
     cfg.costModels.emplace_back(std::make_unique<AdaptiveFORCostModel>());
     cfg.costModels.emplace_back(std::make_unique<AdaptiveFramedBitPrefixCostModel>());
     cfg.costModels.emplace_back(std::make_unique<DictionaryCostModel>());
-    // cfg.costModels.emplace_back(std::make_unique<RLECostModel>());
+    cfg.costModels.emplace_back(std::make_unique<RLECostModel>());
     return cfg;
+}
+
+template <typename T>
+inline std::shared_ptr<SubIntSplitAutoEncoder<T>> makeDefaultAutoSubIntSplitEncoder(BitSplitOrder order = BitSplitOrder::LSB_TO_MSB,
+                                                                                   bool exhaustiveSearch = false,
+                                                                                   bool enablePrune = true,
+                                                                                   bool enableSelectionTiming = false) {
+    auto cfg = makeDefaultAutoSubIntSplitConfig<T>(order, enableSelectionTiming);
+    cfg.selectorConfig.orderHint = order;
+    cfg.selectorConfig.useExhaustiveSearch = exhaustiveSearch;
+    cfg.selectorConfig.enablePrune = enablePrune;
+    cfg.selectorConfig.costGridCsvPath = "../Source/encoders/auto_subintsplit_cost_grid_twitter_snowflake_64.csv"; // for debugging/analysis; selector will log evaluated candidates and their costs
+    return makeAutoSubIntSplitEncoder<T>(std::move(cfg));
+}
+
+using SubIntSplitAutoEncoder64 = SubIntSplitAutoEncoder<int64_t>;
+using SubIntSplitAutoEncoder32 = SubIntSplitAutoEncoder<int32_t>;
+
+inline std::shared_ptr<SubIntSplitAutoEncoder64> makeAutoSubIntSplitEncoder(SubIntSplitAutoEncoder64::Config cfg) {
+    return makeAutoSubIntSplitEncoder<int64_t>(std::move(cfg));
+}
+
+inline SubIntSplitAutoEncoder64::Config makeDefaultAutoSubIntSplitConfig(BitSplitOrder order = BitSplitOrder::LSB_TO_MSB,
+                                                                         bool enableSelectionTiming = false) {
+    return makeDefaultAutoSubIntSplitConfig<int64_t>(order, enableSelectionTiming);
 }
 
 inline std::shared_ptr<SubIntSplitAutoEncoder64> makeDefaultAutoSubIntSplitEncoder(BitSplitOrder order = BitSplitOrder::LSB_TO_MSB,
                                                                                    bool exhaustiveSearch = false,
                                                                                    bool enablePrune = true,
                                                                                    bool enableSelectionTiming = false) {
-    auto cfg = makeDefaultAutoSubIntSplitConfig(order, enableSelectionTiming);
-    cfg.selectorConfig.orderHint = order;
-    cfg.selectorConfig.useExhaustiveSearch = exhaustiveSearch;
-    cfg.selectorConfig.enablePrune = enablePrune;
-    // cfg.selectorConfig.costGridCsvPath = "../Source/encoders/auto_subintsplit_cost_grid.csv"; // for debugging/analysis; selector will log evaluated candidates and their costs
-    return makeAutoSubIntSplitEncoder(std::move(cfg));
+    return makeDefaultAutoSubIntSplitEncoder<int64_t>(order, exhaustiveSearch, enablePrune, enableSelectionTiming);
 }
 
 } // namespace encodings::encoders

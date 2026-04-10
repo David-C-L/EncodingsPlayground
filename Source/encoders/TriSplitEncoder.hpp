@@ -13,6 +13,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <type_traits>
 #include <vector>
 
@@ -28,21 +29,21 @@ namespace encodings::encoders {
 // Config
 // ---------------------------------------------------------------------------
 
-struct TriSplitConfig64 : SubIntSplitConfig64 {
+struct TriSplitConfig64 : SubIntSplitConfigIntegral<uint64_t> {
     uint8_t bitsA{0};
     uint8_t bitsB{0};
     uint8_t bitsC{0};
 
-    std::shared_ptr<ISectionCodec64> codecA;
-    std::shared_ptr<ISectionCodec64> codecB;
-    std::shared_ptr<ISectionCodec64> codecC;
+    std::shared_ptr<ISectionCodecIntegral<uint64_t>> codecA;
+    std::shared_ptr<ISectionCodecIntegral<uint64_t>> codecB;
+    std::shared_ptr<ISectionCodecIntegral<uint64_t>> codecC;
 
     TriSplitConfig64() = default;
 
     TriSplitConfig64(uint8_t a, uint8_t b, uint8_t c,
-                     std::shared_ptr<ISectionCodec64> ca,
-                     std::shared_ptr<ISectionCodec64> cb,
-                     std::shared_ptr<ISectionCodec64> cc,
+                     std::shared_ptr<ISectionCodecIntegral<uint64_t>> ca,
+                     std::shared_ptr<ISectionCodecIntegral<uint64_t>> cb,
+                     std::shared_ptr<ISectionCodecIntegral<uint64_t>> cc,
                      BitSplitOrder ord = BitSplitOrder::LSB_TO_MSB) {
         bitsA  = a;
         bitsB  = b;
@@ -377,7 +378,7 @@ private:
         return has(cfg_.codecA->properties()) && has(cfg_.codecB->properties()) && has(cfg_.codecC->properties());
     }
 
-    static uint64_t decodeOneSection(ISectionCodec64& c, const EncodedBuffer<uint8_t>& view, size_t idx) {
+    static uint64_t decodeOneSection(ISectionCodecIntegral<uint64_t>& c, const EncodedBuffer<uint8_t>& view, size_t idx) {
     if (c.properties().has(EncodingProperty::RandomAccess)) {
             auto v = c.decodeAt(view, idx);
             if (!v) throw std::runtime_error("TriSplitEncoder64::decodeAt: subcodec returned null");
@@ -389,7 +390,7 @@ private:
         return all[idx];
     }
 
-    static std::vector<uint64_t> decodeSectionRange(ISectionCodec64& c, const EncodedBuffer<uint8_t>& view, size_t start, size_t end) {
+    static std::vector<uint64_t> decodeSectionRange(ISectionCodecIntegral<uint64_t>& c, const EncodedBuffer<uint8_t>& view, size_t start, size_t end) {
     if (c.properties().has(EncodingProperty::RandomAccess)) {
             return c.decodeRange(view, start, end);
         }
@@ -428,19 +429,46 @@ private:
 // ---------------------------------------------------------------------------
 
 namespace detail_trisplit {
+enum class SnowflakeVariant {
+    Snowflake,
+    Twitter
+};
+
 struct SnowflakeLayout {
     static constexpr uint8_t timestampBits = 41; // Instagram/Snowflake style
     static constexpr uint8_t machineBits   = 13;
     static constexpr uint8_t sequenceBits  = 10;
 };
 
-TriSplitConfig64 makeSnowflakeConfig(std::shared_ptr<ISectionCodec64> codecA,
-                                     std::shared_ptr<ISectionCodec64> codecB,
-                                     std::shared_ptr<ISectionCodec64> codecC,
-                                     BitSplitOrder order = BitSplitOrder::MSB_TO_LSB) {
-    const uint8_t baseBitsA = SnowflakeLayout::timestampBits;
-    const uint8_t baseBitsB = SnowflakeLayout::machineBits;
-    const uint8_t baseBitsC = SnowflakeLayout::sequenceBits;
+struct TwitterSnowflakeLayout {
+    static constexpr uint8_t timestampBits = 41; // Twitter/Snowflake style
+    static constexpr uint8_t machineBits   = 10;
+    static constexpr uint8_t sequenceBits  = 13;
+};
+
+inline std::tuple<uint8_t, uint8_t, uint8_t> getSnowflakeLayoutBits(SnowflakeVariant variant) {
+    switch (variant) {
+    case SnowflakeVariant::Twitter:
+        return {TwitterSnowflakeLayout::timestampBits,
+                TwitterSnowflakeLayout::machineBits,
+                TwitterSnowflakeLayout::sequenceBits};
+    case SnowflakeVariant::Snowflake:
+        return {SnowflakeLayout::timestampBits,
+                SnowflakeLayout::machineBits,
+                SnowflakeLayout::sequenceBits};
+    default:
+        return {SnowflakeLayout::timestampBits,
+                SnowflakeLayout::machineBits,
+                SnowflakeLayout::sequenceBits};
+    }
+}
+
+TriSplitConfig64 makeSnowflakeConfig(std::shared_ptr<ISectionCodecIntegral<uint64_t>> codecA,
+                                     std::shared_ptr<ISectionCodecIntegral<uint64_t>> codecB,
+                                     std::shared_ptr<ISectionCodecIntegral<uint64_t>> codecC,
+                                     BitSplitOrder order = BitSplitOrder::MSB_TO_LSB,
+                                     SnowflakeVariant variant = SnowflakeVariant::Snowflake) {
+    const auto [baseBitsA, baseBitsB, baseBitsC] = getSnowflakeLayoutBits(variant);
 
     const uint16_t total = static_cast<uint16_t>(baseBitsA) + baseBitsB + baseBitsC;
     const uint8_t pad = static_cast<uint8_t>(64 - total);
@@ -483,110 +511,133 @@ inline std::shared_ptr<TriSplitEncoder64> makeTriSplitAllDict(uint8_t bitsA, uin
     return makeTriSplitEncoder64(std::move(cfg));
 }
 
-inline std::shared_ptr<TriSplitEncoder64> makeSnowflakeTriSplitAllDict(BitSplitOrder order = BitSplitOrder::MSB_TO_LSB) {
-    using detail_trisplit::SnowflakeLayout;
+inline std::shared_ptr<TriSplitEncoder64> makeSnowflakeTriSplitAllDict(
+    BitSplitOrder order = BitSplitOrder::MSB_TO_LSB,
+    detail_trisplit::SnowflakeVariant variant = detail_trisplit::SnowflakeVariant::Snowflake) {
+    const auto [bitsA, bitsB, bitsC] = detail_trisplit::getSnowflakeLayoutBits(variant);
     auto cfg = detail_trisplit::makeSnowflakeConfig(
-        detail_trisplit::makeDictionarySection(SnowflakeLayout::timestampBits),
-        detail_trisplit::makeDictionarySection(SnowflakeLayout::machineBits),
-        detail_trisplit::makeDictionarySection(SnowflakeLayout::sequenceBits),
-        order);
+        detail_trisplit::makeDictionarySection(bitsA),
+        detail_trisplit::makeDictionarySection(bitsB),
+        detail_trisplit::makeDictionarySection(bitsC),
+        order,
+        variant);
     return makeTriSplitEncoder64(std::move(cfg));
 }
 
 
-inline std::shared_ptr<TriSplitEncoder64> makeSnowflakeTriSplitAllRawBitPacked(BitSplitOrder order = BitSplitOrder::MSB_TO_LSB) {
-    using detail_trisplit::SnowflakeLayout;
+inline std::shared_ptr<TriSplitEncoder64> makeSnowflakeTriSplitAllRawBitPacked(
+    BitSplitOrder order = BitSplitOrder::MSB_TO_LSB,
+    detail_trisplit::SnowflakeVariant variant = detail_trisplit::SnowflakeVariant::Snowflake) {
+    const auto [bitsA, bitsB, bitsC] = detail_trisplit::getSnowflakeLayoutBits(variant);
     auto cfg = detail_trisplit::makeSnowflakeConfig(
-        detail_trisplit::makeRawBitPackedSection(SnowflakeLayout::timestampBits),
-        detail_trisplit::makeRawBitPackedSection(SnowflakeLayout::machineBits),
-        detail_trisplit::makeRawBitPackedSection(SnowflakeLayout::sequenceBits),
-        order);
+        detail_trisplit::makeRawBitPackedSection(bitsA),
+        detail_trisplit::makeRawBitPackedSection(bitsB),
+        detail_trisplit::makeRawBitPackedSection(bitsC),
+        order,
+        variant);
     return makeTriSplitEncoder64(std::move(cfg));
 }
 
 template <size_t BlockSize = 0>
-inline std::shared_ptr<TriSplitEncoder64> makeSnowflakeTriSplitOpenZLOnly(BitSplitOrder order = BitSplitOrder::MSB_TO_LSB) {
-    using detail_trisplit::SnowflakeLayout;
+inline std::shared_ptr<TriSplitEncoder64> makeSnowflakeTriSplitOpenZLOnly(
+    BitSplitOrder order = BitSplitOrder::MSB_TO_LSB,
+    detail_trisplit::SnowflakeVariant variant = detail_trisplit::SnowflakeVariant::Snowflake) {
+    const auto [bitsA, bitsB, bitsC] = detail_trisplit::getSnowflakeLayoutBits(variant);
     auto cfg = detail_trisplit::makeSnowflakeConfig(
-        detail_trisplit::makeOpenZLSection<BlockSize>(SnowflakeLayout::timestampBits),
-        detail_trisplit::makeOpenZLSection<BlockSize>(SnowflakeLayout::machineBits),
-        detail_trisplit::makeOpenZLSection<BlockSize>(SnowflakeLayout::sequenceBits),
-        order);
+        detail_trisplit::makeOpenZLSection<BlockSize>(bitsA),
+        detail_trisplit::makeOpenZLSection<BlockSize>(bitsB),
+        detail_trisplit::makeOpenZLSection<BlockSize>(bitsC),
+        order,
+        variant);
     return makeTriSplitEncoder64(std::move(cfg));
 }
 
 // Backwards-compatible alias used by benchmarks
-inline std::shared_ptr<TriSplitEncoder64> makeSnowflakeTriSplitDictOnly(BitSplitOrder order = BitSplitOrder::MSB_TO_LSB) {
-    return makeSnowflakeTriSplitAllDict(order);
+inline std::shared_ptr<TriSplitEncoder64> makeSnowflakeTriSplitDictOnly(
+    BitSplitOrder order = BitSplitOrder::MSB_TO_LSB,
+    detail_trisplit::SnowflakeVariant variant = detail_trisplit::SnowflakeVariant::Snowflake) {
+    return makeSnowflakeTriSplitAllDict(order, variant);
 }
 
 inline std::shared_ptr<TriSplitEncoder64> makeSnowflakeTriSplitFORDictFOR(
-    BitSplitOrder order = BitSplitOrder::MSB_TO_LSB) {
-    using detail_trisplit::SnowflakeLayout;
+    BitSplitOrder order = BitSplitOrder::MSB_TO_LSB,
+    detail_trisplit::SnowflakeVariant variant = detail_trisplit::SnowflakeVariant::Snowflake) {
+    const auto [bitsA, bitsB, bitsC] = detail_trisplit::getSnowflakeLayoutBits(variant);
     auto cfg = detail_trisplit::makeSnowflakeConfig(
-        detail_trisplit::makeAdaptiveFORSection(SnowflakeLayout::timestampBits),
-        detail_trisplit::makeDictionarySection(SnowflakeLayout::machineBits),
-        detail_trisplit::makeAdaptiveFORSection(SnowflakeLayout::sequenceBits),
-        order);
+        detail_trisplit::makeAdaptiveFORSection(bitsA),
+        detail_trisplit::makeDictionarySection(bitsB),
+        detail_trisplit::makeAdaptiveFORSection(bitsC),
+        order,
+        variant);
     return makeTriSplitEncoder64(std::move(cfg));
 }
 
 inline std::shared_ptr<TriSplitEncoder64> makeSnowflakeTriSplitFORRawFOR(
-    BitSplitOrder order = BitSplitOrder::MSB_TO_LSB) {
-    using detail_trisplit::SnowflakeLayout;
+    BitSplitOrder order = BitSplitOrder::MSB_TO_LSB,
+    detail_trisplit::SnowflakeVariant variant = detail_trisplit::SnowflakeVariant::Snowflake) {
+    const auto [bitsA, bitsB, bitsC] = detail_trisplit::getSnowflakeLayoutBits(variant);
     auto cfg = detail_trisplit::makeSnowflakeConfig(
-        detail_trisplit::makeAdaptiveFORSection(SnowflakeLayout::timestampBits),
-        detail_trisplit::makeRawSection(SnowflakeLayout::machineBits),
-        detail_trisplit::makeAdaptiveFORSection(SnowflakeLayout::sequenceBits),
-        order);
+        detail_trisplit::makeAdaptiveFORSection(bitsA),
+        detail_trisplit::makeRawSection(bitsB),
+        detail_trisplit::makeAdaptiveFORSection(bitsC),
+        order,
+        variant);
     return makeTriSplitEncoder64(std::move(cfg));
 }
 
 // Variant: FOR on timestamp, dictionary on machine, dictionary on sequence (cheap + RA)
 inline std::shared_ptr<TriSplitEncoder64> makeSnowflakeTriSplitFORDictDict(
-    BitSplitOrder order = BitSplitOrder::MSB_TO_LSB) {
-    using detail_trisplit::SnowflakeLayout;
+    BitSplitOrder order = BitSplitOrder::MSB_TO_LSB,
+    detail_trisplit::SnowflakeVariant variant = detail_trisplit::SnowflakeVariant::Snowflake) {
+    const auto [bitsA, bitsB, bitsC] = detail_trisplit::getSnowflakeLayoutBits(variant);
     auto cfg = detail_trisplit::makeSnowflakeConfig(
-        detail_trisplit::makeAdaptiveFORSection(SnowflakeLayout::timestampBits),
-        detail_trisplit::makeDictionarySection(SnowflakeLayout::machineBits),
-        detail_trisplit::makeDictionarySection(SnowflakeLayout::sequenceBits),
-        order);
+        detail_trisplit::makeAdaptiveFORSection(bitsA),
+        detail_trisplit::makeDictionarySection(bitsB),
+        detail_trisplit::makeDictionarySection(bitsC),
+        order,
+        variant);
     return makeTriSplitEncoder64(std::move(cfg));
 }
 
 // Variant: FOR on timestamp, dictionary on machine, raw on sequence (fast decode baseline)
 inline std::shared_ptr<TriSplitEncoder64> makeSnowflakeTriSplitFORDictRaw(
-    BitSplitOrder order = BitSplitOrder::MSB_TO_LSB) {
-    using detail_trisplit::SnowflakeLayout;
+    BitSplitOrder order = BitSplitOrder::MSB_TO_LSB,
+    detail_trisplit::SnowflakeVariant variant = detail_trisplit::SnowflakeVariant::Snowflake) {
+    const auto [bitsA, bitsB, bitsC] = detail_trisplit::getSnowflakeLayoutBits(variant);
     auto cfg = detail_trisplit::makeSnowflakeConfig(
-        detail_trisplit::makeAdaptiveFORSection(SnowflakeLayout::timestampBits),
-        detail_trisplit::makeDictionarySection(SnowflakeLayout::machineBits),
-        detail_trisplit::makeRawSection(SnowflakeLayout::sequenceBits),
-        order);
+        detail_trisplit::makeAdaptiveFORSection(bitsA),
+        detail_trisplit::makeDictionarySection(bitsB),
+        detail_trisplit::makeRawSection(bitsC),
+        order,
+        variant);
     return makeTriSplitEncoder64(std::move(cfg));
 }
 
 // All-FOR preset (timestamp/machine/sequence) when per-section deltas are small.
 inline std::shared_ptr<TriSplitEncoder64> makeSnowflakeTriSplitFOROnly(
-    BitSplitOrder order = BitSplitOrder::MSB_TO_LSB) {
-    using detail_trisplit::SnowflakeLayout;
+    BitSplitOrder order = BitSplitOrder::MSB_TO_LSB,
+    detail_trisplit::SnowflakeVariant variant = detail_trisplit::SnowflakeVariant::Snowflake) {
+    const auto [bitsA, bitsB, bitsC] = detail_trisplit::getSnowflakeLayoutBits(variant);
     auto cfg = detail_trisplit::makeSnowflakeConfig(
-        detail_trisplit::makeAdaptiveFORSection(SnowflakeLayout::timestampBits),
-        detail_trisplit::makeAdaptiveFORSection(SnowflakeLayout::machineBits),
-        detail_trisplit::makeAdaptiveFORSection(SnowflakeLayout::sequenceBits),
-        order);
+        detail_trisplit::makeAdaptiveFORSection(bitsA),
+        detail_trisplit::makeAdaptiveFORSection(bitsB),
+        detail_trisplit::makeAdaptiveFORSection(bitsC),
+        order,
+        variant);
     return makeTriSplitEncoder64(std::move(cfg));
 }
 
 // All-AdaptiveFramedBitPrefix preset (timestamp/machine/sequence) when per-section prefixes are small.
 inline std::shared_ptr<TriSplitEncoder64> makeSnowflakeTriSplitBitPrefixOnly(
-    BitSplitOrder order = BitSplitOrder::MSB_TO_LSB) {
-    using detail_trisplit::SnowflakeLayout;
+    BitSplitOrder order = BitSplitOrder::MSB_TO_LSB,
+    detail_trisplit::SnowflakeVariant variant = detail_trisplit::SnowflakeVariant::Snowflake) {
+    const auto [bitsA, bitsB, bitsC] = detail_trisplit::getSnowflakeLayoutBits(variant);
     auto cfg = detail_trisplit::makeSnowflakeConfig(
-        detail_trisplit::makeAdaptiveFramedBitPrefixSection(SnowflakeLayout::timestampBits),
-        detail_trisplit::makeAdaptiveFramedBitPrefixSection(SnowflakeLayout::machineBits),
-        detail_trisplit::makeAdaptiveFramedBitPrefixSection(SnowflakeLayout::sequenceBits),
-        order);
+        detail_trisplit::makeAdaptiveFramedBitPrefixSection(bitsA),
+        detail_trisplit::makeAdaptiveFramedBitPrefixSection(bitsB),
+        detail_trisplit::makeAdaptiveFramedBitPrefixSection(bitsC),
+        order,
+        variant);
     return makeTriSplitEncoder64(std::move(cfg));
 }
 
