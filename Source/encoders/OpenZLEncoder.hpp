@@ -310,8 +310,8 @@ private:
 
         const bool traceOpenZL = (std::getenv("OPENZL_TRACE") != nullptr);
         struct TraceContext {
-            std::vector<std::string> graphs;
-            std::vector<std::string> codecs;
+            std::unordered_set<std::string> graphs;
+            std::unordered_set<std::string> codecs;
         } traceCtx;
         ZL_CompressIntrospectionHooks hooks{};
         if (traceOpenZL) {
@@ -319,14 +319,14 @@ private:
                 auto* ctx = static_cast<TraceContext*>(opaque);
                 if (ctx) {
                     const char* name = ZL_Compressor_Graph_getName(compressor, gid);
-                    ctx->graphs.emplace_back(name ? name : "(anonymous graph)");
+                    ctx->graphs.emplace(name ? name : "(anonymous graph)");
                 }
             };
             hooks.on_codecEncode_start = [](void* opaque, ZL_Encoder*, const ZL_Compressor* compressor, ZL_NodeID nid, const ZL_Input*[], size_t) noexcept {
                 auto* ctx = static_cast<TraceContext*>(opaque);
                 if (ctx) {
                     const char* name = ZL_Compressor_Node_getName(compressor, nid);
-                    ctx->codecs.emplace_back(name ? name : "(node)");
+                    ctx->codecs.emplace(name ? name : "(node)");
                 }
             };
             hooks.opaque = &traceCtx;
