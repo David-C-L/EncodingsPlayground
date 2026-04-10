@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -35,6 +36,15 @@ struct SegmentMetrics {
 	size_t zeroCount{0};
 	size_t nonzeroCount{0};
 	uint8_t bitWidth{0};
+	// Tail-frequency support
+	size_t f1{0}; // values seen exactly once
+	size_t f2{0}; // values seen exactly twice
+
+	struct HyperLogLog {
+		std::vector<uint8_t> registers;
+		uint8_t precision{0};
+	};
+	HyperLogLog hll{};
 
 	// Per-frame residual widths for AdaptiveFOR and suffix widths for prefix codecs (candidates below).
 	static constexpr size_t kFrameCandidateCount = 10;
@@ -53,6 +63,7 @@ template <typename T = uint64_t>
 class MetricCollector {
 public:
 	static constexpr size_t kUniqueCountCap = 1 << 16; // stop tracking if too many uniques
+	static constexpr uint8_t kHllPrecision = 16; // 65536 registers
 	inline static constexpr std::array<size_t, SegmentMetrics::kFrameCandidateCount> kFrameCandidates{
 		8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096
 	};
@@ -74,16 +85,36 @@ public:
 		out.nonzeroCount = (values[0] == 0) ? 0 : 1;
 		out.runCount = 1;
 		out.uniqueCount = 0;
+		out.f1 = 0;
+		out.f2 = 0;
+		out.hll.precision = kHllPrecision;
+		out.hll.registers.assign(static_cast<size_t>(1u << kHllPrecision), 0);
 		out.minDelta = std::numeric_limits<uint64_t>::max();
 		out.maxDelta = 0;
 		out.minDelta1024Window = std::numeric_limits<uint64_t>::max();
 		out.maxDelta1024Window = 0;
 		out.maxRunLength = 1;
 
-		ankerl::unordered_dense::set<T> uniqueSet;
-		uniqueSet.reserve(std::min(n, kUniqueCountCap));
+		ankerl::unordered_dense::map<T, uint32_t> freqMap;
+		freqMap.reserve(std::min(n, kUniqueCountCap));
 		bool uniqueCapped = false;
-		uniqueSet.insert(values[0]);
+		freqMap[values[0]] = 1;
+		out.f1 = 1;
+
+		auto hll_add = [&](uint64_t hash) {
+			const uint32_t p = kHllPrecision;
+			const uint32_t m = 1u << p;
+			const uint32_t idx = static_cast<uint32_t>(hash & (m - 1));
+			const uint64_t w = hash >> p;
+			const uint8_t rank = (w == 0)
+				? static_cast<uint8_t>(64 - p + 1)
+				: static_cast<uint8_t>(std::countl_zero(w) + 1);
+			if (rank > out.hll.registers[idx]) {
+				out.hll.registers[idx] = rank;
+			}
+		};
+
+		hll_add(std::hash<T>{}(values[0]));
 
 		// Per-frame min/max trackers for each candidate frame size (AdaptiveFOR-style).
 		std::array<uint64_t, SegmentMetrics::kFrameCandidateCount> frameMin;
@@ -130,6 +161,7 @@ public:
 		for (size_t i = 0; i < n; ++i) {
 			const T v = values[i];
 			const uint64_t uv = static_cast<uint64_t>(v);
+			hll_add(std::hash<T>{}(v));
 
 			if (i > 0) {
 				out.min = std::min(out.min, uv);
@@ -173,10 +205,21 @@ public:
 					windowMaxDelta = 0;
 				}
 
-				// Unique values (capped)
+				// Unique values (capped) + f1/f2 tracking
 				if (!uniqueCapped) {
-					uniqueSet.insert(v);
-					if (uniqueSet.size() > kUniqueCountCap) {
+					auto [it, inserted] = freqMap.emplace(v, 1);
+					if (inserted) {
+						++out.f1;
+					} else {
+						if (it->second == 1) {
+							--out.f1;
+							++out.f2;
+						} else if (it->second == 2) {
+							--out.f2;
+						}
+						++it->second;
+					}
+					if (freqMap.size() > kUniqueCountCap) {
 						uniqueCapped = true;
 					}
 				}
@@ -184,12 +227,12 @@ public:
 
 			// Frame tracking (always runs for i==0 too)
 			for (size_t c = 0; c < SegmentMetrics::kFrameCandidateCount; ++c) {
-				if (frameCount[c] == 0) {
-					frameFirst[c] = uv;
-				}
+				// if (frameCount[c] == 0) {
+				// 	frameFirst[c] = uv;
+				// }
 				frameMin[c] = std::min(frameMin[c], uv);
 				frameMax[c] = std::max(frameMax[c], uv);
-				frameXor[c] |= (uv ^ frameFirst[c]);
+				frameXor[c] = frameMax[c] ^ frameMin[c];
 				++frameCount[c];
 				if (frameCount[c] == kFrameCandidates[c]) {
 					finalizeFrame(c);
@@ -240,9 +283,30 @@ public:
 		out.variance = (n > 1) ? (m2 / static_cast<double>(n - 1)) : 0.0;
 		out.range = out.max - out.min;
 		out.avgRunLength = static_cast<double>(n) / static_cast<double>(out.runCount);
-		out.uniqueCount = uniqueCapped ? (kUniqueCountCap + 1) : uniqueSet.size();
+		out.uniqueCount = uniqueCapped ? (kUniqueCountCap + 1) : freqMap.size();
 		out.uniqueCountCapped = uniqueCapped;
 		out.bitWidth = static_cast<uint8_t>(std::bit_width(out.max));
+
+		if (!uniqueCapped && !freqMap.empty()) {
+			double entropy = 0.0;
+			const double total = static_cast<double>(n);
+			for (const auto& [key, count] : freqMap) {
+				(void)key;
+				const double p = static_cast<double>(count) / total;
+				if (p > 0.0) {
+					entropy -= p * std::log2(p);
+				}
+			}
+			out.entropyEstimate = entropy;
+		} else {
+			if (uniqueCapped) {
+				// If we had to cap uniques, we can provide a lower bound on entropy based on the number of uniques seen.
+				const double p = static_cast<double>(kUniqueCountCap) / static_cast<double>(n);
+				out.entropyEstimate = -p * std::log2(p) - (1.0 - p) * std::log2(1.0 - p);
+			} else {
+				out.entropyEstimate = 0.0;
+			}
+		}
 
 		if (windowCount > 0) {
 			out.minDelta1024Window = std::min(out.minDelta1024Window, windowMinDelta);

@@ -17,7 +17,9 @@ using encodings::encoders::selectors::costs::DictionaryCostModel;
 using encodings::encoders::selectors::costs::RLECostModel;
 using encodings::encoders::selectors::costs::AdaptiveFORCostModel;
 
-static bool validatePlanCoversBits(const std::vector<SegmentPlan>& segments, std::string& error) {
+static bool validatePlanCoversBits(const std::vector<SegmentPlan>& segments,
+                                  int maxBit,
+                                  std::string& error) {
     if (segments.empty()) {
         error = "segments list is empty";
         return false;
@@ -26,8 +28,8 @@ static bool validatePlanCoversBits(const std::vector<SegmentPlan>& segments, std
         error = "first segment does not start at bit 0";
         return false;
     }
-    if (segments.back().bitEnd != 63) {
-        error = "last segment does not end at bit 63";
+    if (segments.back().bitEnd != maxBit) {
+        error = "last segment does not end at expected max bit";
         return false;
     }
 
@@ -43,8 +45,8 @@ static bool validatePlanCoversBits(const std::vector<SegmentPlan>& segments, std
         }
         expectedStart = seg.bitEnd + 1;
     }
-    if (expectedStart != 64) {
-        error = "segments do not cover all 64 bits";
+    if (expectedStart != maxBit + 1) {
+        error = "segments do not cover all bits";
         return false;
     }
     return true;
@@ -88,7 +90,7 @@ static void testSimpleSample() {
     }
     {
         std::string error;
-        if (!validatePlanCoversBits(result.segments, error)) {
+        if (!validatePlanCoversBits(result.segments, 63, error)) {
             std::cerr << "Selector test failed: " << error << ".\n";
             return;
         }
@@ -114,7 +116,7 @@ static void testSnowflakeSample() {
     }
     {
         std::string error;
-        if (!validatePlanCoversBits(snowflakeResult.segments, error)) {
+        if (!validatePlanCoversBits(snowflakeResult.segments, 63, error)) {
             std::cerr << "Snowflake selector test failed: " << error << ".\n";
             return;
         }
@@ -124,10 +126,38 @@ static void testSnowflakeSample() {
     std::cout << snowflakeResult.toString() << "\n";
 }
 
+static void testSimpleSample32() {
+    const auto encodings = createDefaultEncodings();
+    IDSubStreamEncodingSelector selector = createSelectorWithDefaultVerboseConfig();
+
+    std::vector<uint32_t> sample;
+    sample.reserve(2048);
+    for (uint32_t i = 0; i < 2048; ++i) {
+        sample.push_back((i % 5 == 0) ? 0U : (i * 13U));
+    }
+
+    const auto result = selector.select(sample, encodings);
+    if (!std::isfinite(result.total_cost)) {
+        std::cerr << "Selector 32-bit test failed: total_cost is not finite.\n";
+        return;
+    }
+    {
+        std::string error;
+        if (!validatePlanCoversBits(result.segments, 31, error)) {
+            std::cerr << "Selector 32-bit test failed: " << error << ".\n";
+            return;
+        }
+    }
+
+    std::cout << "Simple 32-bit sample test passed with " << result.segments.size() << " segments.\n";
+    std::cout << result.toString() << "\n";
+}
+
 int main() {
     try {
         testSimpleSample();
         testSnowflakeSample();
+        testSimpleSample32();
     } catch (const std::exception& ex) {
         std::cerr << "Test failed with exception: " << ex.what() << "\n";
         return 1;

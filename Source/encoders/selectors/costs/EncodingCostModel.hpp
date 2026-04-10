@@ -7,9 +7,15 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <iomanip>
+#include <iostream>
 #include <limits>
 
 namespace encodings::encoders::selectors::costs {
+
+#ifndef ENCODINGS_DEBUG_DICT_COST
+#define ENCODINGS_DEBUG_DICT_COST 0
+#endif
 
 using encodings::encoders::selectors::SegmentMetrics;
 
@@ -46,6 +52,106 @@ inline uint32_t clamp_dict_index_width(uint32_t width) {
 	// Allow non-power-of-two widths up to 32 bits to mirror DictionaryEncoder's default behavior.
 	if (width == 0) return 1;
 	return width <= 32 ? width : 32;
+}
+
+inline double hll_alpha(size_t m) {
+	if (m == 16) return 0.673;
+	if (m == 32) return 0.697;
+	if (m == 64) return 0.709;
+	return 0.7213 / (1.0 + 1.079 / static_cast<double>(m));
+}
+
+inline double estimate_hll_cardinality(const SegmentMetrics::HyperLogLog& hll) {
+	const size_t m = hll.registers.size();
+	if (m == 0) return 0.0;
+	double sum = 0.0;
+	size_t zeros = 0;
+	for (uint8_t r : hll.registers) {
+		if (r == 0) ++zeros;
+		sum += std::ldexp(1.0, -static_cast<int>(r));
+	}
+	const double alpha = hll_alpha(m);
+	double estimate = alpha * static_cast<double>(m) * static_cast<double>(m) / sum;
+	if (estimate <= 2.5 * static_cast<double>(m) && zeros > 0) {
+		estimate = static_cast<double>(m) * std::log(static_cast<double>(m) / static_cast<double>(zeros));
+	}
+	return estimate;
+}
+
+inline double estimate_chao1(size_t observed, size_t f1, size_t f2) {
+	const double s = static_cast<double>(observed);
+	const double f1d = static_cast<double>(f1);
+	const double f2d = static_cast<double>(f2);
+	if (f1 == 0) return s;
+	if (f2 > 0) {
+		return s + (f1d * f1d) / (2.0 * f2d);
+	}
+	return s + (f1d * (f1d - 1.0)) / 2.0;
+}
+
+inline void log_dictionary_cost(
+	size_t numValues,
+	size_t bitWidth,
+	const SegmentMetrics& metrics,
+	double observedUniques,
+	double hllEstimate,
+	double chao1Estimate,
+	double blended,
+	double estimatedUniques,
+	uint32_t indexWidth,
+	double entropyBits,
+	double f1Ratio,
+	double confidence,
+	double dictBits,
+	double indexBits,
+	double headerBits,
+	double rawBits,
+	double dictPenalty,
+	double finalCost) {
+#if ENCODINGS_DEBUG_DICT_COST
+	std::cout << std::fixed << std::setprecision(2)
+		<< "[DictCost] n=" << numValues
+		<< " bw=" << bitWidth
+		<< " uniques(obs/hll/chao/blend/est)=" << observedUniques
+		<< "/" << hllEstimate
+		<< "/" << chao1Estimate
+		<< "/" << blended
+		<< "/" << estimatedUniques
+		<< " f1=" << metrics.f1
+		<< " f2=" << metrics.f2
+		<< " f1r=" << f1Ratio
+		<< " conf=" << confidence
+		<< " capped=" << (metrics.uniqueCountCapped ? 1 : 0)
+		<< " entropy=" << entropyBits
+		<< " idxW=" << indexWidth
+		<< " dictBits=" << dictBits
+		<< " idxBits=" << indexBits
+		<< " hdr=" << headerBits
+		<< " raw=" << rawBits
+		<< " penalty=" << dictPenalty
+		<< " cost=" << finalCost
+		<< std::endl;
+#else
+	(void)numValues;
+	(void)bitWidth;
+	(void)metrics;
+	(void)observedUniques;
+	(void)hllEstimate;
+	(void)chao1Estimate;
+	(void)blended;
+	(void)estimatedUniques;
+	(void)indexWidth;
+	(void)entropyBits;
+	(void)entropyBits;
+	(void)f1Ratio;
+	(void)confidence;
+	(void)dictBits;
+	(void)indexBits;
+	(void)headerBits;
+	(void)rawBits;
+	(void)dictPenalty;
+	(void)finalCost;
+#endif
 }
 } // namespace detail
 
@@ -98,29 +204,77 @@ public:
 		if (metrics.uniqueCount == 0 || numValues == 0) {
 			return 0.0;
 		}
-		if (metrics.uniqueCountCapped) {
-			return std::numeric_limits<double>::infinity();
-		}
 
-		const uint64_t uniques = static_cast<uint64_t>(metrics.uniqueCount);
-		const uint32_t rawWidth = detail::ceil_log2_u64(uniques);
-		const uint32_t indexWidth = detail::clamp_dict_index_width(rawWidth);
-		const uint8_t valueStorageBits = storageWidthBits(static_cast<uint8_t>(bitWidth));
-		const double dictBits = static_cast<double>(uniques) * static_cast<double>(valueStorageBits);
-		// Bit-packed keys rounded up to whole bytes
-		const double indexBits = static_cast<double>((numValues * static_cast<size_t>(indexWidth) + 7) / 8 * 8);
+			const double observedUniques = static_cast<double>(metrics.uniqueCount);
+			const double hllEstimate = detail::estimate_hll_cardinality(metrics.hll);
+			const double chao1Estimate = detail::estimate_chao1(metrics.uniqueCount, metrics.f1, metrics.f2);
+			const double f1Ratio = (metrics.uniqueCount > 0)
+				? static_cast<double>(metrics.f1) / static_cast<double>(metrics.uniqueCount)
+				: 0.0;
+
+			const double chaoWeight = (metrics.f2 < 5) ? 0.1 : 0.3;
+			double blended = (1.0 - chaoWeight) * hllEstimate + chaoWeight * chao1Estimate;
+			// blended = std::min(blended, observedUniques);
+
+			const double confidence = std::min(1.0, std::sqrt(static_cast<double>(numValues) / 10000.0));
+			double estimatedUniques = (1.0 - confidence) * observedUniques + confidence * blended;
+			estimatedUniques = std::max(estimatedUniques, observedUniques);
+			estimatedUniques = std::min(estimatedUniques, static_cast<double>(numValues));
+			estimatedUniques = std::min(
+				estimatedUniques,
+				static_cast<double>(MetricCollector<uint64_t>::kUniqueCountCap)
+			);
+
+			const uint64_t uniques = static_cast<uint64_t>(std::ceil(estimatedUniques));
+			const uint32_t rawWidth = detail::ceil_log2_u64(uniques);
+			const uint32_t indexWidth = detail::clamp_dict_index_width(rawWidth);
+			const double effectiveIndexWidth = std::min<double>(32.0, std::max(1.0, std::log2(std::max(estimatedUniques, 1.0))));
+			const uint8_t valueStorageBits = storageWidthBits(static_cast<uint8_t>(bitWidth));
+			const double dictBits = static_cast<double>(uniques) * static_cast<double>(valueStorageBits);
+			// Bit-packed keys rounded up to whole bytes
+			const double indexBitsWorst = static_cast<double>((numValues * static_cast<size_t>(indexWidth) + 7) / 8 * 8);
+			const double indexBitsEntropy = (metrics.entropyEstimate > 0.0)
+				? static_cast<double>(numValues) * metrics.entropyEstimate
+				: static_cast<double>(numValues) * effectiveIndexWidth;
+			double indexBits = std::min(indexBitsWorst, indexBitsEntropy);
+			indexBits = indexBitsWorst; // disable entropy-based index size for now since estimates can be unreliable and lead to bad choices
+			if (f1Ratio > 0.5) {
+				indexBits *= (1.0 + 0.35 * f1Ratio * confidence);
+			}
 		// dict size + key-bytes size + key-bit-width byte
 		const double headerBits = static_cast<double>(2 * sizeof(size_t) + 1) * 8.0;
+		const double rawBits = static_cast<double>(numValues) * static_cast<double>(valueStorageBits);
 
-		// If the index width is not narrower than the value storage width, dictionary cannot beat raw; bias toward raw.
+		double dictPenalty = 1.0;
 		if (indexWidth >= valueStorageBits) {
-			// Raw storage cost for this segment
-			const double rawBits = static_cast<double>(numValues) * static_cast<double>(valueStorageBits);
-			// Add header+dict overhead to ensure raw wins in this case.
-			return rawBits + headerBits + dictBits;
+			const double widthOver = static_cast<double>(indexWidth) / static_cast<double>(valueStorageBits);
+			dictPenalty = 1.0 + 0.15 * std::max(0.0, widthOver - 1.0);
 		}
 
-		return headerBits + dictBits + indexBits;
+		double dictCost = headerBits + dictPenalty * (dictBits + indexBits);
+
+		detail::log_dictionary_cost(
+			numValues,
+			bitWidth,
+			metrics,
+			observedUniques,
+			hllEstimate,
+			chao1Estimate,
+			blended,
+			estimatedUniques,
+			indexWidth,
+			metrics.entropyEstimate,
+			f1Ratio,
+			confidence,
+			dictBits,
+			indexBits,
+			headerBits,
+			rawBits,
+			dictPenalty,
+			dictCost
+		);
+
+		return dictCost;
 	}
 
 	encodings::EncodingType encodingType() const override {
@@ -131,15 +285,19 @@ public:
 class RLECostModel final : public EncodingCostModel {
 public:
 	double computeCost(const SegmentMetrics& metrics, size_t numValues, size_t bitWidth) const override {
-		if (numValues == 0) {
+		if (numValues == 0 || metrics.avgRunLength <= 0.0) {
 			return 0.0;
 		}
 
-		// Matches RunLengthEncoder layout: header (3 * sizeof(size_t)), runStarts (runCount * sizeof(size_t)), runValues (runCount * sizeof(T))
-		const uint64_t runCount = metrics.runCount;
+		// Extrapolate run count to the full stream using avgRunLength, which is a scale-invariant
+		// ratio and therefore accurate regardless of sample size or sampling strategy.
+		// Using raw metrics.runCount is wrong with strided sampling (runCount ≈ sampleSize there).
+		const double estimatedRunCount = static_cast<double>(numValues) / metrics.avgRunLength;
+
+		// Matches RunLengthEncoder layout: header (3 × sizeof(size_t)), runStarts, runValues.
 		const double headerBits = static_cast<double>(3 * sizeof(size_t)) * 8.0;
-		const double runStartsBits = static_cast<double>(runCount) * static_cast<double>(sizeof(size_t) * 8u);
-		const double runValuesBits = static_cast<double>(runCount) * static_cast<double>(storageWidthBits(static_cast<uint8_t>(bitWidth)));
+		const double runStartsBits = estimatedRunCount * static_cast<double>(sizeof(size_t) * 8u);
+		const double runValuesBits = estimatedRunCount * static_cast<double>(storageWidthBits(static_cast<uint8_t>(bitWidth)));
 
 		return headerBits + runStartsBits + runValuesBits;
 	}
@@ -192,9 +350,10 @@ public:
 
 			const double avgBits = metrics.frameAvgResidualBits[i];
 			const uint8_t spanBits = metrics.frameMaxResidualBits[i];
-			const uint8_t neededBits = avgBits > 0.0
+			uint8_t neededBits = avgBits > 0.0
 				? static_cast<uint8_t>(std::ceil(avgBits))
 				: (spanBits == 0 ? 1 : spanBits);
+			neededBits = (spanBits == 0) ? 1 : spanBits; // for cost estimation, use max-based width since avg can be unreliable and lead to bad choices
 
 			size_t packedBytes = std::numeric_limits<size_t>::max();
 			if (neededBits <= 32) {
@@ -239,6 +398,7 @@ public:
 			uint8_t suffixBits = avgSuffix > 0.0
 				? static_cast<uint8_t>(std::ceil(avgSuffix))
 				: (maxSuffix == 0 ? 0 : maxSuffix);
+			suffixBits = maxSuffix == 0 ? 0 : maxSuffix; // for cost estimation, use max-based width since avg can be unreliable and lead to bad choices
 			suffixBits = std::min<uint8_t>(suffixBits, cappedWidth);
 
 			const size_t payloadBytes = suffixBits == 0

@@ -74,8 +74,6 @@ public:
 		std::optional<std::string> costGridCsvPath{}; // optional: write per-encoding bits/elem grid
 	};
 
-	static constexpr int kBits = 64;
-
 	IDSubStreamEncodingSelector() = default;
 	explicit IDSubStreamEncodingSelector(const Config& config) : config_(config) {}
 
@@ -105,6 +103,7 @@ public:
 			encodingNames.push_back(encodings::encodingTypeToString(enc->encodingType()));
 		}
 
+		constexpr int kBits = static_cast<int>(sizeof(SampleT) * 8);
 		std::array<std::array<SegmentChoice, kBits>, kBits> bestCost{};
 		for (int l = 0; l < kBits; ++l) {
 			for (int r = 0; r < kBits; ++r) {
@@ -184,9 +183,9 @@ public:
 			if (config_.verboseLevel >= 1) {
 				std::cout << "[Selector] Running exhaustive search over split combinations" << std::endl;
 			}
-			result = runExhaustiveSearch(bestCost);
+			result = runExhaustiveSearch<kBits>(bestCost);
 		} else {
-			result = runDynamicProgramming(bestCost);
+			result = runDynamicProgramming<kBits>(bestCost);
 		}
 
 		// Emit optional cost grid CSV: columns = start,end,width,<encodings...>
@@ -313,6 +312,7 @@ private:
 	};
 
 	// Standard DP reconstruction helper
+	template <int kBits>
 	Result runDynamicProgramming(const std::array<std::array<SegmentChoice, kBits>, kBits>& bestCost) const {
 		std::array<double, kBits + 1> dp{};
 		std::array<int, kBits + 1> prev{};
@@ -391,6 +391,7 @@ private:
 		return result;
 	}
 
+	template <int kBits>
 	Result runExhaustiveSearch(const std::array<std::array<SegmentChoice, kBits>, kBits>& bestCost) const {
 		struct CacheEntry {
 			bool valid{false};
