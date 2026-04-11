@@ -14,6 +14,9 @@
 #include <algorithm>
 #include <cmath>
 #include <chrono>
+#ifdef __AVX2__
+#  include <immintrin.h>
+#endif
 
 #include "encodings/Encoder.hpp"
 #include "encodings/EncodedData.hpp"
@@ -151,10 +154,17 @@ public:
             }
         }
 
-        std::vector<T> out(h.N);
-        for (size_t i = 0; i < h.N; ++i) {
-            out[i] = static_cast<T>(combine(sections, h.bits, h.order, i));
+        // Column-major combine: for each section, OR-shift its values into the output
+        // buffer with a fixed shift. The inner loop is SIMD-friendly (constant shift,
+        // no per-element allocation, sequential memory access).
+        std::vector<SectionT> acc(h.N, SectionT{0});
+        for (size_t s = 0; s < splits; ++s) {
+            combineSectionInto(sections[s].data(), acc.data(), h.N, h.shifts[s]);
         }
+
+        // Bit-cast the unsigned accumulator to the signed output type (same width).
+        std::vector<T> out(h.N);
+        std::memcpy(out.data(), acc.data(), h.N * sizeof(T));
         return out;
     }
 
@@ -162,12 +172,13 @@ public:
         const auto& h = getCachedHeader(encoded);
         if (index >= h.N) return std::nullopt;
 
+        // Inline combine using precomputed shifts — no allocation.
+        SectionT v = 0;
         const size_t splits = h.bits.size();
-        std::vector<SectionT> parts(splits);
         for (size_t s = 0; s < splits; ++s) {
-            parts[s] = decodeOneSection(*cfg_.codecs[s], h.views[s], index);
+            v |= static_cast<SectionT>(decodeOneSection(*cfg_.codecs[s], h.views[s], index)) << h.shifts[s];
         }
-        return static_cast<T>(combine(parts, h.bits, h.order));
+        return static_cast<T>(v);
     }
 
     std::vector<T> decodeRange(const EncodedBuffer<uint8_t>& encoded, size_t start, size_t end) override {
@@ -186,13 +197,14 @@ public:
             }
         }
 
-        std::vector<T> out;
-        out.reserve(count);
-        for (size_t i = 0; i < count; ++i) {
-            std::vector<SectionT> parts(splits);
-            for (size_t s = 0; s < splits; ++s) parts[s] = sections[s][i];
-            out.push_back(static_cast<T>(combine(parts, h.bits, h.order)));
+        // Column-major combine, same as decodeAll.
+        std::vector<SectionT> acc(count, SectionT{0});
+        for (size_t s = 0; s < splits; ++s) {
+            combineSectionInto(sections[s].data(), acc.data(), count, h.shifts[s]);
         }
+
+        std::vector<T> out(count);
+        std::memcpy(out.data(), acc.data(), count * sizeof(T));
         return out;
     }
 
@@ -222,6 +234,7 @@ private:
         size_t N{};
         BitSplitOrder order{BitSplitOrder::LSB_TO_MSB};
         std::vector<uint8_t> bits;
+        std::vector<uint8_t> shifts;  // precomputed absolute bit-shift per section
         std::vector<uint64_t> bytes;
         std::vector<EncodedBuffer<uint8_t>> views;
     };
@@ -282,6 +295,22 @@ private:
         }
         if (totalBits != kTotalBits) {
             throw std::runtime_error("SubIntSplitEncoder: header bits do not sum to expected width");
+        }
+        // Precompute absolute shifts so combine() can be done with a single OR per section.
+        h.shifts.resize(splits);
+        if (h.order == BitSplitOrder::LSB_TO_MSB) {
+            uint8_t shift = 0;
+            for (size_t s = 0; s < splits; ++s) {
+                h.shifts[s] = shift;
+                shift = static_cast<uint8_t>(shift + h.bits[s]);
+            }
+        } else {
+            // MSB_TO_LSB: section s lands at (kTotalBits - cumsum(bits[0..s]))
+            uint8_t remaining = kTotalBits;
+            for (size_t s = 0; s < splits; ++s) {
+                remaining = static_cast<uint8_t>(remaining - h.bits[s]);
+                h.shifts[s] = remaining;
+            }
         }
         // Build section views
         h.views.reserve(splits);
@@ -354,39 +383,43 @@ private:
         return std::vector<SectionT>(all.begin() + static_cast<ptrdiff_t>(start), all.begin() + static_cast<ptrdiff_t>(end));
     }
 
-    static uint64_t combine(const std::vector<std::vector<SectionT>>& sections,
-                            const std::vector<uint8_t>& bits,
-                            BitSplitOrder order,
-                            size_t idx) {
-        std::vector<SectionT> parts(sections.size());
-        for (size_t s = 0; s < sections.size(); ++s) parts[s] = sections[s][idx];
-        return combine(parts, bits, order);
-    }
-
-    static uint64_t combine(const std::vector<SectionT>& parts, const std::vector<uint8_t>& bits, BitSplitOrder order) {
-        const size_t splits = parts.size();
-        if (splits != bits.size()) {
-            throw std::invalid_argument("SubIntSplitEncoder::combine: size mismatch");
-        }
-        uint64_t v = 0;
-        if (splits == 0) return v;
-        uint16_t sum = 0;
-        for (uint8_t b : bits) sum = static_cast<uint16_t>(sum + b);
-        if (sum != kTotalBits) throw std::invalid_argument("SubIntSplitEncoder::combine: bits do not sum to expected width");
-
-        if (order == BitSplitOrder::LSB_TO_MSB) {
-            uint8_t shift = 0;
-            for (size_t s = 0; s < splits; ++s) {
-                v |= (parts[s] << shift);
-                shift = static_cast<uint8_t>(shift + bits[s]);
+    // Column-major combine kernel: OR src[i] << shift into dst[i] for all i.
+    // shift is constant across all elements in a section — the loop is trivially
+    // SIMD-vectorizable. AVX2 path processes 4 (64-bit) or 8 (32-bit) elements
+    // per iteration without any per-element allocation.
+    static void combineSectionInto(const SectionT* __restrict__ src,
+                                   SectionT* __restrict__ dst,
+                                   size_t N, uint8_t shift) {
+#ifdef __AVX2__
+        if constexpr (sizeof(SectionT) == 8) {
+            // 64-bit sections: 4 elements per 256-bit register.
+            const __m128i vshift = _mm_cvtsi64_si128(static_cast<int64_t>(shift));
+            size_t i = 0;
+            for (; i + 4 <= N; i += 4) {
+                __m256i vs = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + i));
+                __m256i vd = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(dst + i));
+                vs = _mm256_sll_epi64(vs, vshift);
+                vd = _mm256_or_si256(vd, vs);
+                _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + i), vd);
             }
-        } else { // MSB_TO_LSB
-            for (size_t s = 0; s < splits; ++s) {
-                v <<= bits[s];
-                v |= parts[s];
+            for (; i < N; ++i) dst[i] |= src[i] << shift;
+        } else {
+            // 32-bit sections: 8 elements per 256-bit register.
+            const __m128i vshift = _mm_cvtsi32_si128(static_cast<int32_t>(shift));
+            size_t i = 0;
+            for (; i + 8 <= N; i += 8) {
+                __m256i vs = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + i));
+                __m256i vd = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(dst + i));
+                vs = _mm256_sll_epi32(vs, vshift);
+                vd = _mm256_or_si256(vd, vs);
+                _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + i), vd);
             }
+            for (; i < N; ++i) dst[i] |= src[i] << shift;
         }
-        return v;
+#else
+        // Scalar fallback — auto-vectorizer-friendly (constant shift, no aliasing).
+        for (size_t i = 0; i < N; ++i) dst[i] |= src[i] << shift;
+#endif
     }
 
     EncodedBuffer<uint8_t> makeEmpty() const {
