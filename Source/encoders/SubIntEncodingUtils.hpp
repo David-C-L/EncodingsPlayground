@@ -136,9 +136,16 @@ public:
 
     std::vector<SectionCodecTIn> decodeAll(const EncodedBuffer<uint8_t>& enc) override {
         auto vals = impl_->decodeAll(enc);
-        std::vector<SectionCodecTIn> widened;
-        widened.reserve(vals.size());
-        for (T v : vals) widened.push_back(static_cast<SectionCodecTIn>(v));
+        std::vector<SectionCodecTIn> widened(vals.size());
+        if constexpr (sizeof(T) == sizeof(SectionCodecTIn)) {
+            static_assert(std::is_trivially_copyable_v<T> && std::is_trivially_copyable_v<SectionCodecTIn>,
+                          "Types must be trivially copyable for memcpy optimization");
+            static_assert(std::is_integral_v<T> && std::is_integral_v<SectionCodecTIn>,
+                          "Types must be integral for memcpy optimization");
+            std::memcpy(widened.data(), vals.data(), vals.size() * sizeof(T));
+            return widened;
+        }
+        std::transform(vals.begin(), vals.end(), widened.begin(), [](T v) { return static_cast<SectionCodecTIn>(v); });
         return widened;
     }
 
@@ -150,9 +157,16 @@ public:
 
     std::vector<SectionCodecTIn> decodeRange(const EncodedBuffer<uint8_t>& enc, size_t start, size_t end) override {
         auto vals = impl_->decodeRange(enc, start, end);
-        std::vector<SectionCodecTIn> widened;
-        widened.reserve(vals.size());
-        for (T v : vals) widened.push_back(static_cast<SectionCodecTIn>(v));
+        std::vector<SectionCodecTIn> widened(vals.size());
+        if constexpr (sizeof(T) == sizeof(SectionCodecTIn)) {
+            static_assert(std::is_trivially_copyable_v<T> && std::is_trivially_copyable_v<SectionCodecTIn>,
+                          "Types must be trivially copyable for memcpy optimization");
+            static_assert(std::is_integral_v<T> && std::is_integral_v<SectionCodecTIn>,
+                          "Types must be integral for memcpy optimization");
+            std::memcpy(widened.data(), vals.data(), vals.size() * sizeof(T));
+            return widened;
+        }
+        std::transform(vals.begin(), vals.end(), widened.begin(), [](T v) { return static_cast<SectionCodecTIn>(v); });
         return widened;
     }
 
