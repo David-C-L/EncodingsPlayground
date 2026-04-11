@@ -103,6 +103,16 @@ set_target_properties(run_benchmarks sweep_subint_samples map_benchmarks map_ben
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 
+# Enable native ISA (AVX2/AVX-512 etc.) and full optimisation for all benchmark targets.
+# These are research binaries always run on the build machine, so -march=native is appropriate.
+if(NOT MSVC)
+    target_compile_options(run_benchmarks         PRIVATE -march=native -O3)
+    target_compile_options(sweep_subint_samples   PRIVATE -march=native -O3)
+    target_compile_options(map_benchmarks         PRIVATE -march=native -O3)
+    target_compile_options(map_benchmarks_refactored PRIVATE -march=native -O3)
+    target_compile_options(vector_benchmarks      PRIVATE -march=native -O3)
+endif()
+
 # Add as tests (optional)
 if(BUILD_TESTS)
     add_test(NAME BenchmarkSuite COMMAND run_benchmarks)
