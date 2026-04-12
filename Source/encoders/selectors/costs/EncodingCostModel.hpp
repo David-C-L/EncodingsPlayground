@@ -61,22 +61,17 @@ inline double hll_alpha(size_t m) {
 	return 0.7213 / (1.0 + 1.079 / static_cast<double>(m));
 }
 
-inline double estimate_hll_cardinality(const SegmentMetrics::HyperLogLog& hll) {
-	const size_t m = hll.registers.size();
-	if (m == 0) return 0.0;
-	double sum = 0.0;
-	size_t zeros = 0;
-	for (uint8_t r : hll.registers) {
-		if (r == 0) ++zeros;
-		sum += std::ldexp(1.0, -static_cast<int>(r));
-	}
-	const double alpha = hll_alpha(m);
-	double estimate = alpha * static_cast<double>(m) * static_cast<double>(m) / sum;
-	if (estimate <= 2.5 * static_cast<double>(m) && zeros > 0) {
-		estimate = static_cast<double>(m) * std::log(static_cast<double>(m) / static_cast<double>(zeros));
-	}
-	return estimate;
-}
+// Precomputed 2^(-r) table for r in [0, 64]. Replaces std::ldexp(1.0, -r) in the HLL
+// harmonic-mean sum — avoids a libm call per register on the hot path.
+// The maximum rank stored in a register is 64 - p + 1 where p is the HLL precision,
+// so index 64 is the safe upper bound for any precision ≥ 1.
+inline constexpr std::array<double, 65> kPow2Neg = []() constexpr {
+	std::array<double, 65> t{};
+	t[0] = 1.0;
+	for (int i = 1; i < 65; ++i) t[i] = t[i - 1] * 0.5;
+	return t;
+}();
+
 
 inline double estimate_chao1(size_t observed, size_t f1, size_t f2) {
 	const double s = static_cast<double>(observed);
@@ -180,8 +175,8 @@ public:
 		static constexpr double kHeaderBits = static_cast<double>(5 * sizeof(uint64_t)) * 8.0;
 
 		const size_t blocks = (numValues + kBlockSize - 1) / kBlockSize;
-		// Use the precomputed span-based residual width for the 1024-frame candidate (index 6 in MetricCollector).
-		constexpr size_t kFrameIdx = 6; // kFrameCandidates[6] == 1024
+		// 1024-element frame is at index 2 in kResidualFrameCandidates = {256,512,1024,2048,4096}.
+		constexpr size_t kFrameIdx = 2; // kResidualFrameCandidates[2] == 1024
 		const uint8_t spanBits = metrics.frameMaxResidualBits[kFrameIdx];
 		// Reference values stored at rounded storage width per block (one ref per frame)
 		const size_t refWidthBytes = static_cast<size_t>(storageWidthBits(static_cast<uint8_t>(bitWidth))) / 8;
@@ -206,7 +201,9 @@ public:
 		}
 
 			const double observedUniques = static_cast<double>(metrics.uniqueCount);
-			const double hllEstimate = detail::estimate_hll_cardinality(metrics.hll);
+			// Use the cardinality estimate precomputed in MetricCollector::compute() — avoids
+			// re-running the 1024-iteration harmonic-mean sum in every cost model call.
+			const double hllEstimate = metrics.hllEstimatedCardinality;
 			const double chao1Estimate = detail::estimate_chao1(metrics.uniqueCount, metrics.f1, metrics.f2);
 			const double f1Ratio = (metrics.uniqueCount > 0)
 				? static_cast<double>(metrics.f1) / static_cast<double>(metrics.uniqueCount)
@@ -343,8 +340,8 @@ public:
 		const size_t refWidthBytes = static_cast<size_t>(storageWidthBits(static_cast<uint8_t>(bitWidth))) / 8;
 
 		size_t bestBytes = std::numeric_limits<size_t>::max();
-		for (size_t i = 0; i < SegmentMetrics::kFrameCandidateCount; ++i) {
-			const size_t frame = MetricCollector<uint64_t>::kFrameCandidates[i];
+		for (size_t i = 0; i < SegmentMetrics::kResidualFrameCandidateCount; ++i) {
+			const size_t frame = MetricCollector<uint64_t>::kResidualFrameCandidates[i];
 			const size_t numFrames = (numValues + frame - 1) / frame;
 			const size_t refBytes = numFrames * refWidthBytes;
 
@@ -388,9 +385,8 @@ public:
 
 		size_t bestBytes = std::numeric_limits<size_t>::max();
 		const uint8_t cappedWidth = static_cast<uint8_t>(std::min<size_t>(bitWidth, 64));
-		// Only consider the frame sizes the encoder supports: 8,16,32,64,128 (indices 0-4)
-		for (size_t i = 0; i < 5 && i < SegmentMetrics::kFrameCandidateCount; ++i) {
-			const size_t frame = MetricCollector<uint64_t>::kFrameCandidates[i];
+		for (size_t i = 0; i < SegmentMetrics::kBitPrefixFrameCandidateCount; ++i) {
+			const size_t frame = MetricCollector<uint64_t>::kBitPrefixFrameCandidates[i];
 			const size_t numFrames = (numValues + frame - 1) / frame;
 
 			const double avgSuffix = metrics.frameAvgSuffixBits[i];
