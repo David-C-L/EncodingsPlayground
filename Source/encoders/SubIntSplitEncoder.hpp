@@ -57,20 +57,22 @@ public:
         }
 
         const size_t splits = cfg_.splitCount();
-        std::vector<std::vector<SectionT>> sections(splits);
-        for (auto& sec : sections) sec.resize(N);
+
+        // Flat, column-major section buffer: section s occupies [s*N, (s+1)*N).
+        // make_unique_for_overwrite skips the zero-initialisation that vector::resize()
+        // would perform — the fill loop below writes every element before it is read.
+        auto sectionsRaw = std::make_unique_for_overwrite<SectionT[]>(splits * N);
 
         // Split values into sections according to order
         if (cfg_.order == BitSplitOrder::LSB_TO_MSB) {
             for (size_t i = 0; i < N; ++i) {
-                uint64_t v = static_cast<uint64_t>(static_cast<std::make_unsigned_t<T>>(data[i]));
-                uint64_t shifted = v;
+                uint64_t shifted = static_cast<uint64_t>(static_cast<std::make_unsigned_t<T>>(data[i]));
                 for (size_t s = 0; s < splits; ++s) {
                     const uint8_t bits = cfg_.bits[s];
                     const uint64_t mask = (bits == 64)
                         ? ~uint64_t{0}
                         : ((uint64_t{1} << bits) - 1);
-                    sections[s][i] = static_cast<SectionT>(shifted & mask);
+                    sectionsRaw[s * N + i] = static_cast<SectionT>(shifted & mask);
                     if (bits < kTotalBits) shifted >>= bits;
                 }
             }
@@ -84,7 +86,7 @@ public:
                     throw std::invalid_argument("SubIntSplitEncoder: bits exceed width when splitting");
                 }
                 remaining = static_cast<uint8_t>(remaining - bits);
-                shiftStart[s] = remaining; // shift to align MSB block
+                shiftStart[s] = remaining;
             }
             for (size_t i = 0; i < N; ++i) {
                 uint64_t v = static_cast<uint64_t>(static_cast<std::make_unsigned_t<T>>(data[i]));
@@ -93,7 +95,7 @@ public:
                     const uint64_t mask = (bits == 64)
                         ? ~uint64_t{0}
                         : ((uint64_t{1} << bits) - 1);
-                    sections[s][i] = static_cast<SectionT>((v >> shiftStart[s]) & mask);
+                    sectionsRaw[s * N + i] = static_cast<SectionT>((v >> shiftStart[s]) & mask);
                 }
             }
         }
@@ -105,16 +107,18 @@ public:
         sectionSizes.reserve(splits);
 
         for (size_t s = 0; s < splits; ++s) {
-            auto enc = cfg_.codecs[s]->encode(std::span<const SectionT>(sections[s].data(), sections[s].size()));
+            auto enc = cfg_.codecs[s]->encode(std::span<const SectionT>(&sectionsRaw[s * N], N));
             sectionSizes.push_back(enc.data().size());
             encodedSections.push_back(std::move(enc));
         }
 
-        // Build header: [N:8][splitCount:1][order:1][bits_i:1][bytes_i:8]*splitCount
+        // Build output in a single pre-sized allocation: header + all payloads.
+        // Avoids the repeated reallocations from vector::insert that _M_range_insert caused.
         const size_t headerSize = 8 + 1 + 1 + splits * (1 + 8);
-        std::vector<uint8_t> out;
-        out.resize(headerSize);
+        size_t totalPayload = 0;
+        for (const auto& enc : encodedSections) totalPayload += enc.data().size();
 
+        std::vector<uint8_t> out(headerSize + totalPayload);
         uint8_t* p = out.data();
         writeU64(p, static_cast<uint64_t>(N)); p += 8;
         *p++ = static_cast<uint8_t>(splits);
@@ -124,10 +128,11 @@ public:
             writeU64(p, sectionSizes[s]);
             p += 8;
         }
-
-        // Append payloads
+        // p is now at headerSize offset — copy section payloads contiguously
         for (const auto& enc : encodedSections) {
-            out.insert(out.end(), enc.data().begin(), enc.data().end());
+            const size_t sz = enc.data().size();
+            std::memcpy(p, enc.data().data(), sz);
+            p += sz;
         }
 
         encodings::EncodingMetadata meta;
