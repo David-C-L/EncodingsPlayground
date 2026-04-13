@@ -111,26 +111,23 @@ public:
         if (bits_ > MAX_BITS) {
             throw std::invalid_argument("TypedSectionCodecAdapter: bits exceed underlying type width: " + std::to_string(MAX_BITS));
         }
+        mask_ = bits_ == MAX_BITS_SECTION_CODEC
+            ? static_cast<SectionCodecTIn>(std::numeric_limits<SectionCodecTIn>::max())
+            : ((SectionCodecTIn{1} << bits_) - 1);
     }
 
     EncodedBuffer<uint8_t> encode(std::span<const SectionCodecTIn> data) override {
-        std::vector<T> narrowed;
-        narrowed.reserve(data.size());
-        const uint64_t mask = bits_ == MAX_BITS_SECTION_CODEC
-            ? static_cast<uint64_t>(std::numeric_limits<SectionCodecTIn>::max())
-            : ((uint64_t{1} << bits_) - 1);
-        for (SectionCodecTIn v : data) {
-            if ((v & ~mask) != 0) {
-                throw std::overflow_error("Section value does not fit in configured bit width");
-            }
-            if constexpr (std::is_signed_v<T>) {
-                constexpr uint64_t signedMax = static_cast<uint64_t>(std::numeric_limits<T>::max());
-                if (v > signedMax) {
-                    throw std::overflow_error("Section value exceeds signed range for underlying type");
-                }
-            }
-            narrowed.push_back(static_cast<T>(v));
+        // Validate input branch-free
+        if (std::any_of(data.begin(), data.end(), [this](SectionCodecTIn v) {
+            return (v & ~mask_) != 0; })) [[unlikely]] {
+            throw std::overflow_error("Section value does not fit in configured bit width");
         }
+
+        // Narrow input branch-free
+        std::vector<T> narrowed(data.size());
+        std::transform(data.begin(), data.end(), narrowed.begin(), [](SectionCodecTIn v) {
+            return static_cast<T>(v);
+        });
         return impl_->encode(std::span<const T>(narrowed.data(), narrowed.size()));
     }
 
@@ -176,6 +173,7 @@ public:
 private:
     std::shared_ptr<Codec<T, uint8_t>> impl_;
     uint8_t bits_{};
+    SectionCodecTIn mask_{};
 };
 
 // Helper to choose underlying unsigned type based on bit width
