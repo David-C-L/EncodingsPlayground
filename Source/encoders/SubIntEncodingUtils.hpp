@@ -22,6 +22,7 @@
 #include "encoders/AdaptiveFOREncoder.hpp"
 #include "encoders/AdaptiveFramedBitPrefixEncoder.hpp"
 #include "encoders/RunLengthEncoder.hpp"
+#include "encoders/HuffmanEncoder.hpp"
 #include "encoders/FOREncoder.hpp"
 #include "encoders/BitSplitOrder.hpp"
 #include "encoders/selectors/IDSubStreamEncodingSelector.hpp"
@@ -311,6 +312,19 @@ inline std::shared_ptr<ISectionCodecIntegral<SectionCodecTIn>> makeAdaptiveFrame
     return makeSectionCodecForBits<SectionCodecTIn>(std::make_shared<AdaptiveFramedBitPrefixEncoder<int64_t>>(), bits);
 }
 
+template <typename SectionCodecTIn = uint64_t>
+inline std::shared_ptr<ISectionCodecIntegral<SectionCodecTIn>> makeHuffmanSection(uint8_t bits) {
+    // HuffmanEncoder is sequential-only (no random access); instantiated at the
+    // storage type matching chooseTypeBits() / storageWidthBits() so cost estimates are accurate.
+    const uint8_t w = chooseTypeBits(bits);
+    switch (w) {
+        case 8:  return makeSectionCodecForBits<SectionCodecTIn>(std::make_shared<HuffmanEncoder<uint8_t>>(),  bits);
+        case 16: return makeSectionCodecForBits<SectionCodecTIn>(std::make_shared<HuffmanEncoder<uint16_t>>(), bits);
+        case 32: return makeSectionCodecForBits<SectionCodecTIn>(std::make_shared<HuffmanEncoder<uint32_t>>(), bits);
+        default: return makeSectionCodecForBits<SectionCodecTIn>(std::make_shared<HuffmanEncoder<uint64_t>>(), bits);
+    }
+}
+
 template <size_t FrameSize = 512, typename SectionCodecTIn = uint64_t>
 inline std::shared_ptr<ISectionCodecIntegral<SectionCodecTIn>> makeFORSection(uint8_t bits,
                                                 FORReferencePolicy policy = FORReferencePolicy::MIN) {
@@ -450,6 +464,9 @@ inline SubIntSplitConfigIntegral<TIn> SubIntSplitConfigIntegral<TIn>::fromSegmen
                 break;
             case encodings::EncodingType::RunLengthEncoding:
                 cfg.codecs.push_back(detail_trisplit::makeRLESection<TIn>(width));
+                break;
+            case encodings::EncodingType::HuffmanEncoding:
+                cfg.codecs.push_back(detail_trisplit::makeHuffmanSection<TIn>(width));
                 break;
             default:
                 throw std::invalid_argument("SubIntSplitConfigIntegral::fromSegments: unsupported encoding type for section");

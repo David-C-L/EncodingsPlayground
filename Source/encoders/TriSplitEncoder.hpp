@@ -538,6 +538,19 @@ inline std::shared_ptr<TriSplitEncoder64> makeSnowflakeTriSplitAllRawBitPacked(
     return makeTriSplitEncoder64(std::move(cfg));
 }
 
+inline std::shared_ptr<TriSplitEncoder64> makeSnowflakeTriSplitAllHuffman(
+    BitSplitOrder order = BitSplitOrder::MSB_TO_LSB,
+    detail_trisplit::SnowflakeVariant variant = detail_trisplit::SnowflakeVariant::Snowflake) {
+    const auto [bitsA, bitsB, bitsC] = detail_trisplit::getSnowflakeLayoutBits(variant);
+    auto cfg = detail_trisplit::makeSnowflakeConfig(
+        detail_trisplit::makeHuffmanSection(bitsA),
+        detail_trisplit::makeHuffmanSection(bitsB),
+        detail_trisplit::makeHuffmanSection(bitsC),
+        order,
+        variant);
+    return makeTriSplitEncoder64(std::move(cfg));
+}
+
 template <size_t BlockSize = 0>
 inline std::shared_ptr<TriSplitEncoder64> makeSnowflakeTriSplitOpenZLOnly(
     BitSplitOrder order = BitSplitOrder::MSB_TO_LSB,
