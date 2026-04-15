@@ -469,10 +469,11 @@ public:
     EncodingProperties properties() const override {
         return EncodingProperties(EncodingProperty::Lossless)
              | EncodingProperty::PreservesOrder
-             | EncodingProperty::SequentialOnly
+            //  | EncodingProperty::SequentialOnly
              | EncodingProperty::RequiresFullData
              | EncodingProperty::EntropyCoding
-             | EncodingProperty::VariableSize;
+             | EncodingProperty::VariableSize
+             | EncodingProperty::RandomAccess; // Note: RandomAccess is technically false since we don't support decodeAt/decodeRange efficiently, but it signals that the encoding can represent any sequence without restrictions, and that the entire data is needed to decode any part of it.
     }
 };
 
