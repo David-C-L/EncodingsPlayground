@@ -648,9 +648,29 @@ def plot_throughput_summary(results, output_dir, colours, source_label, group_en
 
 
 def plot_compression_vs_random_access(results, output_dir, colours, source_label, group_encoders=False):
-    """Scatter of compression ratio vs random access time, with Pareto frontier."""
+    """Scatter of compression ratio vs random access time, with Pareto frontier.
+
+    Axes orientation
+    ----------------
+    X : compression ratio (higher = better → right)
+    Y : avg random access time — axis is **inverted** so that lower (faster)
+        values appear at the **top**.  The ideal encoder therefore sits in the
+        top-right corner.  The global Pareto frontier and the per-group
+        frontiers all curve toward that corner.
+    """
     datasets = sorted(set(r['datasetName'] for r in results['results']))
     encoders = _sorted_encoders(results, group_encoders=group_encoders)
+
+    # Helper: compute the Pareto frontier for a list of (compression_x, ra)
+    # pairs.  "Better" = higher compression_x AND lower ra.
+    # Sort by compression descending; greedily keep points where ra strictly
+    # decreases → each successive point is faster for the same or worse compression.
+    def _pareto(pts):
+        frontier = []
+        for cx, ra in sorted(pts, key=lambda t: t[0], reverse=True):
+            if not frontier or ra < frontier[-1][1]:
+                frontier.append((cx, ra))
+        return frontier
 
     for dataset in datasets:
         size = _pick_size_for_dataset(results, dataset)
@@ -673,31 +693,49 @@ def plot_compression_vs_random_access(results, output_dir, colours, source_label
         _annotate_source(fig, source_label)
 
         for enc, ratio, ra in points:
-            ax.scatter(ratio, ra, color=colours.get(enc, 'tab:blue'), s=40)
+            ax.scatter(ratio, ra, color=colours.get(enc, 'tab:blue'), s=40, zorder=3)
 
-        # Label points with staggered offsets then drop overlapping labels
+        # ── Global Pareto frontier ─────────────────────────────────────────
+        global_frontier = _pareto([(cx, ra) for _, cx, ra in points])
+        pareto_handle = None
+        if len(global_frontier) >= 2:
+            line = ax.plot([p[0] for p in global_frontier],
+                           [p[1] for p in global_frontier],
+                           color='black', linestyle='--', linewidth=1.4,
+                           zorder=4, label='Pareto frontier (global)')
+            pareto_handle = line[0]
+
+        # ── Per-group Pareto frontiers ─────────────────────────────────────
+        group_frontier_handles = []
+        group_rules = _default_group_rules()
+        groups = _group_encoders([p[0] for p in points], group_rules)
+        for group_name, group_encs in groups:
+            group_pts = [(cx, ra) for enc, cx, ra in points if enc in group_encs]
+            if len(group_pts) < 2:
+                continue
+            gf = _pareto(group_pts)
+            if len(gf) < 2:
+                continue
+            # Representative colour: use the first encoder in the group.
+            rep_color = colours.get(group_encs[0], 'grey')
+            ax.plot([p[0] for p in gf], [p[1] for p in gf],
+                    color=rep_color, linestyle=':', linewidth=1.0,
+                    alpha=0.55, zorder=2)
+            group_frontier_handles.append(
+                mlines.Line2D([0], [0], color=rep_color, linestyle=':',
+                              linewidth=1.0, alpha=0.55, label=group_name))
+
+        # ── Point labels (staggered, overlaps culled) ──────────────────────
         offsets = [(6, 4), (6, -6), (-6, 4), (-6, -6), (10, 0), (-10, 0), (0, 8), (0, -8)]
-
-        # Pareto frontier (higher compression_x and lower access time is better)
-        frontier = []
-        for _, compression_x, ra in sorted(points, key=lambda t: t[1], reverse=True):
-            if not frontier or ra < frontier[-1][1]:
-                frontier.append((compression_x, ra))
-
         texts = []
         for idx, (enc, ratio, ra) in enumerate(points):
             dx, dy = offsets[idx % len(offsets)]
-            txt = ax.annotate(enc, (ratio, ra), textcoords="offset points", xytext=(dx, dy), fontsize=7,
-                              bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="none", alpha=0.7))
+            txt = ax.annotate(enc, (ratio, ra), textcoords="offset points",
+                              xytext=(dx, dy), fontsize=7,
+                              bbox=dict(boxstyle="round,pad=0.2", fc="white",
+                                        ec="none", alpha=0.7))
             texts.append(txt)
 
-        pareto_handle = None
-        if len(frontier) >= 2:
-            line = ax.plot([p[0] for p in frontier], [p[1] for p in frontier],
-                           color='black', linestyle='--', linewidth=1, label='Pareto frontier')
-            pareto_handle = line[0]
-
-        # Remove overlapping labels after layout is known
         fig.canvas.draw()
         renderer_fn = getattr(fig.canvas, "get_renderer", None)
         renderer = renderer_fn() if callable(renderer_fn) else None
@@ -710,33 +748,51 @@ def plot_compression_vs_random_access(results, output_dir, colours, source_label
                 else:
                     placed_bboxes.append(bbox)
 
-        # Group color legend when grouping is enabled
-        group_handles = []
-        group_labels = []
+        # ── Legends ────────────────────────────────────────────────────────
+        # Group scatter-dot legend (when --group-encoders is active)
+        group_dot_handles = []
+        group_dot_labels = []
         if group_encoders:
-            group_rules = _default_group_rules()
-            groups = _group_encoders([p[0] for p in points], group_rules)
             for group_name, encs in groups:
                 if not encs:
                     continue
                 color = colours.get(encs[0], 'tab:blue')
-                group_handles.append(mlines.Line2D([0], [0], marker='o', color='w', markerfacecolor=color, markersize=6))
-                group_labels.append(group_name)
+                group_dot_handles.append(
+                    mlines.Line2D([0], [0], marker='o', color='w',
+                                  markerfacecolor=color, markersize=6))
+                group_dot_labels.append(group_name)
 
-        # Place legends at the top, below title, above plot area
         legend_y = 0.94
-        if group_handles:
-            fig.legend(group_handles, group_labels, fontsize=7, loc='upper center',
-                       bbox_to_anchor=(0.5, legend_y), ncol=min(len(group_handles), 4), title='Encoder groups')
+        if group_dot_handles:
+            fig.legend(group_dot_handles, group_dot_labels, fontsize=7,
+                       loc='upper center', bbox_to_anchor=(0.5, legend_y),
+                       ncol=min(len(group_dot_handles), 4),
+                       title='Encoder groups')
             legend_y -= 0.05
-        if pareto_handle is not None:
-            fig.legend([pareto_handle], ['Pareto frontier'], fontsize=7, loc='upper right',
-                       bbox_to_anchor=(0.97, legend_y), ncol=1)
 
-        ax.set_xlabel('Compression (× smaller than raw, higher = better)')
-        ax.set_ylabel('Avg random access time (ns, lower = better)')
+        # Combine global frontier + per-group frontier entries
+        frontier_handles = []
+        frontier_labels  = []
+        if pareto_handle is not None:
+            frontier_handles.append(pareto_handle)
+            frontier_labels.append('Global Pareto frontier')
+        if group_frontier_handles:
+            frontier_handles += group_frontier_handles
+            frontier_labels  += [h.get_label() for h in group_frontier_handles]
+        if frontier_handles:
+            fig.legend(frontier_handles, frontier_labels, fontsize=7,
+                       loc='lower left', bbox_to_anchor=(0.08, 0.08),
+                       title='Pareto frontiers', title_fontsize=7,
+                       framealpha=0.85)
+
+        # ── Axes ───────────────────────────────────────────────────────────
+        ax.set_xlabel('Compression (× smaller than raw, higher = better →)')
+        ax.set_ylabel('Avg random access time (ns) — faster at top ↑')
         ax.set_xscale('linear')
         ax.set_yscale('log')
+        # Invert y-axis: low (fast) access time floats to the top so the
+        # ideal top-right corner = high compression AND fast access.
+        ax.invert_yaxis()
         ax.grid(True, alpha=0.3)
 
         plt.tight_layout(rect=[0, 0, 1, 0.88])
