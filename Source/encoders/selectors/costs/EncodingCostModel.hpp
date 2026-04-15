@@ -28,6 +28,9 @@ inline constexpr uint8_t storageWidthBits(uint8_t bitWidth) {
 	return 64;
 }
 
+using encodings::encoders::selectors::MetricFlag;
+using encodings::encoders::selectors::MetricFlags;
+
 class EncodingCostModel {
 public:
 	EncodingCostModel() = default;
@@ -38,6 +41,10 @@ public:
 
     virtual encodings::EncodingType encodingType() const = 0;
 
+	// Declare which SegmentMetrics fields this model reads.
+	// IDSubStreamEncodingSelector unions these across all registered models and
+	// passes the result to MetricCollector::compute() to skip unused work.
+	virtual MetricFlags requiredMetrics() const = 0;
 };
 
 namespace detail {
@@ -160,6 +167,10 @@ public:
 	encodings::EncodingType encodingType() const override {
 		return encodings::EncodingType::RawEncoding;
 	}
+
+	MetricFlags requiredMetrics() const override {
+		return static_cast<MetricFlags>(MetricFlag::None);
+	}
 };
 
 class FORCostModel final : public EncodingCostModel {
@@ -190,6 +201,10 @@ public:
 
 	encodings::EncodingType encodingType() const override {
 		return encodings::EncodingType::FrameOfReference;
+	}
+
+	MetricFlags requiredMetrics() const override {
+		return static_cast<MetricFlags>(MetricFlag::ResidualFrames);
 	}
 };
 
@@ -277,6 +292,10 @@ public:
 	encodings::EncodingType encodingType() const override {
 		return encodings::EncodingType::DictionaryEncoding;
 	}
+
+	MetricFlags requiredMetrics() const override {
+		return static_cast<MetricFlags>(MetricFlag::FreqStats);
+	}
 };
 
 class RLECostModel final : public EncodingCostModel {
@@ -302,6 +321,10 @@ public:
 	encodings::EncodingType encodingType() const override {
 		return encodings::EncodingType::RunLengthEncoding;
 	}
+
+	MetricFlags requiredMetrics() const override {
+		return static_cast<MetricFlags>(MetricFlag::RunStats);
+	}
 };
 
 class RawBitPackedCostModel final : public EncodingCostModel {
@@ -323,6 +346,10 @@ public:
 
 	encodings::EncodingType encodingType() const override {
 		return encodings::EncodingType::BitPacking;
+	}
+
+	MetricFlags requiredMetrics() const override {
+		return static_cast<MetricFlags>(MetricFlag::MinMax);
 	}
 };
 
@@ -371,6 +398,10 @@ public:
 	encodings::EncodingType encodingType() const override {
 		return encodings::EncodingType::AdaptiveFrameOfReference;
 	}
+
+	MetricFlags requiredMetrics() const override {
+		return static_cast<MetricFlags>(MetricFlag::ResidualFrames);
+	}
 };
 
 class AdaptiveFramedBitPrefixCostModel final : public EncodingCostModel {
@@ -409,6 +440,45 @@ public:
 
 	encodings::EncodingType encodingType() const override {
 		return encodings::EncodingType::AdaptiveFramedBitPrefix;
+	}
+
+	MetricFlags requiredMetrics() const override {
+		return static_cast<MetricFlags>(MetricFlag::SuffixFrames);
+	}
+};
+
+// Cost model for canonical Huffman entropy coding (sequential decode only).
+// Wire format: 18-byte fixed header + numSymbols*(sizeof(T)+1) symbol table + payload.
+// Cost estimate: header + symbol-table bytes + entropy * N bits for payload.
+class HuffmanCostModel final : public EncodingCostModel {
+public:
+	// Fixed header: 8 (numElements) + 2 (numSymbols) + 8 (payloadBits) = 18 bytes.
+	static constexpr size_t kHeaderFixed = 18;
+
+	double computeCost(const SegmentMetrics& metrics, size_t numValues, size_t bitWidth) const override {
+		if (numValues == 0) return 0.0;
+
+		// Symbol-table entry: sizeof(storage_type) bytes for the symbol + 1 byte for code length.
+		const size_t storageBytes = static_cast<size_t>(storageWidthBits(static_cast<uint8_t>(bitWidth))) / 8;
+		const size_t numSymbols   = metrics.uniqueCountCapped
+			? MetricCollector<uint64_t>::kUniqueCountCap
+			: metrics.uniqueCount;
+
+		const double headerBits      = static_cast<double>(kHeaderFixed) * 8.0;
+		const double symTableBits    = static_cast<double>(numSymbols) *
+		                               static_cast<double>(storageBytes + 1) * 8.0;
+		// Huffman achieves ~entropy bits/symbol on the payload.
+		const double payloadBits     = metrics.entropyEstimate * static_cast<double>(numValues);
+
+		return headerBits + symTableBits + payloadBits;
+	}
+
+	encodings::EncodingType encodingType() const override {
+		return encodings::EncodingType::HuffmanEncoding;
+	}
+
+	MetricFlags requiredMetrics() const override {
+		return static_cast<MetricFlags>(MetricFlag::FreqStats);
 	}
 };
 

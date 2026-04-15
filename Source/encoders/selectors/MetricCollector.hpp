@@ -14,6 +14,30 @@
 
 namespace encodings::encoders::selectors {
 
+// Bitset flags declaring which metric groups a cost model requires.
+// IDSubStreamEncodingSelector unions the flags from all registered cost models
+// and passes the result to MetricCollector::compute() to skip unused work.
+enum class MetricFlag : uint32_t {
+    None           = 0,
+    MinMax         = 1u << 0,  // min, max, range
+    RunStats       = 1u << 1,  // runCount, avgRunLength
+    FreqStats      = 1u << 2,  // uniqueCount, hllEstimatedCardinality, f1, f2, entropyEstimate
+    SuffixFrames   = 1u << 3,  // frameMaxSuffixBits, frameAvgSuffixBits
+    ResidualFrames = 1u << 4,  // frameMaxResidualBits, frameAvgResidualBits
+    All            = (1u << 5) - 1,
+};
+using MetricFlags = uint32_t;
+
+inline constexpr MetricFlags operator|(MetricFlag a, MetricFlag b) noexcept {
+    return static_cast<MetricFlags>(a) | static_cast<MetricFlags>(b);
+}
+inline constexpr MetricFlags operator|(MetricFlags a, MetricFlag b) noexcept {
+    return a | static_cast<MetricFlags>(b);
+}
+inline constexpr bool hasFlag(MetricFlags flags, MetricFlag f) noexcept {
+    return (flags & static_cast<MetricFlags>(f)) != 0;
+}
+
 struct SegmentMetrics {
 	uint64_t min{0};
 	uint64_t max{0};
@@ -288,12 +312,21 @@ private:
 	}
 
 public:
-	SegmentMetrics compute(const std::vector<T>& values) const {
+	// Compute metrics for the given values. Only the metric groups indicated by
+	// `flags` are computed; all others are left at their zero-initialised defaults.
+	// This allows callers that have a fixed set of cost models to skip expensive
+	// work (frequency-map construction, HLL hashing, frame tracking) when the
+	// corresponding metrics are not needed.
+	SegmentMetrics compute(
+		const std::vector<T>& values,
+		MetricFlags flags = static_cast<MetricFlags>(MetricFlag::All)) const
+	{
+		const bool doRun      = hasFlag(flags, MetricFlag::RunStats);
+		const bool doFreq     = hasFlag(flags, MetricFlag::FreqStats);
+		const bool doSuffix   = hasFlag(flags, MetricFlag::SuffixFrames);
+		const bool doResidual = hasFlag(flags, MetricFlag::ResidualFrames);
+
 		SegmentMetrics out;
-		out.frameMaxResidualBits.fill(0);
-		out.frameAvgResidualBits.fill(0.0);
-		out.frameMaxSuffixBits.fill(0);
-		out.frameAvgSuffixBits.fill(0.0);
 		if (values.empty()) return out;
 
 		const size_t n = values.size();
@@ -304,23 +337,29 @@ public:
 		// --- Prolog: initialise from values[0], eliminating if(i>0) from the hot loop ---
 		const T        v0  = values[0];
 		const uint64_t uv0 = static_cast<uint64_t>(v0);
-		out.min      = uv0;
-		out.max      = uv0;
-		out.runCount = 1;
-		out.f1 = 0;
-		out.f2 = 0;
-		hllAdd(hllRegs, std::hash<T>{}(v0));
+		out.min = uv0;
+		out.max = uv0;
+
+		if (doRun) {
+			out.runCount = 1;
+		}
 
 		ankerl::unordered_dense::map<T, uint32_t> freqMap;
-		freqMap.reserve(std::min(n, kUniqueCountCap));
-		freqMap[v0] = 1;
-		out.f1 = 1;
 		bool uniqueCapped = false;
+		if (doFreq) {
+			hllAdd(hllRegs, std::hash<T>{}(v0));
+			freqMap.reserve(std::min(n, kUniqueCountCap));
+			freqMap[v0] = 1;
+			out.f1 = 1;
+		}
 
-		SuffixFrameState  sfx;  sfx.initFromFirst(uv0);
-		ResidualFrameState res; res.initFromFirst(uv0);
+		SuffixFrameState  sfx{};
+		if (doSuffix)   sfx.initFromFirst(uv0);
 
-		T      prev            = v0;
+		ResidualFrameState res{};
+		if (doResidual) res.initFromFirst(uv0);
+
+		T      prev             = v0;
 		size_t currentRunLength = 1;
 
 		// --- Main loop (i=0 already handled in prolog) ---
@@ -328,49 +367,64 @@ public:
 			const T        v  = values[i];
 			const uint64_t uv = static_cast<uint64_t>(v);
 
-			hllAdd(hllRegs, std::hash<T>{}(v));
-
 			if (uv < out.min) out.min = uv;
 			if (uv > out.max) out.max = uv;
 
-			// Run tracking (avgRunLength feeds RLECostModel)
-			if (v == prev) {
-				++currentRunLength;
-			} else {
-				++out.runCount;
-				currentRunLength = 1;
+			if (doRun) {
+				if (v == prev) {
+					++currentRunLength;
+				} else {
+					++out.runCount;
+					currentRunLength = 1;
+				}
 			}
 
-			if (!uniqueCapped) updateFreq(v, freqMap, uniqueCapped, out.f1, out.f2);
+			if (doFreq) {
+				hllAdd(hllRegs, std::hash<T>{}(v));
+				if (!uniqueCapped) updateFreq(v, freqMap, uniqueCapped, out.f1, out.f2);
+			}
 
-			updateSuffixFrames(uv, sfx, i, out.max);
-			updateResidualFrames(uv, res, out, i);
+			if (doSuffix)   updateSuffixFrames(uv, sfx, i, out.max);
+			if (doResidual) updateResidualFrames(uv, res, out, i);
 
 			prev = v;
 		}
 
 		// --- Flush any partial frames ---
-		for (size_t c = 0; c < kBpN;  ++c) finalizeSuffixFrame(c, sfx, out.max);
-		for (size_t c = 0; c < kResN; ++c) finalizeResidualFrame(c, res, out);
+		if (doSuffix) {
+			for (size_t c = 0; c < kBpN;  ++c) finalizeSuffixFrame(c, sfx, out.max);
+		}
+		if (doResidual) {
+			for (size_t c = 0; c < kResN; ++c) finalizeResidualFrame(c, res, out);
+		}
 
 		// --- Commit per-frame averages ---
-		for (size_t c = 0; c < kBpN; ++c) {
-			out.frameMaxSuffixBits[c] = sfx.incrMaxSuffix[c];
-			out.frameAvgSuffixBits[c] = (sfx.incrTotalVals[c] > 0.0)
-				? sfx.incrSumWeightedSuffix[c] / sfx.incrTotalVals[c] : 0.0;
+		if (doSuffix) {
+			for (size_t c = 0; c < kBpN; ++c) {
+				out.frameMaxSuffixBits[c] = sfx.incrMaxSuffix[c];
+				out.frameAvgSuffixBits[c] = (sfx.incrTotalVals[c] > 0.0)
+					? sfx.incrSumWeightedSuffix[c] / sfx.incrTotalVals[c] : 0.0;
+			}
 		}
-		for (size_t c = 0; c < kResN; ++c) {
-			if (res.fbitseen[c] > 0)
-				out.frameAvgResidualBits[c] = res.fbitsum[c] / static_cast<double>(res.fbitseen[c]);
+		if (doResidual) {
+			for (size_t c = 0; c < kResN; ++c) {
+				if (res.fbitseen[c] > 0)
+					out.frameAvgResidualBits[c] = res.fbitsum[c] / static_cast<double>(res.fbitseen[c]);
+			}
 		}
 
-		out.range         = out.max - out.min;
-		out.avgRunLength  = static_cast<double>(n) / static_cast<double>(out.runCount);
-		out.uniqueCount   = uniqueCapped ? (kUniqueCountCap + 1) : freqMap.size();
-		out.uniqueCountCapped = uniqueCapped;
+		out.range = out.max - out.min;
 
-		out.entropyEstimate         = computeEntropy(freqMap, n, uniqueCapped);
-		out.hllEstimatedCardinality = computeHllEstimate(hllRegs);
+		if (doRun) {
+			out.avgRunLength = static_cast<double>(n) / static_cast<double>(out.runCount);
+		}
+
+		if (doFreq) {
+			out.uniqueCount         = uniqueCapped ? (kUniqueCountCap + 1) : freqMap.size();
+			out.uniqueCountCapped   = uniqueCapped;
+			out.entropyEstimate     = computeEntropy(freqMap, n, uniqueCapped);
+			out.hllEstimatedCardinality = computeHllEstimate(hllRegs);
+		}
 
 		return out;
 	}
