@@ -3,6 +3,7 @@ cmake_minimum_required(VERSION 3.28)
 # Create benchmark executable for basic types
 add_executable(run_benchmarks
     run_benchmarks.cpp
+    allocation_hooks.cpp   # global operator new/delete overrides for allocation peak tracking
 )
 
 target_link_libraries(run_benchmarks
@@ -22,6 +23,7 @@ target_include_directories(run_benchmarks
 # Create sweep executable for SubInt auto sample size study
 add_executable(sweep_subint_samples
     sweep_subint_samples.cpp
+    allocation_hooks.cpp
 )
 
 target_link_libraries(sweep_subint_samples
@@ -41,6 +43,7 @@ target_include_directories(sweep_subint_samples
 # Create map benchmark executable
 add_executable(map_benchmarks
     map_benchmarks.cpp
+    allocation_hooks.cpp
 )
 
 target_link_libraries(map_benchmarks
@@ -60,6 +63,7 @@ target_include_directories(map_benchmarks
 # Create refactored map benchmark executable
 add_executable(map_benchmarks_refactored
     map_benchmarks_refactored.cpp
+    allocation_hooks.cpp
 )
 
 target_link_libraries(map_benchmarks_refactored
@@ -79,6 +83,7 @@ target_include_directories(map_benchmarks_refactored
 # Create vector benchmark executable
 add_executable(vector_benchmarks
     vector_benchmarks.cpp
+    allocation_hooks.cpp
 )
 
 target_link_libraries(vector_benchmarks
