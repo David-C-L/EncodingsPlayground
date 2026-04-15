@@ -34,6 +34,7 @@ using encodings::encoders::selectors::costs::AdaptiveFramedBitPrefixCostModel;
 using encodings::encoders::selectors::costs::FORCostModel;
 using encodings::encoders::selectors::costs::DictionaryCostModel;
 using encodings::encoders::selectors::costs::RLECostModel;
+using encodings::encoders::selectors::costs::HuffmanCostModel;
 
 namespace encodings::encoders {
 
@@ -822,9 +823,63 @@ inline std::shared_ptr<SubIntSplitAutoEncoder<T>> makeAutoSubIntSplitEncoder(typ
     return std::make_shared<SubIntSplitAutoEncoder<T>>(std::move(cfg));
 }
 
+inline std::vector<encodings::EncodingType> defaultAutoSubIntSplitCostModelTypes() {
+    return {
+        encodings::EncodingType::RawEncoding,
+        encodings::EncodingType::BitPacking,
+        encodings::EncodingType::RunLengthEncoding,
+        encodings::EncodingType::AdaptiveFrameOfReference,
+        encodings::EncodingType::DictionaryEncoding
+    };
+}
+
+inline std::vector<std::unique_ptr<selectors::costs::EncodingCostModel>>
+makeAutoSubIntSplitCostModelsFromTypes(const std::vector<encodings::EncodingType>& modelTypes) {
+    std::vector<std::unique_ptr<selectors::costs::EncodingCostModel>> models;
+    models.reserve(modelTypes.size());
+
+    for (const auto type : modelTypes) {
+        switch (type) {
+            case encodings::EncodingType::RawEncoding:
+                models.emplace_back(std::make_unique<RawCostModel>());
+                break;
+            case encodings::EncodingType::BitPacking:
+                models.emplace_back(std::make_unique<RawBitPackedCostModel>());
+                break;
+            case encodings::EncodingType::RunLengthEncoding:
+                models.emplace_back(std::make_unique<RLECostModel>());
+                break;
+            case encodings::EncodingType::FrameOfReference:
+                models.emplace_back(std::make_unique<FORCostModel>());
+                break;
+            case encodings::EncodingType::AdaptiveFrameOfReference:
+                models.emplace_back(std::make_unique<AdaptiveFORCostModel>());
+                break;
+            case encodings::EncodingType::AdaptiveFramedBitPrefix:
+                models.emplace_back(std::make_unique<AdaptiveFramedBitPrefixCostModel>());
+                break;
+            case encodings::EncodingType::DictionaryEncoding:
+                models.emplace_back(std::make_unique<DictionaryCostModel>());
+                break;
+            case encodings::EncodingType::HuffmanEncoding:
+                models.emplace_back(std::make_unique<HuffmanCostModel>());
+                break;
+            default:
+                throw std::invalid_argument("makeAutoSubIntSplitCostModelsFromTypes: unsupported encoding type for cost model");
+        }
+    }
+
+    if (models.empty()) {
+        throw std::invalid_argument("makeAutoSubIntSplitCostModelsFromTypes: no cost models provided");
+    }
+
+    return models;
+}
+
 template <typename T>
 inline typename SubIntSplitAutoEncoder<T>::Config makeDefaultAutoSubIntSplitConfig(BitSplitOrder order = BitSplitOrder::LSB_TO_MSB,
-                                                                         bool enableSelectionTiming = false) {
+                                                                         bool enableSelectionTiming = false,
+                                                                         std::vector<encodings::EncodingType> costModelTypes = {}) {
     typename SubIntSplitAutoEncoder<T>::Config cfg;
     cfg.selectorConfig = selectors::IDSubStreamEncodingSelector::Config{}; // defaults
     cfg.selectorConfig.verboseLevel = 1; // leave quiet by default; enable when debugging
@@ -839,13 +894,10 @@ inline typename SubIntSplitAutoEncoder<T>::Config makeDefaultAutoSubIntSplitConf
     cfg.enableSelectionTiming = enableSelectionTiming;
     cfg.orderHint = order;
 
-    cfg.costModels.emplace_back(std::make_unique<RawCostModel>());
-    cfg.costModels.emplace_back(std::make_unique<RawBitPackedCostModel>());
-    // cfg.costModels.emplace_back(std::make_unique<FORCostModel>());
-    cfg.costModels.emplace_back(std::make_unique<AdaptiveFORCostModel>());
-    cfg.costModels.emplace_back(std::make_unique<AdaptiveFramedBitPrefixCostModel>());
-    cfg.costModels.emplace_back(std::make_unique<DictionaryCostModel>());
-    cfg.costModels.emplace_back(std::make_unique<RLECostModel>());
+    if (costModelTypes.empty()) {
+        costModelTypes = defaultAutoSubIntSplitCostModelTypes();
+    }
+    cfg.costModels = makeAutoSubIntSplitCostModelsFromTypes(costModelTypes);
     return cfg;
 }
 
@@ -853,8 +905,9 @@ template <typename T>
 inline std::shared_ptr<SubIntSplitAutoEncoder<T>> makeDefaultAutoSubIntSplitEncoder(BitSplitOrder order = BitSplitOrder::LSB_TO_MSB,
                                                                                    bool exhaustiveSearch = false,
                                                                                    bool enablePrune = true,
-                                                                                   bool enableSelectionTiming = false) {
-    auto cfg = makeDefaultAutoSubIntSplitConfig<T>(order, enableSelectionTiming);
+                                                                                   bool enableSelectionTiming = false,
+                                                                                   std::vector<encodings::EncodingType> costModelTypes = {}) {
+    auto cfg = makeDefaultAutoSubIntSplitConfig<T>(order, enableSelectionTiming, std::move(costModelTypes));
     cfg.selectorConfig.orderHint = order;
     cfg.selectorConfig.useExhaustiveSearch = exhaustiveSearch;
     cfg.selectorConfig.enablePrune = enablePrune;
@@ -870,15 +923,17 @@ inline std::shared_ptr<SubIntSplitAutoEncoder64> makeAutoSubIntSplitEncoder(SubI
 }
 
 inline SubIntSplitAutoEncoder64::Config makeDefaultAutoSubIntSplitConfig(BitSplitOrder order = BitSplitOrder::LSB_TO_MSB,
-                                                                         bool enableSelectionTiming = false) {
-    return makeDefaultAutoSubIntSplitConfig<int64_t>(order, enableSelectionTiming);
+                                                                         bool enableSelectionTiming = false,
+                                                                         std::vector<encodings::EncodingType> costModelTypes = {}) {
+    return makeDefaultAutoSubIntSplitConfig<int64_t>(order, enableSelectionTiming, std::move(costModelTypes));
 }
 
 inline std::shared_ptr<SubIntSplitAutoEncoder64> makeDefaultAutoSubIntSplitEncoder(BitSplitOrder order = BitSplitOrder::LSB_TO_MSB,
                                                                                    bool exhaustiveSearch = false,
                                                                                    bool enablePrune = true,
-                                                                                   bool enableSelectionTiming = false) {
-    return makeDefaultAutoSubIntSplitEncoder<int64_t>(order, exhaustiveSearch, enablePrune, enableSelectionTiming);
+                                                                                   bool enableSelectionTiming = false,
+                                                                                   std::vector<encodings::EncodingType> costModelTypes = {}) {
+    return makeDefaultAutoSubIntSplitEncoder<int64_t>(order, exhaustiveSearch, enablePrune, enableSelectionTiming, std::move(costModelTypes));
 }
 
 } // namespace encodings::encoders
