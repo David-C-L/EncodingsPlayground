@@ -93,6 +93,13 @@ public:
 
 		const size_t effectiveCount = fullCount.value_or(sample.size());
 
+		// Union the metric flags required by all registered cost models so that
+		// MetricCollector::compute() can skip work not needed by any model.
+		MetricFlags requiredFlags = static_cast<MetricFlags>(MetricFlag::None);
+		for (const auto& enc : encodings) {
+			requiredFlags |= enc->requiredMetrics();
+		}
+
 		BitRangeSegmentBuilder<SampleT, uint64_t> builder(sample);
 		MetricCollector<uint64_t> collector;
 
@@ -126,7 +133,7 @@ public:
 			for (int r = l; r < kBits; ++r) {
 				builder.extend(r);
 				const auto& values = builder.values();
-				SegmentMetrics metrics = collector.compute(values);
+				SegmentMetrics metrics = collector.compute(values, requiredFlags);
 				const size_t numValues = values.size();
 				const size_t bitWidth = static_cast<size_t>(r - l + 1);
 
@@ -235,6 +242,10 @@ private:
 		const std::vector<std::unique_ptr<encoders::selectors::costs::EncodingCostModel>>& encodings,
 		size_t effectiveCount,
 		Result& result) const {
+		MetricFlags mergeFlags = static_cast<MetricFlags>(MetricFlag::None);
+		for (const auto& enc : encodings) {
+			mergeFlags |= enc->requiredMetrics();
+		}
 		BitRangeSegmentBuilder<SampleT, uint64_t> mergeBuilder(sample);
 		MetricCollector<uint64_t> mergeCollector;
 		bool merged_any = true;
@@ -255,7 +266,7 @@ private:
 						mergeBuilder.extend(bit);
 					}
 					const auto& values = mergeBuilder.values();
-					SegmentMetrics metrics = mergeCollector.compute(values);
+					SegmentMetrics metrics = mergeCollector.compute(values, mergeFlags);
 					const size_t numValues = values.size();
 
 					double bestMergedCost = std::numeric_limits<double>::infinity();
