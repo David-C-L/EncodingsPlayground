@@ -752,6 +752,262 @@ def plot_selection_time(results, output_dir, colours, source_label, group_encode
 
 
 # ---------------------------------------------------------------------------
+# Memory plots
+# ---------------------------------------------------------------------------
+
+def _bytes_to_mb(b):
+    return b / (1024 * 1024)
+
+
+def _has_memory_data(results) -> bool:
+    """Return True if at least one result has non-zero memory measurement fields."""
+    for r in results['results']:
+        m = r.get('metrics', {}).get('memory', {})
+        if any(m.get(k, 0) > 0 for k in (
+            'encodePeakHeapBytes', 'encodeNetHeapDeltaBytes',
+            'decodeBulkPeakHeapBytes', 'decodeBulkNetHeapDeltaBytes',
+            'decodeRandomPeakHeapBytes', 'decodeStridedPeakHeapBytes',
+            'decodeRangePeakHeapBytes',
+        )):
+            return True
+    return False
+
+
+def plot_memory_encode_decode(results, output_dir, colours, source_label, group_encoders=False):
+    """
+    Mirrors plot_encode_decode_time but shows heap memory usage (MB).
+
+    Left panel : encode peak heap vs net heap delta (stacked bar so the
+                 difference = internal buffers freed before encode returned).
+    Right panel: bulk-decode peak heap vs net heap delta (same layout).
+    """
+    if not _has_memory_data(results):
+        return
+
+    datasets = sorted(set(r['datasetName'] for r in results['results']))
+    encoders = _sorted_encoders(results, group_encoders=group_encoders)
+
+    for dataset in datasets:
+        size = _pick_size_for_dataset(results, dataset)
+        enc_peak, enc_net = [], []
+        dec_peak, dec_net = [], []
+        for enc in encoders:
+            row = _row(results, enc, dataset, size)
+            if row:
+                m = row['metrics']['memory']
+                enc_peak.append(_bytes_to_mb(m.get('encodePeakHeapBytes', 0)))
+                enc_net.append(_bytes_to_mb(m.get('encodeNetHeapDeltaBytes', 0)))
+                dec_peak.append(_bytes_to_mb(m.get('decodeBulkPeakHeapBytes', 0)))
+                dec_net.append(_bytes_to_mb(m.get('decodeBulkNetHeapDeltaBytes', 0)))
+            else:
+                enc_peak.append(0); enc_net.append(0)
+                dec_peak.append(0); dec_net.append(0)
+
+        h = max(4, len(encoders) * 0.7 + 1.5)
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, h))
+        fig.suptitle(
+            f'Heap memory usage — {dataset}  (n={size:,})',
+            fontsize=13, y=1.04)
+        _annotate_source(fig, source_label)
+
+        def _mem_stacked(ax, encoders, peak_vals, net_vals, title):
+            """
+            Stacked bar: net (retained) portion + transient (peak - net) portion.
+            Peak is the high-water mark; net is what remains allocated after the
+            call returns.  The difference shows intermediate buffers that were
+            freed before the call returned.
+            """
+            y = np.arange(len(encoders))
+            bar_h = 0.6
+            net_clipped   = [max(v, 0) for v in net_vals]
+            # Transient portion: peak above net (internal working memory freed by return)
+            transient     = [max(p - n, 0) for p, n in zip(peak_vals, net_clipped)]
+            net_colors    = [colours[e] for e in encoders]
+            trans_colors  = [_lighten_color(colours[e], 0.45) for e in encoders]
+
+            ax.barh(y, net_clipped, height=bar_h, color=net_colors, label='Net retained')
+            ax.barh(y, transient, left=net_clipped, height=bar_h,
+                    color=trans_colors, hatch='///', edgecolor='black',
+                    linewidth=0.5, label='Transient (freed by return)')
+
+            x_max = max((v for v in peak_vals if v > 0), default=1)
+            for i, (net, trans, peak) in enumerate(zip(net_clipped, transient, peak_vals)):
+                if peak > 0:
+                    ax.text(peak + x_max * 0.01,
+                            y[i],
+                            f'{peak:.2f} MB', va='center', fontsize=8)
+                else:
+                    ax.text(x_max * 0.01, y[i],
+                            'N/A', va='center', fontsize=8, color='grey')
+
+            ax.set_yticks(y); ax.set_yticklabels(encoders); ax.invert_yaxis()
+            ax.grid(axis='x', alpha=0.3)
+            ax.set_xlabel('Heap memory (MB, lower = better)')
+            ax.set_title(title)
+            ax.legend(fontsize=8, loc='lower right')
+
+        _mem_stacked(ax1, encoders, enc_peak, enc_net, 'Encode heap memory')
+        _mem_stacked(ax2, encoders, dec_peak, dec_net, 'Bulk decode heap memory')
+
+        plt.tight_layout()
+        fname = output_dir / f'memory_encode_decode_{dataset.replace(" ", "_")}.png'
+        plt.savefig(fname, dpi=150, bbox_inches='tight')
+        print(f"Saved: {fname}")
+        plt.close()
+
+
+def plot_memory_access(results, output_dir, colours, source_label, group_encoders=False):
+    """
+    Mirrors plot_random_access / plot_range_access but shows heap memory.
+
+    Left panel : peak heap per decodeAt call (random + strided).
+                 For most encoders this will be 0 because decodeAt returns
+                 std::optional<T> by value (stack-only).  Non-zero values
+                 indicate internal scratch-buffer allocations.
+    Right panel: peak working heap for a single decodeRange call (MB).
+                 This is the output buffer + any internal temporary buffers
+                 alive at the moment decodeRange returns.
+    """
+    if not _has_memory_data(results):
+        return
+
+    datasets = sorted(set(r['datasetName'] for r in results['results']))
+    encoders = _sorted_encoders(results, group_encoders=group_encoders)
+
+    for dataset in datasets:
+        size = _pick_size_for_dataset(results, dataset)
+        rand_kb, strided_kb, range_mb = [], [], []
+        for enc in encoders:
+            row = _row(results, enc, dataset, size)
+            if row:
+                m = row['metrics']['memory']
+                # Random/strided: values are small (bytes), display in KB
+                rand_kb.append(m.get('decodeRandomPeakHeapBytes', 0) / 1024)
+                strided_kb.append(m.get('decodeStridedPeakHeapBytes', 0) / 1024)
+                range_mb.append(_bytes_to_mb(m.get('decodeRangePeakHeapBytes', 0)))
+            else:
+                rand_kb.append(0); strided_kb.append(0); range_mb.append(0)
+
+        h = max(4, len(encoders) * 0.7 + 1.5)
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, h))
+        fig.suptitle(
+            f'Decode access heap memory — {dataset}  (n={size:,})',
+            fontsize=13, y=1.04)
+        _annotate_source(fig, source_label)
+
+        # Left: random vs strided side-by-side (grouped, KB scale)
+        y   = np.arange(len(encoders))
+        bh  = 0.28
+        ax1.barh(y - bh/2, rand_kb,    height=bh,
+                 color=[colours[e] for e in encoders], label='Random', alpha=0.9)
+        ax1.barh(y + bh/2, strided_kb, height=bh,
+                 color=[colours[e] for e in encoders], label='Strided',
+                 alpha=0.55, hatch='//')
+        ax1.set_yticks(y); ax1.set_yticklabels(encoders); ax1.invert_yaxis()
+        ax1.grid(axis='x', alpha=0.3)
+        ax1.set_xlabel('Peak heap per decodeAt call (KB, lower = better)')
+        ax1.set_title('Random / strided access heap\n(0 = stack-only decode, expected for most encoders)')
+
+        import matplotlib.patches as mpatches
+        rand_patch    = mpatches.Patch(facecolor='grey', alpha=0.9,  label='Random (solid)')
+        strided_patch = mpatches.Patch(facecolor='grey', alpha=0.55, hatch='//', label='Strided (hatch)')
+        ax1.legend(handles=[rand_patch, strided_patch], fontsize=8, loc='lower right')
+
+        # Right: range query (MB)
+        _hbar(ax2, encoders, range_mb, colours, unit='MB', fmt='.2f', log=False)
+        ax2.set_xlabel('Peak heap for one decodeRange call (MB, lower = better)')
+        ax2.set_title('Range-access heap memory\n(output buffer + internal allocations alive at return)')
+
+        plt.tight_layout()
+        fname = output_dir / f'memory_access_{dataset.replace(" ", "_")}.png'
+        plt.savefig(fname, dpi=150, bbox_inches='tight')
+        print(f"Saved: {fname}")
+        plt.close()
+
+
+def plot_time_memory_paired(results, output_dir, colours, source_label, group_encoders=False):
+    """
+    Paired plots that put timing and memory on the same figure for direct
+    comparison.
+
+    Produces two output files per dataset:
+      time_memory_encode_<dataset>.png  — encode time (ms) vs encode peak heap (MB)
+      time_memory_decode_<dataset>.png  — bulk decode time (ms) vs decode peak heap (MB)
+
+    Each figure is a 1×2 grid: left = time bar chart, right = memory bar chart,
+    with identical encoder ordering and colour mapping so the eye can directly
+    compare the two panels.
+    """
+    if not _has_memory_data(results):
+        return
+
+    datasets = sorted(set(r['datasetName'] for r in results['results']))
+    encoders = _sorted_encoders(results, group_encoders=group_encoders)
+
+    for dataset in datasets:
+        size = _pick_size_for_dataset(results, dataset)
+
+        enc_ms, dec_ms = [], []
+        enc_peak_mb, dec_peak_mb = [], []
+        for enc in encoders:
+            row = _row(results, enc, dataset, size)
+            if row:
+                t = row['metrics']['timing']
+                m = row['metrics']['memory']
+                enc_ms.append(t['encodeTime_ns']     / 1e6)
+                dec_ms.append(t['decodeBulkTime_ns'] / 1e6)
+                enc_peak_mb.append(_bytes_to_mb(m.get('encodePeakHeapBytes', 0)))
+                dec_peak_mb.append(_bytes_to_mb(m.get('decodeBulkPeakHeapBytes', 0)))
+            else:
+                enc_ms.append(0); dec_ms.append(0)
+                enc_peak_mb.append(0); dec_peak_mb.append(0)
+
+        h = max(4, len(encoders) * 0.7 + 1.5)
+
+        # ── Encode paired ────────────────────────────────────────────────
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, h))
+        fig.suptitle(
+            f'Encode — time vs memory — {dataset}  (n={size:,})',
+            fontsize=13, y=1.04)
+        _annotate_source(fig, source_label)
+
+        _hbar(ax1, encoders, enc_ms,      colours, unit='ms', fmt='.1f', log=True)
+        ax1.set_xlabel('Encode time (ms, log scale, lower = better)')
+        ax1.set_title('Encode time')
+
+        _hbar(ax2, encoders, enc_peak_mb, colours, unit='MB', fmt='.2f', log=False)
+        ax2.set_xlabel('Encode peak heap (MB, lower = better)')
+        ax2.set_title('Encode peak heap memory')
+
+        plt.tight_layout()
+        fname = output_dir / f'time_memory_encode_{dataset.replace(" ", "_")}.png'
+        plt.savefig(fname, dpi=150, bbox_inches='tight')
+        print(f"Saved: {fname}")
+        plt.close()
+
+        # ── Decode paired ────────────────────────────────────────────────
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, h))
+        fig.suptitle(
+            f'Bulk decode — time vs memory — {dataset}  (n={size:,})',
+            fontsize=13, y=1.04)
+        _annotate_source(fig, source_label)
+
+        _hbar(ax1, encoders, dec_ms,      colours, unit='ms', fmt='.1f', log=True)
+        ax1.set_xlabel('Decode time (ms, log scale, lower = better)')
+        ax1.set_title('Bulk decode time')
+
+        _hbar(ax2, encoders, dec_peak_mb, colours, unit='MB', fmt='.2f', log=False)
+        ax2.set_xlabel('Decode peak heap (MB, lower = better)')
+        ax2.set_title('Bulk decode peak heap memory')
+
+        plt.tight_layout()
+        fname = output_dir / f'time_memory_decode_{dataset.replace(" ", "_")}.png'
+        plt.savefig(fname, dpi=150, bbox_inches='tight')
+        print(f"Saved: {fname}")
+        plt.close()
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -779,6 +1035,7 @@ def main():
         colours = _encoder_colours(encoders)
 
     print("\nGenerating plots...")
+    # ── Existing timing / compression plots ─────────────────────────────
     plot_compression(results, args.output, colours, source_label, group_encoders=args.group_encoders)
     plot_compression_overhead(results, args.output, colours, source_label, group_encoders=args.group_encoders)
     plot_encode_decode_time(results, args.output, colours, source_label, group_encoders=args.group_encoders)
@@ -787,6 +1044,16 @@ def main():
     plot_throughput_summary(results, args.output, colours, source_label, group_encoders=args.group_encoders)
     plot_compression_vs_random_access(results, args.output, colours, source_label, group_encoders=args.group_encoders)
     # selection time (if present) is shown inside the encode plot
+
+    # ── Memory plots (skipped silently if no memory data present) ────────
+    if _has_memory_data(results):
+        print("\nMemory data detected — generating memory plots...")
+        plot_memory_encode_decode(results, args.output, colours, source_label, group_encoders=args.group_encoders)
+        plot_memory_access(results, args.output, colours, source_label, group_encoders=args.group_encoders)
+        plot_time_memory_paired(results, args.output, colours, source_label, group_encoders=args.group_encoders)
+    else:
+        print("\nNo memory data found in results — skipping memory plots.")
+        print("  (Re-run benchmarks with BenchmarkConfig::measureMemory = true to collect it.)")
 
     print(f"\n✓ All plots saved to: {args.output}")
     print(f"\nBenchmark Summary:")
