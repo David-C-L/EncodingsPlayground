@@ -64,7 +64,16 @@ public:
         ss << "      \"originalSize\": " << memory.originalSize << ",\n";
         ss << "      \"encodedSize\": " << memory.encodedSize << ",\n";
         ss << "      \"compressionRatio\": " << memory.compressionRatio() << ",\n";
-        ss << "      \"bitsPerElement\": " << memory.bitsPerElement(elementCount) << "\n";
+        ss << "      \"bitsPerElement\": " << memory.bitsPerElement(elementCount) << ",\n";
+        // Dynamic heap measurements (zero when measureMemory was disabled)
+        ss << "      \"encodePeakHeapBytes\": " << memory.encodePeakHeapBytes << ",\n";
+        ss << "      \"encodeNetHeapDeltaBytes\": " << memory.encodeNetHeapDeltaBytes << ",\n";
+        ss << "      \"encoderOverhead\": " << memory.encoderOverhead << ",\n";
+        ss << "      \"decodeBulkPeakHeapBytes\": " << memory.decodeBulkPeakHeapBytes << ",\n";
+        ss << "      \"decodeBulkNetHeapDeltaBytes\": " << memory.decodeBulkNetHeapDeltaBytes << ",\n";
+        ss << "      \"decodeRandomPeakHeapBytes\": " << memory.decodeRandomPeakHeapBytes << ",\n";
+        ss << "      \"decodeStridedPeakHeapBytes\": " << memory.decodeStridedPeakHeapBytes << ",\n";
+        ss << "      \"decodeRangePeakHeapBytes\": " << memory.decodeRangePeakHeapBytes << "\n";
         ss << "    }";
         return ss.str();
     }
@@ -278,12 +287,30 @@ public:
             
             // Memory
             out << "\nMEMORY:\n";
-            out << "  Original:      " << std::setw(10) << m.memory.originalSize << " bytes\n";
-            out << "  Encoded:       " << std::setw(10) << m.memory.encodedSize << " bytes\n";
-            out << "  Compression:   " << std::setw(10) << std::fixed << std::setprecision(2) 
+            out << "  Original:               " << std::setw(12) << m.memory.originalSize << " bytes\n";
+            out << "  Encoded:                " << std::setw(12) << m.memory.encodedSize << " bytes\n";
+            out << "  Compression:            " << std::setw(12) << std::fixed << std::setprecision(2)
                 << m.memory.compressionRatio() << "x\n";
-            out << "  Bits/element:  " << std::setw(10) << std::fixed << std::setprecision(2)
+            out << "  Bits/element:           " << std::setw(12) << std::fixed << std::setprecision(2)
                 << m.memory.bitsPerElement(m.elementCount) << "\n";
+            if (m.memory.encodePeakHeapBytes > 0 || m.memory.encodeNetHeapDeltaBytes > 0) {
+                out << "  Encode peak heap:       " << std::setw(12) << m.memory.encodePeakHeapBytes
+                    << " bytes  (net delta: " << m.memory.encodeNetHeapDeltaBytes << " bytes";
+                if (m.memory.encoderOverhead > 0)
+                    out << ", encoder overhead: " << m.memory.encoderOverhead << " bytes";
+                out << ")\n";
+                out << "  Decode bulk peak heap:  " << std::setw(12) << m.memory.decodeBulkPeakHeapBytes
+                    << " bytes  (net delta: " << m.memory.decodeBulkNetHeapDeltaBytes << " bytes)\n";
+                if (m.memory.decodeRandomPeakHeapBytes > 0)
+                    out << "  Decode random peak:     " << std::setw(12)
+                        << m.memory.decodeRandomPeakHeapBytes << " bytes\n";
+                if (m.memory.decodeStridedPeakHeapBytes > 0)
+                    out << "  Decode strided peak:    " << std::setw(12)
+                        << m.memory.decodeStridedPeakHeapBytes << " bytes\n";
+                if (m.memory.decodeRangePeakHeapBytes > 0)
+                    out << "  Decode range peak:      " << std::setw(12)
+                        << m.memory.decodeRangePeakHeapBytes << " bytes\n";
+            }
             
             // Accuracy
             out << "\nACCURACY:\n";

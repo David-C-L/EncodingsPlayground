@@ -4,13 +4,19 @@
 #include <vector>
 #include <string>
 #include <functional>
+#include <numeric>
 #include <random>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <iostream>
 #include <utility>
+#ifdef __linux__
+#include <malloc.h>
+#endif
 #include "BenchmarkMetrics.hpp"
+#include "MemoryTracker.hpp"
+#include "AllocationTracker.hpp"
 #include "encodings/Encoder.hpp"
 #include "generators/DataGenerator.hpp"
 
@@ -220,7 +226,18 @@ public:
         if (config_.testRangeAccess) {
             benchmarkRangeAccess(encoder, encoded, result.originalData, result.metrics);
         }
-        
+
+        // ── Memory measurement pass ──────────────────────────────────────
+        // Run each workload a second time, measuring heap usage with a background
+        // sampler. This is kept entirely separate from the timing pass above so
+        // that memory-tracking overhead cannot inflate timing results.
+        if (config_.measureMemory) {
+            if (config_.verboseOutput) {
+                std::cout << "  [memory pass] measuring heap usage..." << std::endl;
+            }
+            measureMemoryUsage(encoder, result.originalData, result);
+        }
+
         return result;
     }
     
@@ -406,6 +423,178 @@ private:
         }
     }
     
+    // ────────────────────────────────────────────────────────────────────
+    // Memory-measurement pass
+    // ────────────────────────────────────────────────────────────────────
+
+    /**
+     * @brief Re-runs every workload (encode, bulk decode, random/strided/range
+     *        access) in a dedicated pass, measuring heap usage with a background
+     *        PeakHeapTracker.  All results are written into result.metrics.memory.
+     *
+     * This method must be called *after* all timing measurements so that the
+     * PeakHeapTracker's background thread (and any malloc_trim calls) cannot
+     * interfere with latency measurements.
+     */
+    void measureMemoryUsage(
+            std::shared_ptr<encodings::Codec<T>> encoder,
+            const std::vector<T>& originalData,
+            BenchmarkResult<T>& result) {
+
+        const size_t n = originalData.size();
+
+        // Helper: net heap bytes above `before` (0 if the heap shrank).
+        auto netDelta = [](size_t after, size_t before) -> size_t {
+            return after > before ? after - before : 0;
+        };
+
+        // Helper: release free arena pages back to the OS so that the baseline
+        // reading is as tight as possible.  No-op on non-Linux.
+        auto trimHeap = [] {
+#ifdef __linux__
+            malloc_trim(0);
+#endif
+        };
+
+        // ── Phase 1: Encode ───────────────────────────────────────────────
+        // Peak: ScopedAllocationTrack intercepts every operator new/delete so
+        //       transient intermediate buffers are captured even if freed before
+        //       encode() returns.
+        // Net delta: mallinfo2 before/after gives the retained heap after the
+        //       call (≈ the encoded output buffer + any retained encoder state).
+        encodings::EncodedData encoded;
+        {
+            trimHeap();
+            size_t heapBefore = currentHeapBytes();
+            {
+                ScopedAllocationTrack track;
+                encoded = encoder->encode(originalData);
+                result.metrics.memory.encodePeakHeapBytes = track.stop();
+            }
+            result.metrics.memory.encodeNetHeapDeltaBytes =
+                netDelta(currentHeapBytes(), heapBefore);
+
+            // Populate legacy aliases.
+            result.metrics.memory.peakMemoryUsage = result.metrics.memory.encodePeakHeapBytes;
+            size_t encodedSz = result.metrics.memory.encodedSize;
+            result.metrics.memory.encoderOverhead =
+                result.metrics.memory.encodeNetHeapDeltaBytes > encodedSz
+                    ? result.metrics.memory.encodeNetHeapDeltaBytes - encodedSz
+                    : 0;
+        }
+
+        // ── Phase 2: Bulk decode ──────────────────────────────────────────
+        {
+            trimHeap();
+            size_t heapBefore = currentHeapBytes();
+            {
+                ScopedAllocationTrack track;
+                auto decoded = encoder->decodeAll(encoded);
+                result.metrics.memory.decodeBulkPeakHeapBytes = track.stop();
+                (void)decoded;
+            }
+            result.metrics.memory.decodeBulkNetHeapDeltaBytes =
+                netDelta(currentHeapBytes(), heapBefore);
+        }
+
+        // ── Phase 3: Random access ────────────────────────────────────────
+        // decodeAt returns std::optional<T> — usually a stack-allocated value
+        // with 0 heap allocation for simple encoders.  However, some encoders
+        // (e.g. SubIntSplitEncoder when a section codec lacks RandomAccess)
+        // internally call decodeAll(), allocating a large std::vector<T> that
+        // is freed before decodeAt returns.  mallinfo2() before/after sees net
+        // delta = 0 in that case.  ScopedAllocationTrack intercepts the
+        // operator new/delete calls and captures the true intra-call peak.
+        if (config_.testRandomAccess &&
+            encoder->properties().has(encodings::EncodingProperty::RandomAccess)) {
+
+            std::vector<size_t> indices;
+            if (!config_.randomAccessIndices.empty()) {
+                indices = config_.randomAccessIndices;
+            } else {
+                indices.resize(n);
+                std::iota(indices.begin(), indices.end(), 0);
+                std::mt19937 fixedRng(42);
+                std::shuffle(indices.begin(), indices.end(), fixedRng);
+            }
+            size_t samplesToTest = std::min({config_.randomAccessSamples,
+                                             indices.size(), n});
+
+            if (samplesToTest > 0) {
+                // Wrap the entire batch in one tracker: the peak over all calls
+                // is the worst-case working memory for a single decodeAt.
+                // (Consecutive calls free their buffers before the next starts,
+                //  so the peak is that of one call, not the sum.)
+                ScopedAllocationTrack track;
+                for (size_t i = 0; i < samplesToTest; ++i) {
+                    auto value = encoder->decodeAt(encoded, indices[i]);
+                    (void)value;
+                }
+                result.metrics.memory.decodeRandomPeakHeapBytes = track.stop();
+            }
+        }
+
+        // ── Phase 4: Strided access ───────────────────────────────────────
+        if (config_.testStridedAccess &&
+            encoder->properties().has(encodings::EncodingProperty::RandomAccess)) {
+
+            ScopedAllocationTrack track;
+            if (!config_.stridedAccessIndices.empty()) {
+                size_t count = 0;
+                for (size_t idx : config_.stridedAccessIndices) {
+                    if (idx >= n) continue;
+                    auto value = encoder->decodeAt(encoded, idx);
+                    (void)value;
+                    if (++count >= config_.stridedAccessSamples) break;
+                }
+            } else {
+                size_t count = 0;
+                for (size_t idx = 0; idx < n; idx += config_.stride) {
+                    auto value = encoder->decodeAt(encoded, idx);
+                    (void)value;
+                    if (++count >= config_.stridedAccessSamples) break;
+                }
+            }
+            result.metrics.memory.decodeStridedPeakHeapBytes = track.stop();
+        }
+
+        // ── Phase 5: Range access ─────────────────────────────────────────
+        // decodeRange returns a std::vector<T>.  We take one ScopedAllocationTrack
+        // over all queries; the peak is the worst-case working memory for one
+        // range query (output buffer + any internal temporary allocations).
+        if (config_.testRangeAccess &&
+            encoder->properties().has(encodings::EncodingProperty::RandomAccess)) {
+
+            ScopedAllocationTrack track;
+            if (!config_.rangeAccesses.empty()) {
+                size_t queryCount = 0;
+                for (const auto& [startRaw, endRaw] : config_.rangeAccesses) {
+                    if (startRaw >= endRaw) continue;
+                    size_t start = std::min(startRaw, n);
+                    size_t end   = std::min(endRaw,   n);
+                    if (start >= end) continue;
+                    auto range = encoder->decodeRange(encoded, start, end);
+                    (void)range;
+                    if (++queryCount >= config_.rangeQueryCount) break;
+                }
+            } else {
+                std::mt19937 fixedRng(42);
+                for (size_t rangeSize : config_.rangeSizes) {
+                    if (rangeSize > n) continue;
+                    for (size_t q = 0; q < config_.rangeQueryCount; ++q) {
+                        std::uniform_int_distribution<size_t> dist(0, n - rangeSize);
+                        size_t start = dist(fixedRng);
+                        auto range = encoder->decodeRange(encoded, start, start + rangeSize);
+                        (void)range;
+                    }
+                }
+            }
+            result.metrics.memory.decodeRangePeakHeapBytes = track.stop();
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+
     void benchmarkRangeAccess(std::shared_ptr<encodings::Codec<T>> encoder,
                              const encodings::EncodedData& encoded,
                              const std::vector<T>& original,

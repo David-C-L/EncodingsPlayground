@@ -40,13 +40,46 @@ struct TimingMetrics {
 
 /**
  * @brief Memory usage measurements
+ *
+ * Fields are split into two groups:
+ *  1. Static sizes (always populated): originalSize, encodedSize.
+ *  2. Dynamic heap measurements (populated only when
+ *     BenchmarkConfig::measureMemory is true, in a pass separate from timing).
+ *
+ * "Peak" fields report the highest heap usage above the pre-operation baseline
+ * as sampled by a background thread (see PeakHeapTracker).
+ * "NetDelta" fields report the net change in live heap bytes between the start
+ * and the end of the operation (i.e. allocations that were not freed before
+ * the operation returned, such as the output buffer itself).
  */
 struct MemoryMetrics {
-    size_t originalSize{0};        // Size of unencoded data in bytes
-    size_t encodedSize{0};         // Size of encoded data in bytes
-    size_t peakMemoryUsage{0};     // Peak memory during encoding/decoding
-    size_t encoderOverhead{0};     // Additional memory used by encoder state
-    
+    size_t originalSize{0};        ///< Size of unencoded data in bytes
+    size_t encodedSize{0};         ///< Size of encoded data in bytes
+
+    // ── Dynamic heap measurements (memory-measurement pass) ──────────────
+    /// Peak heap above baseline during encode (includes all intermediate buffers).
+    size_t encodePeakHeapBytes{0};
+    /// Net heap change at end of encode (≈ encodedSize + any retained encoder state).
+    size_t encodeNetHeapDeltaBytes{0};
+
+    /// Peak heap above baseline during full (bulk) decode.
+    size_t decodeBulkPeakHeapBytes{0};
+    /// Net heap change at end of bulk decode (≈ decoded output size).
+    size_t decodeBulkNetHeapDeltaBytes{0};
+
+    /// Peak heap above baseline while executing all random-access decode calls.
+    size_t decodeRandomPeakHeapBytes{0};
+    /// Peak heap above baseline while executing all strided-access decode calls.
+    size_t decodeStridedPeakHeapBytes{0};
+    /// Peak heap above baseline while executing all range-access decode calls.
+    size_t decodeRangePeakHeapBytes{0};
+
+    // ── Legacy aliases kept for back-compat with existing JSON consumers ──
+    /// Alias for encodePeakHeapBytes (populated alongside it).
+    size_t peakMemoryUsage{0};
+    /// Net encoder heap above the encoded output: encodeNetHeapDeltaBytes − encodedSize (≥ 0).
+    size_t encoderOverhead{0};
+
     double compressionRatio() const {
         return originalSize > 0 
             ? static_cast<double>(encodedSize) / originalSize 
@@ -199,6 +232,14 @@ struct BenchmarkConfig {
     bool verboseOutput{false};
     bool saveResults{true};
     std::string outputPath{"/home/david/Documents/PhD/symbol-store/EncodingsPlayground/Benchmarks/results"};
+
+    // Memory measurement
+    /// When true, each benchmark is run a second time (after timing) to measure
+    /// heap usage per phase. The extra pass does not affect timing results.
+    bool measureMemory{true};
+    /// Sampling interval (µs) for the background peak-heap tracker. Smaller
+    /// values capture short-lived spikes but increase mallinfo2 lock contention.
+    size_t memorySampleIntervalMicros{1000};
 };
 
 } // namespace encodings::benchmark
