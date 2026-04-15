@@ -58,6 +58,13 @@ cmake --build .
 
 - C++23 compatible compiler (GCC 13+, Clang 16+, MSVC 19.36+)
 - CMake 3.28+
+- Zstd development package (`libzstd-dev` on Debian/Ubuntu)
+- LZ4 development package (`liblz4-dev` on Debian/Ubuntu)
+
+Optional notes:
+- OpenZL is expected at the configured path in `Source/encoders/CMakeLists.txt`.
+- LZ4 support currently uses standard fast mode; a high-compression variant (LZ4HC)
+    can be added as an additional codec.
 
 ## Project Structure
 

@@ -35,6 +35,7 @@ using encodings::encoders::selectors::costs::FORCostModel;
 using encodings::encoders::selectors::costs::DictionaryCostModel;
 using encodings::encoders::selectors::costs::RLECostModel;
 using encodings::encoders::selectors::costs::HuffmanCostModel;
+using encodings::encoders::selectors::costs::LZ4CostModel;
 
 namespace encodings::encoders {
 
@@ -533,6 +534,9 @@ inline std::shared_ptr<SubIntSplitEncoder<T>> makeSubIntSplitEncoderManual(
             case encodings::EncodingType::RunLengthEncoding:
                 cfg.codecs.push_back(detail_trisplit::makeRLESection<SectionT>(width));
                 break;
+            case encodings::EncodingType::LZ4:
+                cfg.codecs.push_back(detail_trisplit::makeLZ4Section<SectionT>(width));
+                break;
             default:
                 throw std::invalid_argument("makeSubIntSplitEncoderManual: unsupported encoding type");
         }
@@ -863,6 +867,9 @@ makeAutoSubIntSplitCostModelsFromTypes(const std::vector<encodings::EncodingType
                 break;
             case encodings::EncodingType::HuffmanEncoding:
                 models.emplace_back(std::make_unique<HuffmanCostModel>());
+                break;
+            case encodings::EncodingType::LZ4:
+                models.emplace_back(std::make_unique<LZ4CostModel>());
                 break;
             default:
                 throw std::invalid_argument("makeAutoSubIntSplitCostModelsFromTypes: unsupported encoding type for cost model");

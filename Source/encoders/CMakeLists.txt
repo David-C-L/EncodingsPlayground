@@ -30,6 +30,38 @@ if(NOT ZSTD_FOUND)
         endif()
     endif()
 endif()
+
+find_package(LZ4 QUIET)
+if(NOT LZ4_FOUND)
+    # Try pkg-config fallback (Debian/Ubuntu: liblz4-dev provides liblz4.pc)
+    find_package(PkgConfig QUIET)
+    if(PKG_CONFIG_FOUND)
+        pkg_check_modules(LZ4_PKG liblz4)
+        if(LZ4_PKG_FOUND)
+            message(STATUS "Found LZ4 via pkg-config: ${LZ4_PKG_VERSION}")
+            add_library(LZ4::lz4 INTERFACE IMPORTED)
+            set_target_properties(LZ4::lz4 PROPERTIES
+                INTERFACE_INCLUDE_DIRECTORIES "${LZ4_PKG_INCLUDE_DIRS}"
+                INTERFACE_LINK_LIBRARIES "${LZ4_PKG_LIBRARIES}")
+            set(LZ4_FOUND TRUE)
+        endif()
+    endif()
+endif()
+if(NOT LZ4_FOUND)
+    # Manual fallback
+    find_path(LZ4_INCLUDE_DIR lz4.h)
+    find_library(LZ4_LIBRARY NAMES lz4 liblz4)
+    if(LZ4_INCLUDE_DIR AND LZ4_LIBRARY)
+        message(STATUS "Found LZ4 manually: include=${LZ4_INCLUDE_DIR} lib=${LZ4_LIBRARY}")
+        add_library(LZ4::lz4 UNKNOWN IMPORTED)
+        set_target_properties(LZ4::lz4 PROPERTIES
+            IMPORTED_LOCATION "${LZ4_LIBRARY}"
+            INTERFACE_INCLUDE_DIRECTORIES "${LZ4_INCLUDE_DIR}")
+        set(LZ4_FOUND TRUE)
+    else()
+        message(FATAL_ERROR "Could not find LZ4. Install liblz4-dev or set CMAKE_PREFIX_PATH.")
+    endif()
+endif()
 if(NOT ZSTD_FOUND)
     # Try a manual search for headers and library if pkg-config/CMake config are not available
     find_path(ZSTD_INCLUDE_DIR zstd.h)
@@ -82,6 +114,7 @@ target_sources(encodings_encoders INTERFACE
         DeltaVarIntEncoder.hpp
         FOREncoder.hpp
         OpenZLEncoder.hpp
+        LZ4Encoder.hpp
 )
 
 target_include_directories(encodings_encoders INTERFACE
@@ -93,6 +126,7 @@ target_link_libraries(encodings_encoders INTERFACE
     encodings_core
     encodings_encodings
     ZSTD::libzstd
+    LZ4::lz4
     OpenZL::openzl
     unordered_dense
 )

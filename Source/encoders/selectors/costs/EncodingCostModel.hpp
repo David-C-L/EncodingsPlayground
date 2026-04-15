@@ -482,4 +482,54 @@ public:
 	}
 };
 
+// Cost model for LZ4 fast block compression.
+// Uses only existing metrics:
+// - entropyEstimate (FreqStats) as incompressibility signal
+// - avgRunLength (RunStats) as local-repeat signal
+// - range/bitWidth (MinMax) as spread signal
+//
+// This is intentionally conservative: for high-entropy data, cost stays near raw +
+// lightweight framing overhead; for repetitive/low-entropy data, projected ratio improves.
+class LZ4CostModel final : public EncodingCostModel {
+public:
+	static constexpr size_t kHeaderBytes = 24; // [N][uncompressedBytes][compressedBytes]
+
+	double computeCost(const SegmentMetrics& metrics, size_t numValues, size_t bitWidth) const override {
+		if (numValues == 0) return 0.0;
+
+		const double rawBits = static_cast<double>(numValues) *
+			static_cast<double>(storageWidthBits(static_cast<uint8_t>(bitWidth)));
+		const double headerBits = static_cast<double>(kHeaderBytes) * 8.0;
+
+		// Normalize signals into [0,1].
+		const double maxEntropy = std::max(1.0, static_cast<double>(bitWidth));
+		const double entropyNorm = std::clamp(metrics.entropyEstimate / maxEntropy, 0.0, 1.0);
+		const double repeatScore = std::clamp((metrics.avgRunLength - 1.0) / 16.0, 0.0, 1.0);
+		const double rangeNorm = (bitWidth == 0)
+			? 0.0
+			: std::clamp(static_cast<double>(std::bit_width(metrics.range)) / static_cast<double>(bitWidth), 0.0, 1.0);
+
+		// Lower is better (smaller compressed payload relative to raw).
+		double ratio = 0.99;
+		ratio -= 0.32 * (1.0 - entropyNorm); // low entropy helps
+		ratio -= 0.18 * repeatScore;         // longer runs help match-finding
+		ratio -= 0.10 * (1.0 - rangeNorm);   // tighter value spread tends to help
+
+		// Keep estimate conservative for selector stability.
+		ratio = std::clamp(ratio, 0.14, 1.03);
+
+		return headerBits + rawBits * ratio;
+	}
+
+	encodings::EncodingType encodingType() const override {
+		return encodings::EncodingType::LZ4;
+	}
+
+	MetricFlags requiredMetrics() const override {
+		return static_cast<MetricFlags>(MetricFlag::FreqStats)
+			| MetricFlag::RunStats
+			| MetricFlag::MinMax;
+	}
+};
+
 } // namespace encodings::encoders::selectors::costs

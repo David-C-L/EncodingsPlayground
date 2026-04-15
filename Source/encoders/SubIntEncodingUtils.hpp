@@ -19,6 +19,7 @@
 #include "encoders/RawEncoder.hpp"
 #include "encoders/RawBitPackedEncoder.hpp"
 #include "encoders/OpenZLEncoder.hpp"
+#include "encoders/LZ4Encoder.hpp"
 #include "encoders/AdaptiveFOREncoder.hpp"
 #include "encoders/AdaptiveFramedBitPrefixEncoder.hpp"
 #include "encoders/RunLengthEncoder.hpp"
@@ -325,6 +326,19 @@ inline std::shared_ptr<ISectionCodecIntegral<SectionCodecTIn>> makeHuffmanSectio
     }
 }
 
+template <typename SectionCodecTIn = uint64_t>
+inline std::shared_ptr<ISectionCodecIntegral<SectionCodecTIn>> makeLZ4Section(uint8_t bits) {
+    // LZ4 is block-compressed and effectively sequential; decodeAt/decodeRange
+    // fall back to decodeAll in the codec for benchmark API compatibility.
+    const uint8_t w = chooseTypeBits(bits);
+    switch (w) {
+        case 8:  return makeSectionCodecForBits<SectionCodecTIn>(std::make_shared<LZ4Encoder<uint8_t>>(), bits);
+        case 16: return makeSectionCodecForBits<SectionCodecTIn>(std::make_shared<LZ4Encoder<uint16_t>>(), bits);
+        case 32: return makeSectionCodecForBits<SectionCodecTIn>(std::make_shared<LZ4Encoder<uint32_t>>(), bits);
+        default: return makeSectionCodecForBits<SectionCodecTIn>(std::make_shared<LZ4Encoder<uint64_t>>(), bits);
+    }
+}
+
 template <size_t FrameSize = 512, typename SectionCodecTIn = uint64_t>
 inline std::shared_ptr<ISectionCodecIntegral<SectionCodecTIn>> makeFORSection(uint8_t bits,
                                                 FORReferencePolicy policy = FORReferencePolicy::MIN) {
@@ -467,6 +481,9 @@ inline SubIntSplitConfigIntegral<TIn> SubIntSplitConfigIntegral<TIn>::fromSegmen
                 break;
             case encodings::EncodingType::HuffmanEncoding:
                 cfg.codecs.push_back(detail_trisplit::makeHuffmanSection<TIn>(width));
+                break;
+            case encodings::EncodingType::LZ4:
+                cfg.codecs.push_back(detail_trisplit::makeLZ4Section<TIn>(width));
                 break;
             default:
                 throw std::invalid_argument("SubIntSplitConfigIntegral::fromSegments: unsupported encoding type for section");
