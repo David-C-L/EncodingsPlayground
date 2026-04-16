@@ -29,7 +29,7 @@ namespace encodings::encoders {
 ///
 /// Wire format:
 ///   [8 bytes]  numElements   (uint64_t)
-///   [2 bytes]  numSymbols    (uint16_t, ≤ 65535)
+///   [4 bytes]  numSymbols    (uint32_t)
 ///   [8 bytes]  payloadBits   (uint64_t — total bits in the payload section)
 ///   [numSymbols × (sizeof(T)+1)]  canonical symbol table
 ///              Each entry: sizeof(T) bytes for the symbol value, 1 byte for the
@@ -54,7 +54,7 @@ public:
     static constexpr size_t kMaxCodeBits = 24; // safety cap; never triggered in practice
 
     // Fixed header size before the variable-length symbol table.
-    static constexpr size_t kHeaderFixed = 8 + 2 + 8; // numElements + numSymbols + payloadBits
+    static constexpr size_t kHeaderFixed = 8 + 4 + 8; // numElements + numSymbols + payloadBits
 
     // -------------------------------------------------------------------------
     // Private types
@@ -272,7 +272,10 @@ private:
             br.consume(kMaxFastBits);
             uint8_t len = kMaxFastBits;
             while (len <= maxCodeLen) {
-                if (br.avail == 0) br.refill();
+                if (br.avail == 0) {
+                    br.refill();
+                    if (br.avail == 0) break;
+                }
                 code = (code << 1) | br.peek(1);
                 br.consume(1);
                 ++len;
@@ -346,9 +349,12 @@ public:
         // Write fixed header.
         uint8_t* h = out.data();
         const uint64_t ne = static_cast<uint64_t>(data.size());
-        const uint16_t ns = static_cast<uint16_t>(numSymbols);
+        if (numSymbols > static_cast<size_t>(std::numeric_limits<uint32_t>::max())) {
+            throw std::runtime_error("HuffmanEncoder: symbol count exceeds uint32_t wire limit");
+        }
+        const uint32_t ns = static_cast<uint32_t>(numSymbols);
         std::memcpy(h, &ne, 8);        h += 8;
-        std::memcpy(h, &ns, 2);        h += 2;
+        std::memcpy(h, &ns, 4);        h += 4;
         std::memcpy(h, &totalBits, 8); h += 8;
 
         // Write canonical symbol table (sorted by len ASC, sym ASC).
@@ -380,14 +386,19 @@ public:
         if (total < kHeaderFixed) return {};
 
         uint64_t numElements;
-        uint16_t numSymbols16;
+        uint32_t numSymbols32;
         uint64_t totalPayloadBits;
         std::memcpy(&numElements,     p, 8); p += 8;
-        std::memcpy(&numSymbols16,    p, 2); p += 2;
+        std::memcpy(&numSymbols32,    p, 4); p += 4;
         std::memcpy(&totalPayloadBits, p, 8); p += 8;
 
-        const size_t numSymbols = numSymbols16;
+        const size_t numSymbols = static_cast<size_t>(numSymbols32);
         if (numElements == 0 || numSymbols == 0) return {};
+
+        const size_t symTableBytes = numSymbols * (sizeof(T) + 1);
+        if (kHeaderFixed + symTableBytes > total) {
+            throw std::runtime_error("HuffmanEncoder::decodeAll: symbol table exceeds buffer");
+        }
 
         // Parse canonical symbol table and reconstruct codes.
         std::vector<EncEntry> entries;
@@ -420,7 +431,11 @@ public:
 
         // Decode bit stream.
         const uint8_t* payloadStart = p;
-        const uint8_t* payloadEnd   = encoded.data().data() + encoded.data().size();
+        const size_t payloadBytes = static_cast<size_t>((totalPayloadBits + 7) / 8);
+        if (static_cast<size_t>(encoded.data().data() + encoded.data().size() - payloadStart) < payloadBytes) {
+            throw std::runtime_error("HuffmanEncoder::decodeAll: payload exceeds buffer");
+        }
+        const uint8_t* payloadEnd   = payloadStart + payloadBytes;
         BitReader br{payloadStart, payloadEnd};
 
         std::vector<T> result;
