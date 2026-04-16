@@ -14,6 +14,9 @@
 #include "encodings/EncodingProperty.hpp"
 #include "encodings/EncodingType.hpp"
 #include "core/BitPacker.hpp"
+#ifdef __AVX2__
+#  include <immintrin.h>
+#endif
 
 namespace encodings::encoders {
 
@@ -129,11 +132,21 @@ public:
         }
 
         const size_t bitOffset = index * v.keyBitWidth;
-        encodings::core::BitReader reader(v.keysData, v.keysSize, encodings::core::BitOrder::LSB);
-        reader.seekToBit(bitOffset);
-        const uint32_t k = reader.read(v.keyBitWidth);
-        if (k >= v.dictSize) [[unlikely]] return std::nullopt;
-        return v.dict[k];
+        const size_t wordIdx   = bitOffset >> 6;
+        const uint32_t offset  = static_cast<uint32_t>(bitOffset & 63u);
+        uint64_t word;
+        std::memcpy(&word, v.keysData + wordIdx * sizeof(uint64_t), sizeof(uint64_t));
+        uint64_t key = word >> offset;
+        if (offset + v.keyBitWidth > 64u) {
+            uint64_t next;
+            std::memcpy(&next, v.keysData + (wordIdx + 1) * sizeof(uint64_t), sizeof(uint64_t));
+            key |= next << (64u - offset);
+        }
+        const uint64_t mask = (v.keyBitWidth >= 64u) ? ~uint64_t{0}
+                                                      : ((uint64_t{1} << v.keyBitWidth) - 1u);
+        key &= mask;
+        if (key >= v.dictSize) [[unlikely]] return std::nullopt;
+        return v.dict[key];
     }
 
     std::vector<T> decodeRange(const EncodedData& encoded, size_t start, size_t end) override {
@@ -141,26 +154,23 @@ public:
         if (v.dict == nullptr || start >= v.numElements) return {};
         end = std::min(end, v.numElements);
 
+        const size_t count = end - start;
+
         if (v.keyBitWidth == 32) {
-            std::vector<T> result;
-            result.reserve(end - start);
+            std::vector<T> result(count);
+            T* dst = result.data();
             const uint8_t* rangePtr = v.keysData + start * sizeof(uint32_t);
-            for (size_t i = 0; i < end - start; ++i) {
+            for (size_t i = 0; i < count; ++i) {
                 uint32_t key;
                 std::memcpy(&key, rangePtr + i * sizeof(uint32_t), sizeof(uint32_t));
-                result.push_back(v.dict[key]);
+                dst[i] = v.dict[key];
             }
             return result;
         }
 
-        std::vector<T> result;
-        result.reserve(end - start);
-        encodings::core::BitReader reader(v.keysData, v.keysSize, encodings::core::BitOrder::LSB);
-        reader.seekToBit(start * v.keyBitWidth);
-        for (size_t i = start; i < end; ++i) {
-            const uint32_t key = reader.read(v.keyBitWidth);
-            result.push_back(v.dict[key]);
-        }
+        std::vector<T> result(count);
+        decodeGeneral(v.keysData, v.dict, result.data(), count,
+                      v.keyBitWidth, start * v.keyBitWidth);
         return result;
     }
 
@@ -293,7 +303,10 @@ private:
         const size_t dictBytesSize = dictSize * getElementSize();
         const size_t keysBitsSize = numElements * static_cast<size_t>(keyBitWidth);
         const size_t keysBytesSize = (keysBitsSize + 7) / 8;
-        const size_t totalSize = kHeaderSize + dictBytesSize + keysBytesSize;
+        // Pad to 8-byte boundary so decodeGeneral/decodeBatch can safely load
+        // full uint64_t words at any position without reading past the buffer.
+        const size_t keysPaddedSize = keysBytesSize + 8;
+        const size_t totalSize = kHeaderSize + dictBytesSize + keysPaddedSize;
 
         EncodedData result;
         result.data().resize(totalSize);
@@ -323,14 +336,14 @@ private:
         }
         writer.flush();
 
-        // Copy packed keys
+        // Copy packed keys; the 8-byte pad after them is already zero (resize fills 0).
         std::memcpy(writePtr, keyBuffer.data(), keyBuffer.size());
 
         // Set metadata
         result.metadata().encodingName = name();
         result.metadata().dataType = this->dataType();
         result.metadata().elementCount = numElements;
-        result.metadata().compressedSize = totalSize;
+        result.metadata().compressedSize = kHeaderSize + dictBytesSize + keysBytesSize;
         result.metadata().uncompressedSize = numElements * sizeof(T);
         result.metadata().supportsRandomAccess = true;
         result.metadata().customMetadata["dict_size"] = std::to_string(dictSize);
@@ -391,17 +404,19 @@ private:
     std::vector<T> decodeBitPacked(const std::vector<T>& dictionary,
                                     const uint8_t* keysPtr,
                                     size_t numElements,
-                                    size_t keysBytesSize,
+                                    size_t /*keysBytesSize*/,
                                     uint32_t keyBitWidth) {
-        std::vector<T> result;
-        result.reserve(numElements);
-
-        encodings::core::BitReader reader(keysPtr, keysBytesSize, encodings::core::BitOrder::LSB);
-        for (size_t i = 0; i < numElements; ++i) {
-            const uint32_t key = reader.read(keyBitWidth);
-            result.push_back(dictionary[key]);
+        std::vector<T> result(numElements);
+        T* dst = result.data();
+        const T* dict = dictionary.data();
+        switch (keyBitWidth) {
+            case  1: decodeBatch< 1>(keysPtr, dict, dst, numElements); break;
+            case  2: decodeBatch< 2>(keysPtr, dict, dst, numElements); break;
+            case  4: decodeBatch< 4>(keysPtr, dict, dst, numElements); break;
+            case  8: decodeBatch< 8>(keysPtr, dict, dst, numElements); break;
+            case 16: decodeBatch<16>(keysPtr, dict, dst, numElements); break;
+            default: decodeGeneral(keysPtr, dict, dst, numElements, keyBitWidth, 0); break;
         }
-
         return result;
     }
 
@@ -415,26 +430,6 @@ private:
         for (size_t i = 0; i < numElements; ++i) {
             KeyType key;
             std::memcpy(&key, keysPtr + i * sizeof(KeyType), sizeof(KeyType));
-            result.push_back(dictionary[key]);
-        }
-
-        return result;
-    }
-
-    std::vector<T> decodeRangeBitPacked(const std::vector<T>& dictionary,
-                                         const uint8_t* keysPtr,
-                                         size_t keysBytesSize,
-                                         size_t start,
-                                         size_t end,
-                                         uint32_t keyBitWidth) {
-        std::vector<T> result;
-        result.reserve(end - start);
-
-        encodings::core::BitReader reader(keysPtr, keysBytesSize, encodings::core::BitOrder::LSB);
-        reader.seekToBit(start * keyBitWidth);
-
-        for (size_t i = start; i < end; ++i) {
-            const uint32_t key = reader.read(keyBitWidth);
             result.push_back(dictionary[key]);
         }
 
@@ -458,6 +453,120 @@ private:
         }
 
         return result;
+    }
+
+    // -----------------------------------------------------------------------
+    // decodeGeneral — handles any key bit-width, starting at an arbitrary
+    // bit offset within the packed key stream.
+    //
+    // Loads one or two uint64_t words per element via unaligned memcpy and
+    // extracts the key using shift+mask, matching the LSB-first layout
+    // written by BitWriter.  The buffer must have at least 8 bytes of padding
+    // beyond the logical key data (guaranteed by encodeBitPacked).
+    // -----------------------------------------------------------------------
+    static void decodeGeneral(const uint8_t* __restrict__ keys,
+                               const T*       __restrict__ dict,
+                               T*             __restrict__ dst,
+                               size_t n,
+                               uint32_t keyBitWidth,
+                               size_t   startBit) {
+        const uint64_t mask = (keyBitWidth >= 64u)
+                              ? ~uint64_t{0}
+                              : ((uint64_t{1} << keyBitWidth) - 1u);
+        size_t bitPos = startBit;
+        for (size_t i = 0; i < n; ++i, bitPos += keyBitWidth) {
+            const size_t   wordIdx = bitPos >> 6;
+            const uint32_t offset  = static_cast<uint32_t>(bitPos & 63u);
+            uint64_t word;
+            std::memcpy(&word, keys + wordIdx * sizeof(uint64_t), sizeof(uint64_t));
+            uint64_t key = word >> offset;
+            if (offset + keyBitWidth > 64u) {
+                uint64_t next;
+                std::memcpy(&next, keys + (wordIdx + 1) * sizeof(uint64_t), sizeof(uint64_t));
+                key |= next << (64u - offset);
+            }
+            dst[i] = dict[key & mask];
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // decodeBatch<W> — optimised decoder for power-of-two key widths.
+    //
+    // Scalar path: loads one uint64_t per 64/W keys, shifts out W bits at a
+    // time.  The inner loop body is shift + mask + table-lookup + store —
+    // about 4 instructions vs. ~15 for the BitReader state machine.
+    //
+    // AVX2 path (T=uint8_t, W=4): broadcasts the 16-entry dictionary into
+    // both YMM lanes and uses _mm256_shuffle_epi8 to perform 32 dictionary
+    // lookups per iteration from 16 bytes of packed nibble keys.
+    // -----------------------------------------------------------------------
+    template <uint32_t W>
+    static void decodeBatch(const uint8_t* __restrict__ keys,
+                             const T*       __restrict__ dict,
+                             T*             __restrict__ dst,
+                             size_t n) {
+        static_assert(64u % W == 0, "W must divide 64");
+        constexpr uint32_t kPerWord = 64u / W;
+        constexpr uint64_t kMask    = (W == 64u) ? ~uint64_t{0}
+                                                  : ((uint64_t{1} << W) - 1u);
+
+#ifdef __AVX2__
+        if constexpr (std::is_same_v<T, uint8_t> && W == 4) {
+            // 32 lookups per iteration: load 16 bytes = 32 nibbles, interleave
+            // into index order, then _mm256_shuffle_epi8 does the dict lookup.
+            size_t i = 0;
+            if (n >= 32) {
+                const __m128i dict_xmm = _mm_loadu_si128(
+                    reinterpret_cast<const __m128i*>(dict));
+                const __m256i dict_ymm = _mm256_broadcastsi128_si256(dict_xmm);
+                for (; i + 32 <= n; i += 32) {
+                    // 16 input bytes → low nibbles [lo0..lo15] and high nibbles [hi0..hi15]
+                    const __m128i raw = _mm_loadu_si128(
+                        reinterpret_cast<const __m128i*>(keys + i / 2));
+                    const __m128i lo = _mm_and_si128(raw, _mm_set1_epi8(0x0F));
+                    const __m128i hi = _mm_and_si128(
+                        _mm_srli_epi16(raw, 4), _mm_set1_epi8(0x0F));
+                    // Interleave: elements 0-15 → lower lane, 16-31 → upper lane
+                    const __m256i idx = _mm256_set_m128i(
+                        _mm_unpackhi_epi8(lo, hi),   // elements 16-31
+                        _mm_unpacklo_epi8(lo, hi));  // elements  0-15
+                    _mm256_storeu_si256(
+                        reinterpret_cast<__m256i*>(dst + i),
+                        _mm256_shuffle_epi8(dict_ymm, idx));
+                }
+            }
+            // Scalar tail
+            size_t bitPos = i * W;
+            for (; i < n; ++i, bitPos += W) {
+                const size_t wordIdx = bitPos >> 6;
+                uint64_t word;
+                std::memcpy(&word, keys + wordIdx * sizeof(uint64_t), sizeof(uint64_t));
+                dst[i] = dict[(word >> (bitPos & 63u)) & kMask];
+            }
+            return;
+        }
+#endif
+
+        // Scalar path — one uint64_t load per kPerWord elements.
+        const size_t fullWords = n / kPerWord;
+        for (size_t w = 0; w < fullWords; ++w) {
+            uint64_t word;
+            std::memcpy(&word, keys + w * sizeof(uint64_t), sizeof(uint64_t));
+            T* dw = dst + w * kPerWord;
+            for (uint32_t j = 0; j < kPerWord; ++j, word >>= W) {
+                dw[j] = dict[word & kMask];
+            }
+        }
+        // Remainder (< kPerWord elements in the last partial word)
+        const size_t rem = n % kPerWord;
+        if (rem > 0) {
+            uint64_t word;
+            std::memcpy(&word, keys + fullWords * sizeof(uint64_t), sizeof(uint64_t));
+            T* dw = dst + fullWords * kPerWord;
+            for (size_t j = 0; j < rem; ++j, word >>= W) {
+                dw[j] = dict[word & kMask];
+            }
+        }
     }
 
     size_t getElementSize() const {
