@@ -87,8 +87,7 @@ public:
 		}
 
 		const uint8_t* payload = encoded.data().data() + headerSize();
-		const size_t wordCount = payloadWordCount(count, bitWidth);
-		return unpackValues(payload, wordCount, count, bitWidth, base);
+		return unpackValues(payload, count, bitWidth, base);
 	}
 
 	std::optional<T> decodeAt(const EncodedData& encoded, size_t index) override {
@@ -135,22 +134,13 @@ public:
 		}
 
 		const uint8_t* payload = encoded.data().data() + headerSize();
-		const size_t wordCount = payloadWordCount(count, bitWidth);
-
-		std::vector<uint64_t> words(wordCount);
-		std::memcpy(words.data(), payload, wordCount * sizeof(uint64_t));
-
-		std::vector<T> out;
-		out.reserve(outCount);
-
+		std::vector<T> out(outCount);
+		T* dst = out.data();
 		size_t bitPos = static_cast<size_t>(bitWidth) * start;
 		const uint64_t mask = bitMask(bitWidth);
-
-		for (size_t i = 0; i < outCount; ++i) {
-			out.push_back(addBase(extractAt(words.data(), bitPos, bitWidth, mask), base));
-			bitPos += bitWidth;
+		for (size_t i = 0; i < outCount; ++i, bitPos += bitWidth) {
+			dst[i] = addBase(extractAt(payload, bitPos, bitWidth, mask), base);
 		}
-
 		return out;
 	}
 
@@ -287,6 +277,23 @@ private:
 		return w;
 	}
 
+	// Overload that reads directly from the raw byte payload via unaligned loads
+	// (memcpy-based, compiles to a single movq on x86-64). Allows callers to skip
+	// copying the payload into an intermediate uint64_t[] buffer.
+	static uint64_t extractAt(const uint8_t* payload, size_t bitPos, uint8_t bitWidth, uint64_t mask) {
+		if (bitWidth == 64) {
+			return loadWord(payload, bitPos >> 6);
+		}
+		const size_t wordIdx = bitPos >> 6;
+		const uint32_t offset = static_cast<uint32_t>(bitPos & 63u);
+		uint64_t value = loadWord(payload, wordIdx) >> offset;
+		const uint32_t spill = offset + bitWidth;
+		if (spill > 64) {
+			value |= loadWord(payload, wordIdx + 1) << (64 - offset);
+		}
+		return value & mask;
+	}
+
 	static uint64_t extractValue(const uint8_t* payload, uint8_t bitWidth, size_t index) {
 		const size_t bitPos = static_cast<size_t>(bitWidth) * index;
 		const uint64_t mask = bitMask(bitWidth);
@@ -306,20 +313,17 @@ private:
 		return value & mask;
 	}
 
-	static std::vector<T> unpackValues(const uint8_t* payload, size_t wordCount, size_t count, uint8_t bitWidth, T base) {
-		std::vector<uint64_t> words(wordCount);
-		std::memcpy(words.data(), payload, wordCount * sizeof(uint64_t));
-
-		std::vector<T> out;
-		out.reserve(count);
-
+	static std::vector<T> unpackValues(const uint8_t* payload, size_t count, uint8_t bitWidth, T base) {
+		// Read directly from the encoded byte payload via unaligned loads — no
+		// intermediate uint64_t[] copy needed. Pre-size output and write by index
+		// to eliminate push_back bookkeeping and enable auto-vectorisation.
+		std::vector<T> out(count);
+		T* dst = out.data();
 		const uint64_t mask = bitMask(bitWidth);
 		size_t bitPos = 0;
-		for (size_t i = 0; i < count; ++i) {
-			out.push_back(addBase(extractAt(words.data(), bitPos, bitWidth, mask), base));
-			bitPos += bitWidth;
+		for (size_t i = 0; i < count; ++i, bitPos += bitWidth) {
+			dst[i] = addBase(extractAt(payload, bitPos, bitWidth, mask), base);
 		}
-
 		return out;
 	}
 
