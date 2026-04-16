@@ -448,12 +448,12 @@ public:
 };
 
 // Cost model for canonical Huffman entropy coding (sequential decode only).
-// Wire format: 18-byte fixed header + numSymbols*(sizeof(T)+1) symbol table + payload.
+// Wire format: 20-byte fixed header + numSymbols*(sizeof(T)+1) symbol table + payload.
 // Cost estimate: header + symbol-table bytes + entropy * N bits for payload.
 class HuffmanCostModel final : public EncodingCostModel {
 public:
-	// Fixed header: 8 (numElements) + 2 (numSymbols) + 8 (payloadBits) = 18 bytes.
-	static constexpr size_t kHeaderFixed = 18;
+	// Fixed header: 8 (numElements) + 4 (numSymbols) + 8 (payloadBits) = 20 bytes.
+	static constexpr size_t kHeaderFixed = 20;
 
 	double computeCost(const SegmentMetrics& metrics, size_t numValues, size_t bitWidth) const override {
 		if (numValues == 0) return 0.0;
