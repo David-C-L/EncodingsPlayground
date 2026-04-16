@@ -153,22 +153,20 @@ public:
         if (h.N == 0) return {};
 
         const size_t splits = h.bits.size();
-        std::vector<std::vector<SectionT>> sections(splits);
-        for (size_t s = 0; s < splits; ++s) {
-            sections[s] = cfg_.codecs[s]->decodeAll(h.views[s]);
-            if (sections[s].size() != h.N) {
-                throw std::runtime_error("SubIntSplitEncoder::decodeAll: section size mismatch");
-            }
-        }
 
-        // Accumulate into an uninitialised buffer: section 0 uses assignSectionInto
-        // (pure store) so no zero-init is needed, saving the memset of h.N*sizeof(SectionT)
-        // bytes that vector<SectionT>(h.N, 0) would perform before being overwritten.
+        // Decode each section directly into a single reused temp buffer, then
+        // assign/OR-shift into acc.  This replaces splits separate vector<SectionT>
+        // allocations with one shared buffer, reducing peak working set from
+        // (splits+1)*N*sizeof(SectionT) to 2*N*sizeof(SectionT).
         auto accRaw = std::make_unique_for_overwrite<SectionT[]>(h.N);
         SectionT* acc = accRaw.get();
-        assignSectionInto(sections[0].data(), acc, h.N, h.shifts[0]);
-        for (size_t s = 1; s < splits; ++s) {
-            combineSectionInto(sections[s].data(), acc, h.N, h.shifts[s]);
+        auto tmpRaw = std::make_unique_for_overwrite<SectionT[]>(h.N);
+        SectionT* tmp = tmpRaw.get();
+
+        for (size_t s = 0; s < splits; ++s) {
+            cfg_.codecs[s]->decodeAllInto(h.views[s], tmp, h.N);
+            if (s == 0) assignSectionInto(tmp, acc, h.N, h.shifts[0]);
+            else        combineSectionInto(tmp, acc, h.N, h.shifts[s]);
         }
 
         // Bit-cast the unsigned accumulator to the signed output type (same width).
@@ -198,21 +196,16 @@ public:
         const size_t count = end - start;
 
         const size_t splits = h.bits.size();
-        std::vector<std::vector<SectionT>> sections(splits);
-        for (size_t s = 0; s < splits; ++s) {
-            sections[s] = decodeSectionRange(*cfg_.codecs[s], h.views[s], start, end);
-            if (sections[s].size() != count) {
-                throw std::runtime_error("SubIntSplitEncoder::decodeRange: section size mismatch");
-            }
-        }
 
-        // Column-major combine, same optimisation as decodeAll: uninitialised
-        // accumulator with assign for section 0, OR-shift for the rest.
         auto accRaw = std::make_unique_for_overwrite<SectionT[]>(count);
         SectionT* acc = accRaw.get();
-        assignSectionInto(sections[0].data(), acc, count, h.shifts[0]);
-        for (size_t s = 1; s < splits; ++s) {
-            combineSectionInto(sections[s].data(), acc, count, h.shifts[s]);
+        auto tmpRaw = std::make_unique_for_overwrite<SectionT[]>(count);
+        SectionT* tmp = tmpRaw.get();
+
+        for (size_t s = 0; s < splits; ++s) {
+            cfg_.codecs[s]->decodeRangeInto(h.views[s], start, end, tmp, count);
+            if (s == 0) assignSectionInto(tmp, acc, count, h.shifts[0]);
+            else        combineSectionInto(tmp, acc, count, h.shifts[s]);
         }
 
         std::vector<T> out(count);
@@ -383,16 +376,6 @@ private:
         auto all = c.decodeAll(view);
         if (idx >= all.size()) throw std::runtime_error("SubIntSplitEncoder::decodeAt: index out of range");
         return all[idx];
-    }
-
-    static std::vector<SectionT> decodeSectionRange(ISectionCodecIntegral<SectionT>& c, const EncodedBuffer<uint8_t>& view, size_t start, size_t end) {
-        if (c.properties().has(EncodingProperty::RandomAccess)) {
-            return c.decodeRange(view, start, end);
-        }
-        auto all = c.decodeAll(view);
-        if (start > all.size()) return {};
-        end = std::min(end, all.size());
-        return std::vector<SectionT>(all.begin() + static_cast<ptrdiff_t>(start), all.begin() + static_cast<ptrdiff_t>(end));
     }
 
     // Initialise an uninitialised accumulator from section 0: stores src[i] << shift

@@ -44,6 +44,15 @@ public:
     virtual std::vector<TIn> decodeAll(const EncodedBuffer<uint8_t>& enc) = 0;
     virtual std::optional<TIn> decodeAt(const EncodedBuffer<uint8_t>& enc, size_t idx) = 0;
     virtual std::vector<TIn> decodeRange(const EncodedBuffer<uint8_t>& enc, size_t start, size_t end) = 0;
+
+    // Decode directly into a caller-supplied buffer, eliminating the intermediate
+    // vector allocation that decodeAll / decodeRange would otherwise return.
+    // Implementations must write exactly n elements; a size mismatch is a hard error.
+    virtual void decodeAllInto(const EncodedBuffer<uint8_t>& enc, TIn* dst, size_t n) = 0;
+    virtual void decodeRangeInto(const EncodedBuffer<uint8_t>& enc,
+                                  size_t start, size_t end,
+                                  TIn* dst, size_t n) = 0;
+
     virtual EncodingProperties properties() const = 0;
     virtual std::string name() const = 0;
 };
@@ -135,16 +144,12 @@ public:
 
     std::vector<SectionCodecTIn> decodeAll(const EncodedBuffer<uint8_t>& enc) override {
         auto vals = impl_->decodeAll(enc);
-        std::vector<SectionCodecTIn> widened(vals.size());
-        if constexpr (sizeof(T) == sizeof(SectionCodecTIn)) {
-            static_assert(std::is_trivially_copyable_v<T> && std::is_trivially_copyable_v<SectionCodecTIn>,
-                          "Types must be trivially copyable for memcpy optimization");
-            static_assert(std::is_integral_v<T> && std::is_integral_v<SectionCodecTIn>,
-                          "Types must be integral for memcpy optimization");
-            std::memcpy(widened.data(), vals.data(), vals.size() * sizeof(T));
-            return widened;
-        }
-        std::transform(vals.begin(), vals.end(), widened.begin(), [](T v) { return static_cast<SectionCodecTIn>(v); });
+        // reserve+push_back writes each element exactly once with no preceding
+        // zero-init pass — vector(n) would memset n*sizeof(SectionCodecTIn) bytes
+        // that are immediately overwritten by the cast/copy loop.
+        std::vector<SectionCodecTIn> widened;
+        widened.reserve(vals.size());
+        for (const T v : vals) widened.push_back(static_cast<SectionCodecTIn>(v));
         return widened;
     }
 
@@ -156,17 +161,39 @@ public:
 
     std::vector<SectionCodecTIn> decodeRange(const EncodedBuffer<uint8_t>& enc, size_t start, size_t end) override {
         auto vals = impl_->decodeRange(enc, start, end);
-        std::vector<SectionCodecTIn> widened(vals.size());
-        if constexpr (sizeof(T) == sizeof(SectionCodecTIn)) {
-            static_assert(std::is_trivially_copyable_v<T> && std::is_trivially_copyable_v<SectionCodecTIn>,
-                          "Types must be trivially copyable for memcpy optimization");
-            static_assert(std::is_integral_v<T> && std::is_integral_v<SectionCodecTIn>,
-                          "Types must be integral for memcpy optimization");
-            std::memcpy(widened.data(), vals.data(), vals.size() * sizeof(T));
-            return widened;
-        }
-        std::transform(vals.begin(), vals.end(), widened.begin(), [](T v) { return static_cast<SectionCodecTIn>(v); });
+        // Same as decodeAll: avoid the zero-init of vector(n) that would be
+        // immediately overwritten.
+        std::vector<SectionCodecTIn> widened;
+        widened.reserve(vals.size());
+        for (const T v : vals) widened.push_back(static_cast<SectionCodecTIn>(v));
         return widened;
+    }
+
+    void decodeAllInto(const EncodedBuffer<uint8_t>& enc,
+                        SectionCodecTIn* dst, size_t n) override {
+        auto vals = impl_->decodeAll(enc);
+        if (vals.size() != n) [[unlikely]]
+            throw std::runtime_error("TypedSectionCodecAdapter::decodeAllInto: size mismatch");
+        if constexpr (sizeof(T) == sizeof(SectionCodecTIn)) {
+            std::memcpy(dst, vals.data(), n * sizeof(T));
+        } else {
+            for (size_t i = 0; i < n; ++i)
+                dst[i] = static_cast<SectionCodecTIn>(vals[i]);
+        }
+    }
+
+    void decodeRangeInto(const EncodedBuffer<uint8_t>& enc,
+                          size_t start, size_t end,
+                          SectionCodecTIn* dst, size_t n) override {
+        auto vals = impl_->decodeRange(enc, start, end);
+        if (vals.size() != n) [[unlikely]]
+            throw std::runtime_error("TypedSectionCodecAdapter::decodeRangeInto: size mismatch");
+        if constexpr (sizeof(T) == sizeof(SectionCodecTIn)) {
+            std::memcpy(dst, vals.data(), n * sizeof(T));
+        } else {
+            for (size_t i = 0; i < n; ++i)
+                dst[i] = static_cast<SectionCodecTIn>(vals[i]);
+        }
     }
 
     EncodingProperties properties() const override { return impl_->properties(); }
