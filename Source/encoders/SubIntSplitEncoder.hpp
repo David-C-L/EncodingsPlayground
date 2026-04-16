@@ -161,17 +161,19 @@ public:
             }
         }
 
-        // Column-major combine: for each section, OR-shift its values into the output
-        // buffer with a fixed shift. The inner loop is SIMD-friendly (constant shift,
-        // no per-element allocation, sequential memory access).
-        std::vector<SectionT> acc(h.N, SectionT{0});
-        for (size_t s = 0; s < splits; ++s) {
-            combineSectionInto(sections[s].data(), acc.data(), h.N, h.shifts[s]);
+        // Accumulate into an uninitialised buffer: section 0 uses assignSectionInto
+        // (pure store) so no zero-init is needed, saving the memset of h.N*sizeof(SectionT)
+        // bytes that vector<SectionT>(h.N, 0) would perform before being overwritten.
+        auto accRaw = std::make_unique_for_overwrite<SectionT[]>(h.N);
+        SectionT* acc = accRaw.get();
+        assignSectionInto(sections[0].data(), acc, h.N, h.shifts[0]);
+        for (size_t s = 1; s < splits; ++s) {
+            combineSectionInto(sections[s].data(), acc, h.N, h.shifts[s]);
         }
 
         // Bit-cast the unsigned accumulator to the signed output type (same width).
         std::vector<T> out(h.N);
-        std::memcpy(out.data(), acc.data(), h.N * sizeof(T));
+        std::memcpy(out.data(), acc, h.N * sizeof(T));
         return out;
     }
 
@@ -204,14 +206,17 @@ public:
             }
         }
 
-        // Column-major combine, same as decodeAll.
-        std::vector<SectionT> acc(count, SectionT{0});
-        for (size_t s = 0; s < splits; ++s) {
-            combineSectionInto(sections[s].data(), acc.data(), count, h.shifts[s]);
+        // Column-major combine, same optimisation as decodeAll: uninitialised
+        // accumulator with assign for section 0, OR-shift for the rest.
+        auto accRaw = std::make_unique_for_overwrite<SectionT[]>(count);
+        SectionT* acc = accRaw.get();
+        assignSectionInto(sections[0].data(), acc, count, h.shifts[0]);
+        for (size_t s = 1; s < splits; ++s) {
+            combineSectionInto(sections[s].data(), acc, count, h.shifts[s]);
         }
 
         std::vector<T> out(count);
-        std::memcpy(out.data(), acc.data(), count * sizeof(T));
+        std::memcpy(out.data(), acc, count * sizeof(T));
         return out;
     }
 
@@ -388,6 +393,42 @@ private:
         if (start > all.size()) return {};
         end = std::min(end, all.size());
         return std::vector<SectionT>(all.begin() + static_cast<ptrdiff_t>(start), all.begin() + static_cast<ptrdiff_t>(end));
+    }
+
+    // Initialise an uninitialised accumulator from section 0: stores src[i] << shift
+    // into dst[i] with no read of dst (pure store, no OR). Required when the
+    // accumulator was allocated with make_unique_for_overwrite.
+    // shift == 0 fast-paths to memcpy (always true for LSB_TO_MSB section 0).
+    static void assignSectionInto(const SectionT* __restrict__ src,
+                                   SectionT* __restrict__ dst,
+                                   size_t N, uint8_t shift) {
+        if (shift == 0) {
+            std::memcpy(dst, src, N * sizeof(SectionT));
+            return;
+        }
+#ifdef __AVX2__
+        if constexpr (sizeof(SectionT) == 8) {
+            const __m128i vshift = _mm_cvtsi64_si128(static_cast<int64_t>(shift));
+            size_t i = 0;
+            for (; i + 4 <= N; i += 4) {
+                __m256i vs = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + i));
+                vs = _mm256_sll_epi64(vs, vshift);
+                _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + i), vs);
+            }
+            for (; i < N; ++i) dst[i] = src[i] << shift;
+        } else {
+            const __m128i vshift = _mm_cvtsi32_si128(static_cast<int32_t>(shift));
+            size_t i = 0;
+            for (; i + 8 <= N; i += 8) {
+                __m256i vs = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + i));
+                vs = _mm256_sll_epi32(vs, vshift);
+                _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + i), vs);
+            }
+            for (; i < N; ++i) dst[i] = src[i] << shift;
+        }
+#else
+        for (size_t i = 0; i < N; ++i) dst[i] = src[i] << shift;
+#endif
     }
 
     // Column-major combine kernel: OR src[i] << shift into dst[i] for all i.
