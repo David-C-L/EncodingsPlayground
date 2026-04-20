@@ -29,7 +29,9 @@ namespace encodings {
         AdaptiveFrameOfReference, // Adaptive frame-of-reference: dynamic per-frame ref selection and residual width
         OpenZL,           // OpenZL external codec
         HuffmanEncoding,  // Canonical Huffman entropy coding (sequential decode only)
-        LZ4               // LZ4 block compression (fast mode)
+        LZ4,              // LZ4 block compression (fast mode)
+        FSEEncoding,      // Finite State Entropy (tANS) entropy coding (sequential decode only)
+        FrequencyPartitionEncoding // Frequency-partitioned fixed-width keys with per-tier bitmaps
     };
 
     /** Convert EncodingType enum to human-readable string */
@@ -53,6 +55,8 @@ namespace encodings {
             case EncodingType::OpenZL:                   return "OpenZL";
             case EncodingType::HuffmanEncoding:          return "HuffmanEncoding";
             case EncodingType::LZ4:                      return "LZ4";
+            case EncodingType::FSEEncoding:              return "FSEEncoding";
+            case EncodingType::FrequencyPartitionEncoding: return "FrequencyPartitionEncoding";
         }
         return "Unknown";
     }
