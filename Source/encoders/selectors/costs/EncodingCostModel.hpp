@@ -532,4 +532,122 @@ public:
 	}
 };
 
+// Cost model for Finite State Entropy (tANS) entropy coding (sequential decode only).
+// Wire format: 17-byte fixed header + numSymbols*(sizeof(T)+2) symbol table + payload.
+// FSE achieves essentially the same entropy limit as Huffman, so cost estimates are
+// very similar; the header is slightly larger (stores uint16_t normFreqs instead of
+// uint8_t code lengths), but FSE avoids the power-of-2 code-length rounding loss on
+// skewed distributions, giving a small advantage at high compression ratios.
+class FSECostModel final : public EncodingCostModel {
+public:
+    // Fixed header: numElements(8) + tableLog(1) + numSymbols(4) + initState(4) = 17 bytes.
+    static constexpr size_t kHeaderFixed = 17;
+
+    double computeCost(const SegmentMetrics& metrics, size_t numValues, size_t bitWidth) const override {
+        if (numValues == 0) return 0.0;
+
+        // Symbol-table entry: sizeof(T) + 2 bytes (sym + uint16_t normFreq).
+        const size_t storageBytes = static_cast<size_t>(storageWidthBits(static_cast<uint8_t>(bitWidth))) / 8;
+        const size_t numSymbols   = metrics.uniqueCountCapped
+            ? MetricCollector<uint64_t>::kUniqueCountCap
+            : metrics.uniqueCount;
+
+		// Keep a "reasonable" FSE regime up to 65,536 symbols.
+		// Above that, allow benchmarking but heavily penalize the model so the
+		// selector strongly prefers alternatives unless no better option exists.
+		constexpr size_t kReasonableFSESymbols = 1u << 16; // 65,536
+		constexpr size_t kImplMaxFSESymbols    = 1u << 20; // kMaxTableLog = 20
+
+		const double headerBits   = static_cast<double>(kHeaderFixed) * 8.0;
+		const double symTableBits = static_cast<double>(numSymbols) *
+									static_cast<double>(storageBytes + 2) * 8.0;
+		const double rawBits      = static_cast<double>(numValues) * static_cast<double>(bitWidth);
+        // FSE achieves ~entropy bits/symbol on the payload (same limit as Huffman).
+        const double payloadBits  = metrics.entropyEstimate * static_cast<double>(numValues);
+
+		if (numSymbols > kImplMaxFSESymbols) {
+			return rawBits * 16.0;
+		}
+
+		if (numSymbols > kReasonableFSESymbols) {
+			const double over =
+				static_cast<double>(numSymbols - kReasonableFSESymbols)
+				/ static_cast<double>(kReasonableFSESymbols);
+			const double multiplier = 1.0 + 12.0 * over * over;
+			return (headerBits + symTableBits + payloadBits) * multiplier;
+		}
+
+        return headerBits + symTableBits + payloadBits;
+    }
+
+    encodings::EncodingType encodingType() const override {
+        return encodings::EncodingType::FSEEncoding;
+    }
+
+    MetricFlags requiredMetrics() const override {
+        return static_cast<MetricFlags>(MetricFlag::FreqStats);
+    }
+};
+
+// Cost model for FrequencyPartitionEncoding.
+// Active tiers: key widths {1,2,4,8,16,32} where keyBits < storageTypeBits/2.
+// Cost = header + dict storage + per-tier bitmaps + key payload + fallback raw storage.
+class FrequencyPartitionCostModel final : public EncodingCostModel {
+public:
+    double computeCost(const SegmentMetrics& metrics, size_t numValues, size_t bitWidth) const override {
+        if (numValues == 0) return 0.0;
+
+        const size_t storageTypeBits = storageWidthBits(static_cast<uint8_t>(bitWidth));
+        const size_t maxKeyBits = storageTypeBits / 2;
+
+        static constexpr uint8_t kAllTierBits[] = {1, 2, 4, 8, 16, 32};
+
+        size_t totalCapacity = 0;
+        size_t numTiers      = 0;
+        size_t lastTierBits  = 0;
+        for (const uint8_t kb : kAllTierBits) {
+            if (kb >= maxKeyBits) break;
+            totalCapacity += (size_t{1} << kb);
+            ++numTiers;
+            lastTierBits = kb;
+        }
+
+        if (numTiers == 0) return static_cast<double>(numValues * bitWidth);
+
+        const size_t uniqueEst = metrics.uniqueCountCapped
+            ? static_cast<size_t>(size_t{1} << std::min(bitWidth, size_t{20}))
+            : metrics.uniqueCount;
+
+        // Covered fraction: capped at 1.0. For uint64_t the 32-bit tier has ~4B capacity
+        // so virtually all practical datasets are fully covered.
+        const double coveredFraction = (uniqueEst == 0 || uniqueEst <= totalCapacity)
+            ? 1.0
+            : static_cast<double>(totalCapacity) / static_cast<double>(uniqueEst);
+
+        // Average key bits bounded by entropy and the widest active tier.
+        const double avgKeyBits = std::min(metrics.entropyEstimate,
+                                           static_cast<double>(lastTierBits));
+
+        const double storageBits = static_cast<double>(storageTypeBits);
+        // Dict overhead capped at uniqueEst to avoid inflating cost for large-capacity tiers.
+        const double coveredUniqueEst = std::min(static_cast<double>(totalCapacity),
+                                                  static_cast<double>(uniqueEst));
+        const double dictBits       = coveredUniqueEst * storageBits;
+        const double bitmapBits     = static_cast<double>(numTiers * numValues);
+        const double keyPayloadBits = static_cast<double>(numValues) * coveredFraction * avgKeyBits;
+        const double fallbackBits   = static_cast<double>(numValues) * (1.0 - coveredFraction) * storageBits;
+        constexpr double headerBits = (8 + 1 + 4) * 8.0;
+
+        return headerBits + dictBits + bitmapBits + keyPayloadBits + fallbackBits;
+    }
+
+    MetricFlags requiredMetrics() const override {
+        return static_cast<MetricFlags>(MetricFlag::FreqStats);
+    }
+
+    encodings::EncodingType encodingType() const override {
+        return encodings::EncodingType::FrequencyPartitionEncoding;
+    }
+};
+
 } // namespace encodings::encoders::selectors::costs
