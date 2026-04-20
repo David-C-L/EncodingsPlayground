@@ -18,6 +18,7 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 import matplotlib.cm as cm
 import matplotlib.lines as mlines
+import matplotlib.patches as mpatches
 import numpy as np
 from pathlib import Path
 import argparse
@@ -136,29 +137,42 @@ def _grouped_encoder_order(encoders: Iterable[str], rules: List[GroupRule]) -> L
 
 def _grouped_encoder_colours(encoders: Iterable[str], rules: List[GroupRule]) -> dict:
     grouped = _group_encoders(encoders, rules)
-    group_count = max(len(grouped), 1)
-    cmap = cm.get_cmap('tab10', group_count)
+
+    # Use deliberately separated base hues per group to improve distinction
+    # between the darkest shades of each gradient.
+    preferred_group_hues = {
+        'AutoSubIntSplit': 0.58,  # blue-cyan
+        'Raw':             0.00,  # red
+        'SubInt':          0.30,  # green
+        'TriSplit':        0.78,  # violet
+        'OpenZL':          0.12,  # amber
+        'VarInt':          0.92,  # magenta-red
+        'Other':           0.52,  # fallback teal-ish
+    }
+
+    # Additional hues for unforeseen groups, spaced by golden angle.
+    golden_angle = 0.61803398875
     colours = {}
-    for idx, (_, encs) in enumerate(grouped):
-        group_name = grouped[idx][0]
-        if group_name == 'VarInt':
-            base = (1.0, 0.55, 0.0, 1.0)  # orange
-        else:
-            base = cmap(idx)
-        h, l, s = colorsys.rgb_to_hls(base[0], base[1], base[2])
+    for idx, (group_name, encs) in enumerate(grouped):
+        h = preferred_group_hues.get(group_name, (0.07 + idx * golden_angle) % 1.0)
+        # Keep base saturation/lightness in a range that preserves group identity
+        # even for the darkest shades.
+        base_s = 0.82
+        base_l = 0.56
         count = max(len(encs), 1)
         for j, enc in enumerate(encs):
-            # Vary lightness within group for a gentle gradient
+            # Vary lightness within group while staying away from near-black,
+            # so dark shades across groups remain distinguishable.
             if count == 1:
-                l_j = l
-                s_j = s
+                l_j = base_l
+                s_j = base_s
             else:
-                spread = 0.6
-                l_min = max(0.08, l - spread / 2)
-                l_max = min(0.94, l + spread / 2)
+                l_min = 0.34
+                l_max = 0.80
                 l_j = l_min + (l_max - l_min) * (j / (count - 1))
-                s_min = max(0.25, s * 0.7)
-                s_max = min(1.0, s * 1.25)
+                # Slight saturation variation gives depth without collapsing hues.
+                s_min = 0.66
+                s_max = 0.92
                 s_j = s_min + (s_max - s_min) * (j / (count - 1))
             r, g, b = colorsys.hls_to_rgb(h, l_j, s_j)
             colours[enc] = (r, g, b)
@@ -223,6 +237,49 @@ def _safe_log_scale(ax, axis='x'):
         setter('log')
 
 
+# Encoders considered non-random-access for plotting annotation purposes.
+# Per request: names containing OpenZL, VarInt, Delta, LZ4, Huff/Huffman.
+_NON_RANDOM_ACCESS_TOKENS = (
+    'openzl',
+    'varint',
+    'delta',
+    'lz4',
+    'huff',
+    'huffman',
+    'fse',
+)
+
+
+def _is_random_access_encoder(encoder_name: str) -> bool:
+    n = encoder_name.lower()
+    return not any(tok in n for tok in _NON_RANDOM_ACCESS_TOKENS)
+
+
+def _encoder_display_label(encoder_name: str) -> str:
+    return f"{encoder_name} [{'RA' if _is_random_access_encoder(encoder_name) else 'No-RA'}]"
+
+
+def _set_encoder_axis_labels(ax, y, encoders):
+    ax.set_yticks(y)
+    ax.set_yticklabels([_encoder_display_label(e) for e in encoders])
+
+
+def _ra_bar_legend_handles():
+    return [
+        mpatches.Patch(facecolor='lightgray', edgecolor='black', label='RA: random-access capable'),
+        mpatches.Patch(facecolor='lightgray', edgecolor='black', hatch='///', label='No-RA: fallback/sequential access'),
+    ]
+
+
+def _ra_scatter_legend_handles():
+    return [
+        mlines.Line2D([0], [0], marker='o', color='w', markerfacecolor='gray', markeredgecolor='black',
+                      markersize=7, label='RA: random-access capable'),
+        mlines.Line2D([0], [0], marker='X', color='w', markerfacecolor='gray', markeredgecolor='black',
+                      markersize=7, label='No-RA: fallback/sequential access'),
+    ]
+
+
 def _hbar(ax, encoders, values, colours, unit='', fmt='.3g', log=True):
     """
     Draw a horizontal bar chart with one bar per encoder.
@@ -232,6 +289,13 @@ def _hbar(ax, encoders, values, colours, unit='', fmt='.3g', log=True):
     bar_h = 0.6
     bars = ax.barh(y, values, height=bar_h,
                    color=[colours[e] for e in encoders])
+
+    # Visually mark non-random-access encoders.
+    for bar, enc in zip(bars, encoders):
+        if not _is_random_access_encoder(enc):
+            bar.set_hatch('///')
+            bar.set_edgecolor('black')
+            bar.set_linewidth(0.6)
 
     # Value labels
     x_max = max((v for v in values if v and v > 0), default=1)
@@ -244,8 +308,7 @@ def _hbar(ax, encoders, values, colours, unit='', fmt='.3g', log=True):
             ax.text(x_max * 0.01, bar.get_y() + bar.get_height() / 2,
                     'N/A', va='center', fontsize=8, color='grey')
 
-    ax.set_yticks(y)
-    ax.set_yticklabels(encoders)
+    _set_encoder_axis_labels(ax, y, encoders)
     ax.invert_yaxis()
     ax.grid(axis='x', alpha=0.3)
 
@@ -317,14 +380,20 @@ def plot_compression(results, output_dir, colours, source_label, group_encoders=
                     label='No compression (1×)')
         ax1.set_xlabel('Compression ratio (higher = better)')
         ax1.set_title('Inverted compression ratio')
-        ax1.legend(fontsize=8)
+        ax1.legend(handles=[
+            mlines.Line2D([0], [0], color='red', linestyle='--', linewidth=1, label='No compression (1×)'),
+            *_ra_bar_legend_handles(),
+        ], fontsize=8)
 
         _hbar(ax2, encoders, bpe_vals, colours, unit='bits', fmt='.2f', log=False)
         ax2.axvline(x=64, color='red', linestyle='--', linewidth=1, alpha=0.6,
                     label='Raw int64 (64 bits)')
         ax2.set_xlabel('Bits per element (lower = better)')
         ax2.set_title('Bits per element')
-        ax2.legend(fontsize=8)
+        ax2.legend(handles=[
+            mlines.Line2D([0], [0], color='red', linestyle='--', linewidth=1, label='Raw int64 (64 bits)'),
+            *_ra_bar_legend_handles(),
+        ], fontsize=8)
 
         plt.tight_layout()
         fname = output_dir / f'compression_{dataset.replace(" ", "_")}.png'
@@ -361,7 +430,10 @@ def plot_compression_overhead(results, output_dir, colours, source_label, group_
                     label='Best compression (1×)')
         ax.set_xlabel('Compression ratio relative to best (lower = better)')
         ax.set_title('Normalized compression ratio (overhead)')
-        ax.legend(fontsize=8)
+        ax.legend(handles=[
+            mlines.Line2D([0], [0], color='red', linestyle='--', linewidth=1, label='Best compression (1×)'),
+            *_ra_bar_legend_handles(),
+        ], fontsize=8)
 
         plt.tight_layout()
         fname = output_dir / f'compression_overhead_{dataset.replace(" ", "_")}.png'
@@ -440,7 +512,12 @@ def plot_encode_decode_time(results, output_dir, colours, source_label, group_en
                                 va='center', ha='left', fontsize=7, color='black', fontweight='bold')
         else:
             total_vals = enc_ms
-            ax.barh(y, total_vals, height=bar_h, color=[colours[e] for e in encoders], label='Encode')
+            bars = ax.barh(y, total_vals, height=bar_h, color=[colours[e] for e in encoders], label='Encode')
+            for bar, enc in zip(bars, encoders):
+                if not _is_random_access_encoder(enc):
+                    bar.set_hatch('///')
+                    bar.set_edgecolor('black')
+                    bar.set_linewidth(0.6)
             for idx, val in enumerate(total_vals):
                 if val > 0:
                     if val >= min_label_width:
@@ -451,22 +528,25 @@ def plot_encode_decode_time(results, output_dir, colours, source_label, group_en
                         ax.text(val + label_x_offset, y[idx], f'{val:.1f} ms', va='center', ha='left',
                                 fontsize=7, color='black', fontweight='bold')
 
-        ax.set_yticks(y)
-        ax.set_yticklabels(encoders)
+        _set_encoder_axis_labels(ax, y, encoders)
         ax.invert_yaxis()
         ax.grid(axis='x', alpha=0.3)
         if any(v > 0 for v in total_vals):
             ax.set_xscale('log')
         ax.set_xlabel('Time (ms, log scale, lower = better)')
         ax.set_title('Encode time')
+        ra_leg = ax.legend(handles=_ra_bar_legend_handles(), fontsize=8, loc='upper right', title='Access capability')
         if has_selection:
-            ax.legend(fontsize=8, loc='lower right')
+            main_leg = ax.legend(fontsize=8, loc='lower right')
+            ax.add_artist(ra_leg)
+            ax.add_artist(main_leg)
 
         # Decode plot (unchanged)
         ax = axes[1]
         _hbar(ax, encoders, dec_ms, colours, unit='ms', fmt='.1f', log=True)
         ax.set_xlabel('Time (ms, log scale, lower = better)')
         ax.set_title('Bulk decode time')
+        ax.legend(handles=_ra_bar_legend_handles(), fontsize=8, loc='upper right', title='Access capability')
 
         plt.tight_layout()
         fname = output_dir / f'encode_decode_time_{dataset.replace(" ", "_")}.png'
@@ -508,6 +588,11 @@ def plot_random_access(results, output_dir, colours, source_label, group_encoder
 
         bars = ax1.barh(y, avg_ns, height=bar_h,
                         color=[colours[e] for e in encoders])
+        for bar, enc in zip(bars, encoders):
+            if not _is_random_access_encoder(enc):
+                bar.set_hatch('///')
+                bar.set_edgecolor('black')
+                bar.set_linewidth(0.6)
         # Label each bar with its value (ns) similar to _hbar helper
         x_max = max((v for v in avg_ns if v and v > 0), default=1)
         for bar, val in zip(bars, avg_ns):
@@ -526,17 +611,19 @@ def plot_random_access(results, output_dir, colours, source_label, group_encoder
         # ax1.errorbar(avg_ns, y, xerr=[x_lo, x_hi],
         #              fmt='none', color='black', capsize=3, linewidth=1)
 
-        ax1.set_yticks(y); ax1.set_yticklabels(encoders); ax1.invert_yaxis()
+        _set_encoder_axis_labels(ax1, y, encoders); ax1.invert_yaxis()
         ax1.set_xlabel('Time (ns, log scale, lower = better)')
         ax1.set_title('Avg random access (bars)')
         ax1.grid(axis='x', alpha=0.3)
         if any(v > 0 for v in avg_ns):
             ax1.set_xscale('log')
+        ax1.legend(handles=_ra_bar_legend_handles(), fontsize=8, loc='upper right', title='Access capability')
 
         # Right: average strided access
         _hbar(ax2, encoders, strided_ns, colours, unit='ns', fmt='.0f', log=True)
         ax2.set_xlabel('Time (ns, log scale, lower = better)')
         ax2.set_title('Avg strided access (stride from config)')
+        ax2.legend(handles=_ra_bar_legend_handles(), fontsize=8, loc='upper right', title='Access capability')
 
         plt.tight_layout()
         fname = output_dir / f'random_access_{dataset.replace(" ", "_")}.png'
@@ -581,10 +668,12 @@ def plot_range_access(results, output_dir, colours, source_label, group_encoders
         _hbar(ax1, encoders, avg_ms, colours, unit='ms', fmt='.2f', log=True)
         ax1.set_xlabel('Time (ms, log scale, lower = better)')
         ax1.set_title('Avg range-query latency')
+        ax1.legend(handles=_ra_bar_legend_handles(), fontsize=8, loc='upper right', title='Access capability')
 
         _hbar(ax2, encoders, tp_vals, colours, unit='M e/s', fmt='.1f', log=True)
         ax2.set_xlabel('Throughput (M elem/s, log scale, higher = better)')
         ax2.set_title('Range-query decode throughput')
+        ax2.legend(handles=_ra_bar_legend_handles(), fontsize=8, loc='upper right', title='Access capability')
 
         plt.tight_layout()
         fname = output_dir / f'range_access_{dataset.replace(" ", "_")}.png'
@@ -619,14 +708,17 @@ def plot_throughput_summary(results, output_dir, colours, source_label, group_en
         fig.suptitle(f'Throughput summary — {dataset}  (n={size:,})', fontsize=13, y=1.04)
         _annotate_source(fig, source_label)
 
-        ax.barh(y - bh/2, enc_tp, height=bh,
-                color=[colours[e] for e in encoders], label='Encode', alpha=0.85)
-        ax.barh(y + bh/2, dec_tp, height=bh,
-                color=[colours[e] for e in encoders], label='Decode (bulk)',
-                alpha=0.55, hatch='//')
+        bars_enc = ax.barh(y - bh/2, enc_tp, height=bh,
+                           color=[colours[e] for e in encoders], label='Encode', alpha=0.85)
+        bars_dec = ax.barh(y + bh/2, dec_tp, height=bh,
+                           color=[colours[e] for e in encoders], label='Decode (bulk)',
+                           alpha=0.55, hatch='//')
+        for b1, b2, enc in zip(bars_enc, bars_dec, encoders):
+            if not _is_random_access_encoder(enc):
+                b1.set_hatch('///'); b1.set_edgecolor('black'); b1.set_linewidth(0.6)
+                b2.set_hatch('xx');  b2.set_edgecolor('black'); b2.set_linewidth(0.6)
 
-        ax.set_yticks(y)
-        ax.set_yticklabels(encoders)
+        _set_encoder_axis_labels(ax, y, encoders)
         ax.invert_yaxis()
         ax.set_xlabel('Throughput (M elements/sec, log scale, higher = better)')
         ax.grid(axis='x', alpha=0.3)
@@ -634,10 +726,9 @@ def plot_throughput_summary(results, output_dir, colours, source_label, group_en
             ax.set_xscale('log')
 
         # Custom legend: colour patches for each encoder, then encode/decode style
-        import matplotlib.patches as mpatches
         enc_patch  = mpatches.Patch(facecolor='grey', alpha=0.85, label='Encode (solid)')
         dec_patch  = mpatches.Patch(facecolor='grey', alpha=0.55, hatch='//', label='Decode (hatch)')
-        handles    = [enc_patch, dec_patch]
+        handles    = [enc_patch, dec_patch, *_ra_bar_legend_handles()]
         ax.legend(handles=handles, fontsize=8, loc='lower right')
 
         plt.tight_layout()
@@ -693,7 +784,8 @@ def plot_compression_vs_random_access(results, output_dir, colours, source_label
         _annotate_source(fig, source_label)
 
         for enc, ratio, ra in points:
-            ax.scatter(ratio, ra, color=colours.get(enc, 'tab:blue'), s=40, zorder=3)
+            marker = 'o' if _is_random_access_encoder(enc) else 'X'
+            ax.scatter(ratio, ra, color=colours.get(enc, 'tab:blue'), marker=marker, s=45, zorder=3)
 
         # ── Global Pareto frontier ─────────────────────────────────────────
         global_frontier = _pareto([(cx, ra) for _, cx, ra in points])
@@ -748,7 +840,7 @@ def plot_compression_vs_random_access(results, output_dir, colours, source_label
                 else:
                     placed_bboxes.append(bbox)
 
-        # ── Legends ────────────────────────────────────────────────────────
+    # ── Legends ────────────────────────────────────────────────────────
         # Group scatter-dot legend (when --group-encoders is active)
         group_dot_handles = []
         group_dot_labels = []
@@ -762,14 +854,6 @@ def plot_compression_vs_random_access(results, output_dir, colours, source_label
                                   markerfacecolor=color, markersize=6))
                 group_dot_labels.append(group_name)
 
-        legend_y = 0.94
-        if group_dot_handles:
-            fig.legend(group_dot_handles, group_dot_labels, fontsize=7,
-                       loc='upper center', bbox_to_anchor=(0.5, legend_y),
-                       ncol=min(len(group_dot_handles), 4),
-                       title='Encoder groups')
-            legend_y -= 0.05
-
         # Combine global frontier + per-group frontier entries
         frontier_handles = []
         frontier_labels  = []
@@ -779,11 +863,54 @@ def plot_compression_vs_random_access(results, output_dir, colours, source_label
         if group_frontier_handles:
             frontier_handles += group_frontier_handles
             frontier_labels  += [h.get_label() for h in group_frontier_handles]
+
+        # Place all legends at the top with aligned top edge and fixed gap.
+        legend_specs = []
+        if group_dot_handles:
+            legend_specs.append(dict(
+                handles=group_dot_handles,
+                labels=group_dot_labels,
+                title='Encoder groups',
+                ncol=min(len(group_dot_handles), 4),
+                framealpha=0.85,
+            ))
         if frontier_handles:
-            fig.legend(frontier_handles, frontier_labels, fontsize=7,
-                       loc='lower left', bbox_to_anchor=(0.08, 0.08),
-                       title='Pareto frontiers', title_fontsize=7,
-                       framealpha=0.85)
+            legend_specs.append(dict(
+                handles=frontier_handles,
+                labels=frontier_labels,
+                title='Pareto frontiers',
+                framealpha=0.85,
+            ))
+
+        ra_handles = _ra_scatter_legend_handles()
+        legend_specs.append(dict(
+            handles=ra_handles,
+            labels=[h.get_label() for h in ra_handles],
+            title='Access capability',
+            framealpha=0.85,
+        ))
+
+        legend_top_y = 0.94
+        legend_x = 0.02
+        legend_gap = 0.02
+        fig.canvas.draw()
+        for spec in legend_specs:
+            leg = fig.legend(
+                spec['handles'], spec['labels'],
+                fontsize=7,
+                loc='upper left',
+                bbox_to_anchor=(legend_x, legend_top_y),
+                bbox_transform=fig.transFigure,
+                title=spec.get('title'),
+                title_fontsize=7,
+                ncol=spec.get('ncol', 1),
+                framealpha=spec.get('framealpha', 0.85),
+            )
+            fig.canvas.draw()
+            renderer = fig.canvas.get_renderer()
+            bbox = leg.get_window_extent(renderer=renderer)
+            fig_w_px = fig.get_size_inches()[0] * fig.dpi
+            legend_x += (bbox.width / fig_w_px) + legend_gap
 
         # ── Axes ───────────────────────────────────────────────────────────
         ax.set_xlabel('Compression (× smaller than raw, higher = better →)')
@@ -795,7 +922,7 @@ def plot_compression_vs_random_access(results, output_dir, colours, source_label
         ax.invert_yaxis()
         ax.grid(True, alpha=0.3)
 
-        plt.tight_layout(rect=[0, 0, 1, 0.88])
+        plt.tight_layout(rect=[0, 0, 1, 0.82])
         fname = output_dir / f'compression_vs_random_access_{dataset.replace(" ", "_")}.png'
         plt.savefig(fname, dpi=150)
         print(f"Saved: {fname}")
@@ -896,11 +1023,13 @@ def plot_memory_encode_decode(results, output_dir, colours, source_label, group_
                     ax.text(x_max * 0.01, y[i],
                             'N/A', va='center', fontsize=8, color='grey')
 
-            ax.set_yticks(y); ax.set_yticklabels(encoders); ax.invert_yaxis()
+            _set_encoder_axis_labels(ax, y, encoders); ax.invert_yaxis()
             ax.grid(axis='x', alpha=0.3)
             ax.set_xlabel('Heap memory (MB, lower = better)')
             ax.set_title(title)
-            ax.legend(fontsize=8, loc='lower right')
+            base_leg = ax.legend(fontsize=8, loc='lower right')
+            ax.add_artist(base_leg)
+            ax.legend(handles=_ra_bar_legend_handles(), fontsize=8, loc='upper right', title='Access capability')
 
         _mem_stacked(ax1, encoders, enc_peak, enc_net, 'Encode heap memory')
         _mem_stacked(ax2, encoders, dec_peak, dec_net, 'Bulk decode heap memory')
@@ -959,7 +1088,7 @@ def plot_memory_access(results, output_dir, colours, source_label, group_encoder
         ax1.barh(y + bh/2, strided_kb, height=bh,
                  color=[colours[e] for e in encoders], label='Strided',
                  alpha=0.55, hatch='//')
-        ax1.set_yticks(y); ax1.set_yticklabels(encoders); ax1.invert_yaxis()
+        _set_encoder_axis_labels(ax1, y, encoders); ax1.invert_yaxis()
         ax1.grid(axis='x', alpha=0.3)
         ax1.set_xlabel('Peak heap per decodeAt call (KB, lower = better)')
         ax1.set_title('Random / strided access heap\n(0 = stack-only decode, expected for most encoders)')
@@ -967,12 +1096,15 @@ def plot_memory_access(results, output_dir, colours, source_label, group_encoder
         import matplotlib.patches as mpatches
         rand_patch    = mpatches.Patch(facecolor='grey', alpha=0.9,  label='Random (solid)')
         strided_patch = mpatches.Patch(facecolor='grey', alpha=0.55, hatch='//', label='Strided (hatch)')
-        ax1.legend(handles=[rand_patch, strided_patch], fontsize=8, loc='lower right')
+        base_leg = ax1.legend(handles=[rand_patch, strided_patch], fontsize=8, loc='lower right')
+        ax1.add_artist(base_leg)
+        ax1.legend(handles=_ra_bar_legend_handles(), fontsize=8, loc='upper right', title='Access capability')
 
         # Right: range query (MB)
         _hbar(ax2, encoders, range_mb, colours, unit='MB', fmt='.2f', log=False)
         ax2.set_xlabel('Peak heap for one decodeRange call (MB, lower = better)')
         ax2.set_title('Range-access heap memory\n(output buffer + internal allocations alive at return)')
+        ax2.legend(handles=_ra_bar_legend_handles(), fontsize=8, loc='upper right', title='Access capability')
 
         plt.tight_layout()
         fname = output_dir / f'memory_access_{dataset.replace(" ", "_")}.png'
@@ -1030,10 +1162,12 @@ def plot_time_memory_paired(results, output_dir, colours, source_label, group_en
         _hbar(ax1, encoders, enc_ms,      colours, unit='ms', fmt='.1f', log=True)
         ax1.set_xlabel('Encode time (ms, log scale, lower = better)')
         ax1.set_title('Encode time')
+        ax1.legend(handles=_ra_bar_legend_handles(), fontsize=8, loc='upper right', title='Access capability')
 
         _hbar(ax2, encoders, enc_peak_mb, colours, unit='MB', fmt='.2f', log=False)
         ax2.set_xlabel('Encode peak heap (MB, lower = better)')
         ax2.set_title('Encode peak heap memory')
+        ax2.legend(handles=_ra_bar_legend_handles(), fontsize=8, loc='upper right', title='Access capability')
 
         plt.tight_layout()
         fname = output_dir / f'time_memory_encode_{dataset.replace(" ", "_")}.png'
@@ -1051,10 +1185,12 @@ def plot_time_memory_paired(results, output_dir, colours, source_label, group_en
         _hbar(ax1, encoders, dec_ms,      colours, unit='ms', fmt='.1f', log=True)
         ax1.set_xlabel('Decode time (ms, log scale, lower = better)')
         ax1.set_title('Bulk decode time')
+        ax1.legend(handles=_ra_bar_legend_handles(), fontsize=8, loc='upper right', title='Access capability')
 
         _hbar(ax2, encoders, dec_peak_mb, colours, unit='MB', fmt='.2f', log=False)
         ax2.set_xlabel('Decode peak heap (MB, lower = better)')
         ax2.set_title('Bulk decode peak heap memory')
+        ax2.legend(handles=_ra_bar_legend_handles(), fontsize=8, loc='upper right', title='Access capability')
 
         plt.tight_layout()
         fname = output_dir / f'time_memory_decode_{dataset.replace(" ", "_")}.png'
