@@ -10,6 +10,7 @@
 #include <string>
 #include <vector>
 #include <cstdint>
+#include <unordered_set>
 
 #include "encodings/Encoder.hpp"
 #include "encodings/EncodedData.hpp"
