@@ -43,6 +43,7 @@ if(BUILD_TESTS)
     add_test(NAME test_vector_generators COMMAND test_vector_generators)
     add_test(NAME test_bitset COMMAND test_bitset)
     add_test(NAME test_subint_encoder COMMAND test_subint_encoder)
+    add_test(NAME test_fse_encoder COMMAND test_fse_encoder)
 endif()
 
 # Simple test for DeltaRunLengthEncoder
@@ -110,3 +111,9 @@ target_compile_definitions(test_subint_encoder_dbg PRIVATE SUBINT_DEBUG=1)
 target_include_directories(test_subint_encoder_dbg PRIVATE ${CMAKE_SOURCE_DIR}/Source)
 target_link_libraries(test_subint_encoder_dbg PRIVATE encodings_core encodings_encodings encodings_encoders encodings_generators)
 set_target_properties(test_subint_encoder_dbg PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+# Tests for FSEEncoder and SubIntSplit FSE integration
+add_executable(test_fse_encoder test_fse_encoder.cpp)
+target_include_directories(test_fse_encoder PRIVATE ${CMAKE_SOURCE_DIR}/Source)
+target_link_libraries(test_fse_encoder PRIVATE encodings_core encodings_encodings encodings_encoders encodings_generators)
+set_target_properties(test_fse_encoder PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
