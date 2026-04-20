@@ -20,10 +20,12 @@
 #include "encoders/RawBitPackedEncoder.hpp"
 #include "encoders/OpenZLEncoder.hpp"
 #include "encoders/LZ4Encoder.hpp"
+#include "encoders/FSEEncoder.hpp"
 #include "encoders/AdaptiveFOREncoder.hpp"
 #include "encoders/AdaptiveFramedBitPrefixEncoder.hpp"
 #include "encoders/RunLengthEncoder.hpp"
 #include "encoders/HuffmanEncoder.hpp"
+#include "encoders/FrequencyPartitionEncoder.hpp"
 #include "encoders/FOREncoder.hpp"
 #include "encoders/BitSplitOrder.hpp"
 #include "encoders/selectors/IDSubStreamEncodingSelector.hpp"
@@ -366,6 +368,30 @@ inline std::shared_ptr<ISectionCodecIntegral<SectionCodecTIn>> makeLZ4Section(ui
     }
 }
 
+template <typename SectionCodecTIn = uint64_t>
+inline std::shared_ptr<ISectionCodecIntegral<SectionCodecTIn>> makeFSESection(uint8_t bits) {
+    // FSE is entropy coding and sequential; decodeAt/decodeRange in the codec
+    // are decodeAll fallbacks for benchmark API compatibility.
+    const uint8_t w = chooseTypeBits(bits);
+    switch (w) {
+        case 8:  return makeSectionCodecForBits<SectionCodecTIn>(std::make_shared<FSEEncoder<uint8_t>>(), bits);
+        case 16: return makeSectionCodecForBits<SectionCodecTIn>(std::make_shared<FSEEncoder<uint16_t>>(), bits);
+        case 32: return makeSectionCodecForBits<SectionCodecTIn>(std::make_shared<FSEEncoder<uint32_t>>(), bits);
+        default: return makeSectionCodecForBits<SectionCodecTIn>(std::make_shared<FSEEncoder<uint64_t>>(), bits);
+    }
+}
+
+template <typename SectionCodecTIn = uint64_t>
+inline std::shared_ptr<ISectionCodecIntegral<SectionCodecTIn>> makeFrequencyPartitionSection(uint8_t bits) {
+    const uint8_t w = chooseTypeBits(bits);
+    switch (w) {
+        case 8:  return makeSectionCodecForBits<SectionCodecTIn>(std::make_shared<FrequencyPartitionEncoder<uint8_t>>(),  bits);
+        case 16: return makeSectionCodecForBits<SectionCodecTIn>(std::make_shared<FrequencyPartitionEncoder<uint16_t>>(), bits);
+        case 32: return makeSectionCodecForBits<SectionCodecTIn>(std::make_shared<FrequencyPartitionEncoder<uint32_t>>(), bits);
+        default: return makeSectionCodecForBits<SectionCodecTIn>(std::make_shared<FrequencyPartitionEncoder<uint64_t>>(), bits);
+    }
+}
+
 template <size_t FrameSize = 512, typename SectionCodecTIn = uint64_t>
 inline std::shared_ptr<ISectionCodecIntegral<SectionCodecTIn>> makeFORSection(uint8_t bits,
                                                 FORReferencePolicy policy = FORReferencePolicy::MIN) {
@@ -511,6 +537,12 @@ inline SubIntSplitConfigIntegral<TIn> SubIntSplitConfigIntegral<TIn>::fromSegmen
                 break;
             case encodings::EncodingType::LZ4:
                 cfg.codecs.push_back(detail_trisplit::makeLZ4Section<TIn>(width));
+                break;
+            case encodings::EncodingType::FSEEncoding:
+                cfg.codecs.push_back(detail_trisplit::makeFSESection<TIn>(width));
+                break;
+            case encodings::EncodingType::FrequencyPartitionEncoding:
+                cfg.codecs.push_back(detail_trisplit::makeFrequencyPartitionSection<TIn>(width));
                 break;
             default:
                 throw std::invalid_argument("SubIntSplitConfigIntegral::fromSegments: unsupported encoding type for section");

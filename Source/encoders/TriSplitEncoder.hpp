@@ -564,6 +564,32 @@ inline std::shared_ptr<TriSplitEncoder64> makeSnowflakeTriSplitAllLZ4(
     return makeTriSplitEncoder64(std::move(cfg));
 }
 
+inline std::shared_ptr<TriSplitEncoder64> makeSnowflakeTriSplitAllFSE(
+    BitSplitOrder order = BitSplitOrder::MSB_TO_LSB,
+    detail_trisplit::SnowflakeVariant variant = detail_trisplit::SnowflakeVariant::Snowflake) {
+    const auto [bitsA, bitsB, bitsC] = detail_trisplit::getSnowflakeLayoutBits(variant);
+    auto cfg = detail_trisplit::makeSnowflakeConfig(
+        detail_trisplit::makeFSESection(bitsA),
+        detail_trisplit::makeFSESection(bitsB),
+        detail_trisplit::makeFSESection(bitsC),
+        order,
+        variant);
+    return makeTriSplitEncoder64(std::move(cfg));
+}
+
+inline std::shared_ptr<TriSplitEncoder64> makeSnowflakeTriSplitAllFrequencyPartition(
+    BitSplitOrder order = BitSplitOrder::MSB_TO_LSB,
+    detail_trisplit::SnowflakeVariant variant = detail_trisplit::SnowflakeVariant::Snowflake) {
+    const auto [bitsA, bitsB, bitsC] = detail_trisplit::getSnowflakeLayoutBits(variant);
+    auto cfg = detail_trisplit::makeSnowflakeConfig(
+        detail_trisplit::makeFrequencyPartitionSection(bitsA),
+        detail_trisplit::makeFrequencyPartitionSection(bitsB),
+        detail_trisplit::makeFrequencyPartitionSection(bitsC),
+        order,
+        variant);
+    return makeTriSplitEncoder64(std::move(cfg));
+}
+
 template <size_t BlockSize = 0>
 inline std::shared_ptr<TriSplitEncoder64> makeSnowflakeTriSplitOpenZLOnly(
     BitSplitOrder order = BitSplitOrder::MSB_TO_LSB,

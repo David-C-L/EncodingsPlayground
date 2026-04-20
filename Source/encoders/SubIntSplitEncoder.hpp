@@ -36,6 +36,8 @@ using encodings::encoders::selectors::costs::DictionaryCostModel;
 using encodings::encoders::selectors::costs::RLECostModel;
 using encodings::encoders::selectors::costs::HuffmanCostModel;
 using encodings::encoders::selectors::costs::LZ4CostModel;
+using encodings::encoders::selectors::costs::FSECostModel;
+using encodings::encoders::selectors::costs::FrequencyPartitionCostModel;
 
 namespace encodings::encoders {
 
@@ -558,8 +560,14 @@ inline std::shared_ptr<SubIntSplitEncoder<T>> makeSubIntSplitEncoderManual(
             case encodings::EncodingType::RunLengthEncoding:
                 cfg.codecs.push_back(detail_trisplit::makeRLESection<SectionT>(width));
                 break;
+            case encodings::EncodingType::HuffmanEncoding:
+                cfg.codecs.push_back(detail_trisplit::makeHuffmanSection<SectionT>(width));
+                break;
             case encodings::EncodingType::LZ4:
                 cfg.codecs.push_back(detail_trisplit::makeLZ4Section<SectionT>(width));
+                break;
+            case encodings::EncodingType::FSEEncoding:
+                cfg.codecs.push_back(detail_trisplit::makeFSESection<SectionT>(width));
                 break;
             default:
                 throw std::invalid_argument("makeSubIntSplitEncoderManual: unsupported encoding type");
@@ -857,7 +865,8 @@ inline std::vector<encodings::EncodingType> defaultAutoSubIntSplitCostModelTypes
         encodings::EncodingType::BitPacking,
         encodings::EncodingType::RunLengthEncoding,
         encodings::EncodingType::AdaptiveFrameOfReference,
-        encodings::EncodingType::DictionaryEncoding
+        encodings::EncodingType::DictionaryEncoding,
+        encodings::EncodingType::FrequencyPartitionEncoding
     };
 }
 
@@ -894,6 +903,12 @@ makeAutoSubIntSplitCostModelsFromTypes(const std::vector<encodings::EncodingType
                 break;
             case encodings::EncodingType::LZ4:
                 models.emplace_back(std::make_unique<LZ4CostModel>());
+                break;
+            case encodings::EncodingType::FSEEncoding:
+                models.emplace_back(std::make_unique<FSECostModel>());
+                break;
+            case encodings::EncodingType::FrequencyPartitionEncoding:
+                models.emplace_back(std::make_unique<FrequencyPartitionCostModel>());
                 break;
             default:
                 throw std::invalid_argument("makeAutoSubIntSplitCostModelsFromTypes: unsupported encoding type for cost model");
