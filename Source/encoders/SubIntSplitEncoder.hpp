@@ -14,6 +14,8 @@
 #include <algorithm>
 #include <cmath>
 #include <chrono>
+#include <cstdlib>
+#include <iostream>
 #ifdef __AVX2__
 #  include <immintrin.h>
 #endif
@@ -147,6 +149,25 @@ public:
         meta.uncompressedSize     = N * sizeof(T);
         meta.supportsRandomAccess = allSectionsRandomAccess();
 
+        if (verboseEnabled()) {
+            const double bitsPerElemTotal = N ? (static_cast<double>(out.size()) * 8.0 / static_cast<double>(N)) : 0.0;
+            std::cerr << "[SubIntSplit] N=" << N
+                      << " order=" << (cfg_.order == BitSplitOrder::LSB_TO_MSB ? "LSB" : "MSB")
+                      << " splits=" << splits
+                      << " total=" << out.size() << "B (~" << bitsPerElemTotal << " b/elem)"
+                      << " ratio=" << (N ? (static_cast<double>(out.size()) / (N * sizeof(T))) : 0.0)
+                      << "\n";
+            for (size_t s = 0; s < splits; ++s) {
+                const double bitsPerElem = N ? (static_cast<double>(sectionSizes[s]) * 8.0 / static_cast<double>(N)) : 0.0;
+                std::cerr << "  sec " << s
+                          << " bits=" << static_cast<int>(cfg_.bits[s])
+                          << " bytes=" << sectionSizes[s] << "B"
+                          << " (~" << bitsPerElem << " b/elem)"
+                          << " codec=" << cfg_.codecs[s]->name()
+                          << "\n";
+            }
+        }
+
         return encodings::EncodedData(std::move(out), std::move(meta));
     }
 
@@ -237,6 +258,11 @@ public:
     }
 
 private:
+    static bool verboseEnabled() {
+        static bool v = (std::getenv("SUBINTSPLIT_VERBOSE") != nullptr);
+        return v || true;
+    }
+
     struct ParsedHeader {
         size_t N{};
         BitSplitOrder order{BitSplitOrder::LSB_TO_MSB};
