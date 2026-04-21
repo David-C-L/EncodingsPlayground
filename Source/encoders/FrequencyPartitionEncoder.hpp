@@ -72,7 +72,7 @@ enum class FreqPartIndexType : uint8_t {
 ///   [4]  fallbackCount (uint32_t)
 ///   [fallbackCount*sizeof(T)]  raw fallback values in original index order
 ///
-template <typename T>
+template <typename T, FreqPartIndexType IndexType = FreqPartIndexType::PerTierBitmaps>
     requires (std::is_same_v<T, uint8_t>  || std::is_same_v<T, uint16_t> ||
               std::is_same_v<T, uint32_t> || std::is_same_v<T, uint64_t> ||
               std::is_same_v<T, int8_t>   || std::is_same_v<T, int16_t>  ||
@@ -89,9 +89,7 @@ public:
     // widths 1,2,...,kMaxKeyBits. Each tier's actual capacity is 2^keyBits.
     static constexpr size_t kNumActiveTiers = kMaxKeyBits;
 
-    explicit FrequencyPartitionEncoder(
-        FreqPartIndexType indexType = FreqPartIndexType::PerTierBitmaps)
-        : indexType_(indexType) {}
+    explicit FrequencyPartitionEncoder() = default;
 
     // ---------------------------------------------------------------------------
     // Encode
@@ -235,7 +233,7 @@ public:
 
         appendT(static_cast<uint64_t>(N));
         appendT(numTiersWithData);
-        appendT(static_cast<uint8_t>(indexType_));
+    appendT(static_cast<uint8_t>(IndexType));
 
         struct TierLogInfo {
             uint8_t logicalTier{0};
@@ -250,11 +248,11 @@ public:
         tierLogs.reserve(numTiersWithData);
 
         const size_t tagBytes =
-            (indexType_ == FreqPartIndexType::TierTagArray)
+            (IndexType == FreqPartIndexType::TierTagArray)
                 ? ((N * ceilLog2WithMinOne(static_cast<uint32_t>(numTiersWithData) + 1u) + 7) / 8)
                 : 0;
 
-        if (indexType_ == FreqPartIndexType::PerTierBitmaps) {
+        if constexpr (IndexType == FreqPartIndexType::PerTierBitmaps) {
             for (size_t t = 0; t < kNumActiveTiers; ++t) {
                 if (!includeTier[t] || tiers[t].dict.empty()) continue;
                 const uint8_t kb    = tiers[t].keyBits;
@@ -279,7 +277,7 @@ public:
                     bitmapBytes,
                 });
             }
-        } else if (indexType_ == FreqPartIndexType::TierTagArray) {
+    } else if constexpr (IndexType == FreqPartIndexType::TierTagArray) {
             // TierTagArray: emit the tag array first, then per-tier dict+keys.
             // tagBits = ceil(log2(numTiersWithData + 1)), minimum 1.
             const uint8_t tagBits = ceilLog2WithMinOne(static_cast<uint32_t>(numTiersWithData) + 1u);
@@ -329,7 +327,7 @@ public:
                     0,
                 });
             }
-        } else if (indexType_ == FreqPartIndexType::EliasFano) {
+    } else if constexpr (IndexType == FreqPartIndexType::EliasFano) {
             for (size_t t = 0; t < kNumActiveTiers; ++t) {
                 if (!includeTier[t] || tiers[t].dict.empty()) continue;
                 const uint8_t kb   = tiers[t].keyBits;
@@ -424,11 +422,11 @@ public:
             const size_t headerBytes = 8 + 1 + 1;
             const size_t fallbackBytes = 4 + fallback.size() * sizeof(T);
             size_t totalIndexBytes = 0;
-            if (indexType_ == FreqPartIndexType::PerTierBitmaps) {
+            if constexpr (IndexType == FreqPartIndexType::PerTierBitmaps) {
                 totalIndexBytes = numTiersWithData * numWords * sizeof(uint64_t);
-            } else if (indexType_ == FreqPartIndexType::TierTagArray) {
+            } else if constexpr (IndexType == FreqPartIndexType::TierTagArray) {
                 totalIndexBytes = tagBytes;
-            } else if (indexType_ == FreqPartIndexType::EliasFano) {
+            } else if constexpr (IndexType == FreqPartIndexType::EliasFano) {
                 for (const auto& tl : tierLogs) totalIndexBytes += tl.indexBytes;
             }
 
@@ -444,9 +442,9 @@ public:
             std::cerr << "[FreqPart] N=" << N
                       << " unique=" << numUnique
                       << " mode="
-                      << (indexType_ == FreqPartIndexType::PerTierBitmaps ? "PerTierBitmaps"
-                          : indexType_ == FreqPartIndexType::TierTagArray ? "TierTagArray"
-                          : indexType_ == FreqPartIndexType::EliasFano ? "EliasFano"
+                      << (IndexType == FreqPartIndexType::PerTierBitmaps ? "PerTierBitmaps"
+                          : IndexType == FreqPartIndexType::TierTagArray ? "TierTagArray"
+                          : IndexType == FreqPartIndexType::EliasFano ? "EliasFano"
                           : "NoIndex")
                       << " tiers=" << static_cast<int>(numTiersWithData)
                       << " total=" << result.metadata().compressedSize << "B (~" << totalBpe << " b/elem)"
@@ -487,10 +485,8 @@ public:
 private:
     static bool verboseEnabled() {
         static bool v = (std::getenv("FREQPART_VERBOSE") != nullptr);
-        return v || true;
+        return v;
     }
-
-    FreqPartIndexType indexType_{FreqPartIndexType::PerTierBitmaps};
 
     struct ParsedHeader {
         uint64_t numElements{0};
@@ -546,11 +542,14 @@ private:
         h.numElements = readU64();
         h.numTiers    = readU8();
         h.indexType   = static_cast<FreqPartIndexType>(readU8());
+        if (h.indexType != IndexType) {
+            throw std::runtime_error("FrequencyPartitionEncoder::parseHeader: wire indexType does not match template IndexType");
+        }
         h.numWords    = (h.numElements + 63) / 64;
 
         h.tiers.resize(h.numTiers);
 
-        if (h.indexType == FreqPartIndexType::PerTierBitmaps) {
+    if constexpr (IndexType == FreqPartIndexType::PerTierBitmaps) {
             for (auto& td : h.tiers) {
                 td.keyBits = readU8();
                 const uint32_t dictCount = readU32();
@@ -582,7 +581,7 @@ private:
                 h.fallbackPrefixPop[w + 1] = h.fallbackPrefixPop[w]
                                            + static_cast<size_t>(__builtin_popcountll(uncov));
             }
-        } else if (h.indexType == FreqPartIndexType::TierTagArray) {
+    } else if constexpr (IndexType == FreqPartIndexType::TierTagArray) {
             // TierTagArray: tag array comes first.
             h.tagBits = ceilLog2WithMinOne(static_cast<uint32_t>(h.numTiers) + 1u);
             h.tagArrayOffset = static_cast<size_t>(p - enc.data().data());
@@ -608,7 +607,7 @@ private:
                 }
                 p += packedKeyBytes(td.tierCount, td.keyBits);
             }
-        } else if (h.indexType == FreqPartIndexType::EliasFano) {
+    } else if constexpr (IndexType == FreqPartIndexType::EliasFano) {
             for (auto& td : h.tiers) {
                 td.keyBits = readU8();
                 const uint32_t dictCount = readU32();
@@ -816,121 +815,302 @@ private:
     }
 
     // ---------------------------------------------------------------------------
-    // Decode all
+    // Decode helpers per index mode (split for profiler visibility)
     // ---------------------------------------------------------------------------
 
-public:
-    std::vector<T> decodeAll(const EncodedBuffer<uint8_t>& enc) override {
-        const ParsedHeader& h = getParsedHeader(enc);
+    std::vector<T> decodeAllPerTierBitmaps(const EncodedBuffer<uint8_t>& enc, const ParsedHeader& h) const {
         const size_t N = static_cast<size_t>(h.numElements);
         std::vector<T> out(N);
 
-        if (h.indexType == FreqPartIndexType::PerTierBitmaps) {
-            // Tier passes: iterate set bits in each tier's bitmap.
-            for (const auto& td : h.tiers) {
-                const uint8_t* keysBase = enc.data().data() + td.keysOffset;
-                size_t rank = 0;
-                for (size_t w = 0; w < h.numWords; ++w) {
-                    uint64_t word = td.bitmap[w];
-                    while (word) {
-                        const size_t bit = static_cast<size_t>(__builtin_ctzll(word));
-                        const size_t pos = w * 64 + bit;
-                        if (pos < N)
-                            out[pos] = td.dict[unpackKey(keysBase, rank, td.keyBits)];
-                        ++rank;
-                        word &= word - 1;
-                    }
+        for (const auto& td : h.tiers) {
+            const uint8_t* keysBase = enc.data().data() + td.keysOffset;
+            size_t rank = 0;
+            for (size_t w = 0; w < h.numWords; ++w) {
+                uint64_t word = td.bitmap[w];
+                while (word) {
+                    const size_t bit = static_cast<size_t>(__builtin_ctzll(word));
+                    const size_t pos = w * 64 + bit;
+                    if (pos < N) out[pos] = td.dict[unpackKey(keysBase, rank, td.keyBits)];
+                    ++rank;
+                    word &= word - 1;
                 }
-            }
-
-            // Fallback pass: iterate uncovered positions via ~coveredBitmap.
-            if (h.fallbackCount > 0) {
-                const T* fp = reinterpret_cast<const T*>(enc.data().data() + h.fallbackOffset + 4);
-                size_t fi = 0;
-                for (size_t w = 0; w < h.numWords; ++w) {
-                    uint64_t uncov = ~h.coveredBitmap[w];
-                    // Mask bits beyond numElements in the last word.
-                    if (w == h.numWords - 1 && (N % 64) != 0)
-                        uncov &= (uint64_t{1} << (N % 64)) - 1;
-                    while (uncov) {
-                        const size_t bit = static_cast<size_t>(__builtin_ctzll(uncov));
-                        const size_t pos = w * 64 + bit;
-                        T v; std::memcpy(&v, fp + fi, sizeof(T));
-                        out[pos] = v;
-                        ++fi;
-                        uncov &= uncov - 1;
-                    }
-                }
-            }
-        } else if (h.indexType == FreqPartIndexType::TierTagArray) {
-            // TierTagArray: single linear scan of tag array.
-            const uint8_t* tagBase = enc.data().data() + h.tagArrayOffset;
-            // Per-tier key readers: track current rank per tier.
-            std::vector<size_t> tierRank(h.numTiers, 0);
-            std::vector<const uint8_t*> tierKeysBase(h.numTiers, nullptr);
-            for (size_t t = 0; t < h.numTiers; ++t)
-                tierKeysBase[t] = enc.data().data() + h.tiers[t].keysOffset;
-
-            const T* fp = reinterpret_cast<const T*>(enc.data().data() + h.fallbackOffset + 4);
-            size_t fi = 0;
-            for (size_t pos = 0; pos < N; ++pos) {
-                const uint8_t tag = unpackTagAt(tagBase, pos, h.tagBits);
-                if (tag < h.numTiers) {
-                    const auto& td = h.tiers[tag];
-                    out[pos] = td.dict[unpackKey(tierKeysBase[tag], tierRank[tag], td.keyBits)];
-                    ++tierRank[tag];
-                } else {
-                    T v; std::memcpy(&v, fp + fi, sizeof(T));
-                    out[pos] = v;
-                    ++fi;
-                }
-            }
-        } else if (h.indexType == FreqPartIndexType::EliasFano) {
-            for (const auto& td : h.tiers) {
-                const uint8_t* keysBase = enc.data().data() + td.keysOffset;
-                for (size_t rank = 0; rank < td.positions.size(); ++rank) {
-                    const size_t pos = td.positions[rank];
-                    if (pos < N) {
-                        out[pos] = td.dict[unpackKey(keysBase, rank, td.keyBits)];
-                    }
-                }
-            }
-
-            if (h.fallbackCount > 0) {
-                const T* fp = reinterpret_cast<const T*>(enc.data().data() + h.fallbackOffset + 4);
-                size_t fi = 0;
-                for (size_t w = 0; w < h.numWords; ++w) {
-                    uint64_t uncov = ~h.coveredBitmap[w];
-                    if (w == h.numWords - 1 && (N % 64) != 0)
-                        uncov &= (uint64_t{1} << (N % 64)) - 1;
-                    while (uncov) {
-                        const size_t bit = static_cast<size_t>(__builtin_ctzll(uncov));
-                        const size_t pos = w * 64 + bit;
-                        T v; std::memcpy(&v, fp + fi, sizeof(T));
-                        out[pos] = v;
-                        ++fi;
-                        uncov &= uncov - 1;
-                    }
-                }
-            }
-        } else {
-            // NoIndex: decoded order is tier0..tierK then fallback.
-            out.clear();
-            out.reserve(N);
-            for (const auto& td : h.tiers) {
-                const uint8_t* keysBase = enc.data().data() + td.keysOffset;
-                for (size_t rank = 0; rank < td.tierCount; ++rank) {
-                    out.push_back(td.dict[unpackKey(keysBase, rank, td.keyBits)]);
-                }
-            }
-            const T* fp = reinterpret_cast<const T*>(enc.data().data() + h.fallbackOffset + 4);
-            for (size_t i = 0; i < h.fallbackCount; ++i) {
-                T v; std::memcpy(&v, fp + i, sizeof(T));
-                out.push_back(v);
             }
         }
 
+        if (h.fallbackCount > 0) {
+            const T* fp = reinterpret_cast<const T*>(enc.data().data() + h.fallbackOffset + 4);
+            size_t fi = 0;
+            for (size_t w = 0; w < h.numWords; ++w) {
+                uint64_t uncov = ~h.coveredBitmap[w];
+                if (w == h.numWords - 1 && (N % 64) != 0) uncov &= (uint64_t{1} << (N % 64)) - 1;
+                while (uncov) {
+                    const size_t bit = static_cast<size_t>(__builtin_ctzll(uncov));
+                    const size_t pos = w * 64 + bit;
+                    T v; std::memcpy(&v, fp + fi, sizeof(T));
+                    out[pos] = v;
+                    ++fi;
+                    uncov &= uncov - 1;
+                }
+            }
+        }
         return out;
+    }
+
+    std::vector<T> decodeAllTierTagArray(const EncodedBuffer<uint8_t>& enc, const ParsedHeader& h) const {
+        const size_t N = static_cast<size_t>(h.numElements);
+        std::vector<T> out(N);
+        const uint8_t* tagBase = enc.data().data() + h.tagArrayOffset;
+
+        std::vector<size_t> tierRank(h.numTiers, 0);
+        std::vector<const uint8_t*> tierKeysBase(h.numTiers, nullptr);
+        for (size_t t = 0; t < h.numTiers; ++t) tierKeysBase[t] = enc.data().data() + h.tiers[t].keysOffset;
+
+        const T* fp = reinterpret_cast<const T*>(enc.data().data() + h.fallbackOffset + 4);
+        size_t fi = 0;
+        for (size_t pos = 0; pos < N; ++pos) {
+            const uint8_t tag = unpackTagAt(tagBase, pos, h.tagBits);
+            if (tag < h.numTiers) {
+                const auto& td = h.tiers[tag];
+                out[pos] = td.dict[unpackKey(tierKeysBase[tag], tierRank[tag], td.keyBits)];
+                ++tierRank[tag];
+            } else {
+                T v; std::memcpy(&v, fp + fi, sizeof(T));
+                out[pos] = v;
+                ++fi;
+            }
+        }
+        return out;
+    }
+
+    std::vector<T> decodeAllEliasFano(const EncodedBuffer<uint8_t>& enc, const ParsedHeader& h) const {
+        const size_t N = static_cast<size_t>(h.numElements);
+        std::vector<T> out(N);
+
+        for (const auto& td : h.tiers) {
+            const uint8_t* keysBase = enc.data().data() + td.keysOffset;
+            for (size_t rank = 0; rank < td.positions.size(); ++rank) {
+                const size_t pos = td.positions[rank];
+                if (pos < N) out[pos] = td.dict[unpackKey(keysBase, rank, td.keyBits)];
+            }
+        }
+
+        if (h.fallbackCount > 0) {
+            const T* fp = reinterpret_cast<const T*>(enc.data().data() + h.fallbackOffset + 4);
+            size_t fi = 0;
+            for (size_t w = 0; w < h.numWords; ++w) {
+                uint64_t uncov = ~h.coveredBitmap[w];
+                if (w == h.numWords - 1 && (N % 64) != 0) uncov &= (uint64_t{1} << (N % 64)) - 1;
+                while (uncov) {
+                    const size_t bit = static_cast<size_t>(__builtin_ctzll(uncov));
+                    const size_t pos = w * 64 + bit;
+                    T v; std::memcpy(&v, fp + fi, sizeof(T));
+                    out[pos] = v;
+                    ++fi;
+                    uncov &= uncov - 1;
+                }
+            }
+        }
+        return out;
+    }
+
+    std::vector<T> decodeAllNoIndex(const EncodedBuffer<uint8_t>& enc, const ParsedHeader& h) const {
+        std::vector<T> out;
+        out.reserve(static_cast<size_t>(h.numElements));
+        for (const auto& td : h.tiers) {
+            const uint8_t* keysBase = enc.data().data() + td.keysOffset;
+            for (size_t rank = 0; rank < td.tierCount; ++rank) {
+                out.push_back(td.dict[unpackKey(keysBase, rank, td.keyBits)]);
+            }
+        }
+        const T* fp = reinterpret_cast<const T*>(enc.data().data() + h.fallbackOffset + 4);
+        for (size_t i = 0; i < h.fallbackCount; ++i) {
+            T v; std::memcpy(&v, fp + i, sizeof(T));
+            out.push_back(v);
+        }
+        return out;
+    }
+
+    std::optional<T> decodeAtPerTierBitmaps(const EncodedBuffer<uint8_t>& enc, const ParsedHeader& h, size_t i) const {
+        for (const auto& td : h.tiers) {
+            if (td.bitmap[i / 64] & (uint64_t{1} << (i % 64))) {
+                const size_t rank = popcountPrefix(td.bitmap, i);
+                return td.dict[unpackKey(enc.data().data() + td.keysOffset, rank, td.keyBits)];
+            }
+        }
+        const size_t fallbackRank = fallbackRankAt(h, i);
+        const T* fp = reinterpret_cast<const T*>(enc.data().data() + h.fallbackOffset + 4);
+        T v; std::memcpy(&v, fp + fallbackRank, sizeof(T));
+        return v;
+    }
+
+    std::optional<T> decodeAtTierTagArray(const EncodedBuffer<uint8_t>& enc, const ParsedHeader& h, size_t i) const {
+        const uint8_t* tagBase = enc.data().data() + h.tagArrayOffset;
+        const uint8_t tag = unpackTagAt(tagBase, i, h.tagBits);
+        if (tag < h.numTiers) {
+            const auto& td = h.tiers[tag];
+            size_t rank = 0;
+            for (size_t j = 0; j < i; ++j) if (unpackTagAt(tagBase, j, h.tagBits) == tag) ++rank;
+            return td.dict[unpackKey(enc.data().data() + td.keysOffset, rank, td.keyBits)];
+        }
+        size_t fi = 0;
+        for (size_t j = 0; j < i; ++j) if (unpackTagAt(tagBase, j, h.tagBits) >= h.numTiers) ++fi;
+        const T* fp = reinterpret_cast<const T*>(enc.data().data() + h.fallbackOffset + 4);
+        T v; std::memcpy(&v, fp + fi, sizeof(T));
+        return v;
+    }
+
+    std::optional<T> decodeAtEliasFano(const EncodedBuffer<uint8_t>& enc, const ParsedHeader& h, size_t i) const {
+        for (const auto& td : h.tiers) {
+            auto it = std::lower_bound(td.positions.begin(), td.positions.end(), static_cast<uint32_t>(i));
+            if (it != td.positions.end() && *it == i) {
+                const size_t rank = static_cast<size_t>(it - td.positions.begin());
+                return td.dict[unpackKey(enc.data().data() + td.keysOffset, rank, td.keyBits)];
+            }
+        }
+        const size_t fallbackRank = fallbackRankAt(h, i);
+        const T* fp = reinterpret_cast<const T*>(enc.data().data() + h.fallbackOffset + 4);
+        T v; std::memcpy(&v, fp + fallbackRank, sizeof(T));
+        return v;
+    }
+
+    std::optional<T> decodeAtNoIndex(const EncodedBuffer<uint8_t>& enc, const ParsedHeader& h, size_t i) const {
+        if (i < h.tierPrefix.back()) {
+            const auto it = std::upper_bound(h.tierPrefix.begin(), h.tierPrefix.end(), i);
+            const size_t t = static_cast<size_t>(it - h.tierPrefix.begin() - 1);
+            const size_t rank = i - h.tierPrefix[t];
+            const auto& td = h.tiers[t];
+            return td.dict[unpackKey(enc.data().data() + td.keysOffset, rank, td.keyBits)];
+        }
+        const size_t fi = i - h.tierPrefix.back();
+        const T* fp = reinterpret_cast<const T*>(enc.data().data() + h.fallbackOffset + 4);
+        T v; std::memcpy(&v, fp + fi, sizeof(T));
+        return v;
+    }
+
+    std::vector<T> decodeRangePerTierBitmaps(const EncodedBuffer<uint8_t>& enc, const ParsedHeader& h, size_t start, size_t end) const {
+        const size_t rangeLen = end - start;
+        std::vector<T> out(rangeLen);
+        for (const auto& td : h.tiers) {
+            size_t rank = popcountPrefix(td.bitmap, start);
+            const uint8_t* keysBase = enc.data().data() + td.keysOffset;
+            for (size_t pos = start; pos < end; ++pos) {
+                if (td.bitmap[pos / 64] & (uint64_t{1} << (pos % 64))) {
+                    out[pos - start] = td.dict[unpackKey(keysBase, rank, td.keyBits)];
+                    ++rank;
+                }
+            }
+        }
+        if (h.fallbackCount > 0) {
+            const size_t fallbackRankStart = fallbackRankAt(h, start);
+            const T* fp = reinterpret_cast<const T*>(enc.data().data() + h.fallbackOffset + 4);
+            size_t fi = fallbackRankStart;
+            for (size_t pos = start; pos < end; ++pos) {
+                if (!(h.coveredBitmap[pos / 64] & (uint64_t{1} << (pos % 64)))) {
+                    T v; std::memcpy(&v, fp + fi, sizeof(T));
+                    out[pos - start] = v;
+                    ++fi;
+                }
+            }
+        }
+        return out;
+    }
+
+    std::vector<T> decodeRangeTierTagArray(const EncodedBuffer<uint8_t>& enc, const ParsedHeader& h, size_t start, size_t end) const {
+        const size_t rangeLen = end - start;
+        std::vector<T> out(rangeLen);
+        const uint8_t* tagBase = enc.data().data() + h.tagArrayOffset;
+
+        std::vector<size_t> tierRankAtStart(h.numTiers, 0);
+        size_t fallbackRankAtStart = 0;
+        for (size_t j = 0; j < start; ++j) {
+            const uint8_t tag = unpackTagAt(tagBase, j, h.tagBits);
+            if (tag < h.numTiers) ++tierRankAtStart[tag];
+            else ++fallbackRankAtStart;
+        }
+
+        std::vector<const uint8_t*> tierKeysBase(h.numTiers, nullptr);
+        for (size_t t = 0; t < h.numTiers; ++t) tierKeysBase[t] = enc.data().data() + h.tiers[t].keysOffset;
+        const T* fp = reinterpret_cast<const T*>(enc.data().data() + h.fallbackOffset + 4);
+
+        std::vector<size_t> tierRank = tierRankAtStart;
+        size_t fi = fallbackRankAtStart;
+        for (size_t pos = start; pos < end; ++pos) {
+            const uint8_t tag = unpackTagAt(tagBase, pos, h.tagBits);
+            if (tag < h.numTiers) {
+                const auto& td = h.tiers[tag];
+                out[pos - start] = td.dict[unpackKey(tierKeysBase[tag], tierRank[tag], td.keyBits)];
+                ++tierRank[tag];
+            } else {
+                T v; std::memcpy(&v, fp + fi, sizeof(T));
+                out[pos - start] = v;
+                ++fi;
+            }
+        }
+        return out;
+    }
+
+    std::vector<T> decodeRangeEliasFano(const EncodedBuffer<uint8_t>& enc, const ParsedHeader& h, size_t start, size_t end) const {
+        const size_t rangeLen = end - start;
+        std::vector<T> out(rangeLen);
+        for (const auto& td : h.tiers) {
+            auto it = std::lower_bound(td.positions.begin(), td.positions.end(), static_cast<uint32_t>(start));
+            size_t rank = static_cast<size_t>(it - td.positions.begin());
+            const uint8_t* keysBase = enc.data().data() + td.keysOffset;
+            for (; it != td.positions.end() && *it < end; ++it, ++rank) {
+                out[*it - start] = td.dict[unpackKey(keysBase, rank, td.keyBits)];
+            }
+        }
+        if (h.fallbackCount > 0) {
+            const size_t fallbackRankStart = fallbackRankAt(h, start);
+            const T* fp = reinterpret_cast<const T*>(enc.data().data() + h.fallbackOffset + 4);
+            size_t fi = fallbackRankStart;
+            for (size_t pos = start; pos < end; ++pos) {
+                if (!(h.coveredBitmap[pos / 64] & (uint64_t{1} << (pos % 64)))) {
+                    T v; std::memcpy(&v, fp + fi, sizeof(T));
+                    out[pos - start] = v;
+                    ++fi;
+                }
+            }
+        }
+        return out;
+    }
+
+    std::vector<T> decodeRangeNoIndex(const EncodedBuffer<uint8_t>& enc, const ParsedHeader& h, size_t start, size_t end) const {
+        const size_t rangeLen = end - start;
+        std::vector<T> out(rangeLen);
+        for (size_t idx = start; idx < end; ++idx) {
+            if (idx < h.tierPrefix.back()) {
+                const auto it = std::upper_bound(h.tierPrefix.begin(), h.tierPrefix.end(), idx);
+                const size_t t = static_cast<size_t>(it - h.tierPrefix.begin() - 1);
+                const size_t rank = idx - h.tierPrefix[t];
+                const auto& td = h.tiers[t];
+                out[idx - start] = td.dict[unpackKey(enc.data().data() + td.keysOffset, rank, td.keyBits)];
+            } else {
+                const size_t fi = idx - h.tierPrefix.back();
+                const T* fp = reinterpret_cast<const T*>(enc.data().data() + h.fallbackOffset + 4);
+                T v; std::memcpy(&v, fp + fi, sizeof(T));
+                out[idx - start] = v;
+            }
+        }
+        return out;
+    }
+
+public:
+    // ---------------------------------------------------------------------------
+    // Decode all
+    // ---------------------------------------------------------------------------
+
+    std::vector<T> decodeAll(const EncodedBuffer<uint8_t>& enc) override {
+        const ParsedHeader& h = getParsedHeader(enc);
+        if constexpr (IndexType == FreqPartIndexType::PerTierBitmaps) {
+            return decodeAllPerTierBitmaps(enc, h);
+        } else if constexpr (IndexType == FreqPartIndexType::TierTagArray) {
+            return decodeAllTierTagArray(enc, h);
+        } else if constexpr (IndexType == FreqPartIndexType::EliasFano) {
+            return decodeAllEliasFano(enc, h);
+        } else {
+            return decodeAllNoIndex(enc, h);
+        }
     }
 
     // ---------------------------------------------------------------------------
@@ -940,63 +1120,14 @@ public:
     std::optional<T> decodeAt(const EncodedBuffer<uint8_t>& enc, size_t i) override {
         const ParsedHeader& h = getParsedHeader(enc);
         if (i >= h.numElements) return std::nullopt;
-
-        if (h.indexType == FreqPartIndexType::PerTierBitmaps) {
-            for (const auto& td : h.tiers) {
-                if (td.bitmap[i / 64] & (uint64_t{1} << (i % 64))) {
-                    const size_t rank = popcountPrefix(td.bitmap, i);
-                    return td.dict[unpackKey(enc.data().data() + td.keysOffset, rank, td.keyBits)];
-                }
-            }
-            // Fallback: use precomputed prefix table — O(numWords) instead of O(i×numTiers).
-            const size_t fallbackRank = fallbackRankAt(h, i);
-            const T* fp = reinterpret_cast<const T*>(enc.data().data() + h.fallbackOffset + 4);
-            T v; std::memcpy(&v, fp + fallbackRank, sizeof(T));
-            return v;
-        } else if (h.indexType == FreqPartIndexType::TierTagArray) {
-            // TierTagArray: read tag at position i, then scan to compute rank.
-            const uint8_t* tagBase = enc.data().data() + h.tagArrayOffset;
-            const uint8_t  tag     = unpackTagAt(tagBase, i, h.tagBits);
-            if (tag < h.numTiers) {
-                const auto& td = h.tiers[tag];
-                // Rank = number of positions < i with the same tag.
-                size_t rank = 0;
-                for (size_t j = 0; j < i; ++j)
-                    if (unpackTagAt(tagBase, j, h.tagBits) == tag) ++rank;
-                return td.dict[unpackKey(enc.data().data() + td.keysOffset, rank, td.keyBits)];
-            } else {
-                size_t fi = 0;
-                for (size_t j = 0; j < i; ++j)
-                    if (unpackTagAt(tagBase, j, h.tagBits) >= h.numTiers) ++fi;
-                const T* fp = reinterpret_cast<const T*>(enc.data().data() + h.fallbackOffset + 4);
-                T v; std::memcpy(&v, fp + fi, sizeof(T));
-                return v;
-            }
-        } else if (h.indexType == FreqPartIndexType::EliasFano) {
-            for (const auto& td : h.tiers) {
-                auto it = std::lower_bound(td.positions.begin(), td.positions.end(), static_cast<uint32_t>(i));
-                if (it != td.positions.end() && *it == i) {
-                    const size_t rank = static_cast<size_t>(it - td.positions.begin());
-                    return td.dict[unpackKey(enc.data().data() + td.keysOffset, rank, td.keyBits)];
-                }
-            }
-            const size_t fallbackRank = fallbackRankAt(h, i);
-            const T* fp = reinterpret_cast<const T*>(enc.data().data() + h.fallbackOffset + 4);
-            T v; std::memcpy(&v, fp + fallbackRank, sizeof(T));
-            return v;
+        if constexpr (IndexType == FreqPartIndexType::PerTierBitmaps) {
+            return decodeAtPerTierBitmaps(enc, h, i);
+        } else if constexpr (IndexType == FreqPartIndexType::TierTagArray) {
+            return decodeAtTierTagArray(enc, h, i);
+        } else if constexpr (IndexType == FreqPartIndexType::EliasFano) {
+            return decodeAtEliasFano(enc, h, i);
         } else {
-            // NoIndex: index is in reordered output space.
-            if (i < h.tierPrefix.back()) {
-                const auto it = std::upper_bound(h.tierPrefix.begin(), h.tierPrefix.end(), i);
-                const size_t t = static_cast<size_t>(it - h.tierPrefix.begin() - 1);
-                const size_t rank = i - h.tierPrefix[t];
-                const auto& td = h.tiers[t];
-                return td.dict[unpackKey(enc.data().data() + td.keysOffset, rank, td.keyBits)];
-            }
-            const size_t fi = i - h.tierPrefix.back();
-            const T* fp = reinterpret_cast<const T*>(enc.data().data() + h.fallbackOffset + 4);
-            T v; std::memcpy(&v, fp + fi, sizeof(T));
-            return v;
+            return decodeAtNoIndex(enc, h, i);
         }
     }
 
@@ -1009,108 +1140,16 @@ public:
         const size_t N = static_cast<size_t>(h.numElements);
         if (start >= end || start >= N) return {};
         end = std::min(end, N);
-        const size_t rangeLen = end - start;
-        std::vector<T> out(rangeLen);
 
-        if (h.indexType == FreqPartIndexType::PerTierBitmaps) {
-            // Tier passes.
-            for (const auto& td : h.tiers) {
-                size_t rank = popcountPrefix(td.bitmap, start);
-                const uint8_t* keysBase = enc.data().data() + td.keysOffset;
-                for (size_t pos = start; pos < end; ++pos) {
-                    if (td.bitmap[pos / 64] & (uint64_t{1} << (pos % 64))) {
-                        out[pos - start] = td.dict[unpackKey(keysBase, rank, td.keyBits)];
-                        ++rank;
-                    }
-                }
-            }
-
-            // Fallback pass using precomputed prefix table.
-            if (h.fallbackCount > 0) {
-                const size_t fallbackRankStart = fallbackRankAt(h, start);
-                const T* fp = reinterpret_cast<const T*>(enc.data().data() + h.fallbackOffset + 4);
-                size_t fi = fallbackRankStart;
-                for (size_t pos = start; pos < end; ++pos) {
-                    if (!(h.coveredBitmap[pos / 64] & (uint64_t{1} << (pos % 64)))) {
-                        T v; std::memcpy(&v, fp + fi, sizeof(T));
-                        out[pos - start] = v;
-                        ++fi;
-                    }
-                }
-            }
-        } else if (h.indexType == FreqPartIndexType::TierTagArray) {
-            // TierTagArray: scan tag array, track per-tier and fallback ranks.
-            const uint8_t* tagBase = enc.data().data() + h.tagArrayOffset;
-
-            // Compute ranks at `start` by scanning prefix.
-            std::vector<size_t> tierRankAtStart(h.numTiers, 0);
-            size_t fallbackRankAtStart = 0;
-            for (size_t j = 0; j < start; ++j) {
-                const uint8_t tag = unpackTagAt(tagBase, j, h.tagBits);
-                if (tag < h.numTiers) ++tierRankAtStart[tag];
-                else ++fallbackRankAtStart;
-            }
-
-            std::vector<const uint8_t*> tierKeysBase(h.numTiers, nullptr);
-            for (size_t t = 0; t < h.numTiers; ++t)
-                tierKeysBase[t] = enc.data().data() + h.tiers[t].keysOffset;
-            const T* fp = reinterpret_cast<const T*>(enc.data().data() + h.fallbackOffset + 4);
-
-            std::vector<size_t> tierRank = tierRankAtStart;
-            size_t fi = fallbackRankAtStart;
-            for (size_t pos = start; pos < end; ++pos) {
-                const uint8_t tag = unpackTagAt(tagBase, pos, h.tagBits);
-                if (tag < h.numTiers) {
-                    const auto& td = h.tiers[tag];
-                    out[pos - start] = td.dict[unpackKey(tierKeysBase[tag], tierRank[tag], td.keyBits)];
-                    ++tierRank[tag];
-                } else {
-                    T v; std::memcpy(&v, fp + fi, sizeof(T));
-                    out[pos - start] = v;
-                    ++fi;
-                }
-            }
-        } else if (h.indexType == FreqPartIndexType::EliasFano) {
-            for (const auto& td : h.tiers) {
-                auto it = std::lower_bound(td.positions.begin(), td.positions.end(), static_cast<uint32_t>(start));
-                size_t rank = static_cast<size_t>(it - td.positions.begin());
-                const uint8_t* keysBase = enc.data().data() + td.keysOffset;
-                for (; it != td.positions.end() && *it < end; ++it, ++rank) {
-                    out[*it - start] = td.dict[unpackKey(keysBase, rank, td.keyBits)];
-                }
-            }
-
-            if (h.fallbackCount > 0) {
-                const size_t fallbackRankStart = fallbackRankAt(h, start);
-                const T* fp = reinterpret_cast<const T*>(enc.data().data() + h.fallbackOffset + 4);
-                size_t fi = fallbackRankStart;
-                for (size_t pos = start; pos < end; ++pos) {
-                    if (!(h.coveredBitmap[pos / 64] & (uint64_t{1} << (pos % 64)))) {
-                        T v; std::memcpy(&v, fp + fi, sizeof(T));
-                        out[pos - start] = v;
-                        ++fi;
-                    }
-                }
-            }
+        if constexpr (IndexType == FreqPartIndexType::PerTierBitmaps) {
+            return decodeRangePerTierBitmaps(enc, h, start, end);
+        } else if constexpr (IndexType == FreqPartIndexType::TierTagArray) {
+            return decodeRangeTierTagArray(enc, h, start, end);
+        } else if constexpr (IndexType == FreqPartIndexType::EliasFano) {
+            return decodeRangeEliasFano(enc, h, start, end);
         } else {
-            // NoIndex range in reordered output space.
-            for (size_t idx = start; idx < end; ++idx) {
-                if (idx < h.tierPrefix.back()) {
-                    const auto it = std::upper_bound(h.tierPrefix.begin(), h.tierPrefix.end(), idx);
-                    const size_t t = static_cast<size_t>(it - h.tierPrefix.begin() - 1);
-                    const size_t rank = idx - h.tierPrefix[t];
-                    const auto& td = h.tiers[t];
-                    out[idx - start] = td.dict[unpackKey(enc.data().data() + td.keysOffset, rank, td.keyBits)];
-                } else {
-                    const size_t fi = idx - h.tierPrefix.back();
-                    const T* fp = reinterpret_cast<const T*>(enc.data().data() + h.fallbackOffset + 4);
-                    T v; std::memcpy(&v, fp + fi, sizeof(T));
-                    out[idx - start] = v;
-                }
-            }
+            return decodeRangeNoIndex(enc, h, start, end);
         }
-
-        return out;
     }
 
     // ---------------------------------------------------------------------------
