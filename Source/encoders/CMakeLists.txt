@@ -115,7 +115,7 @@ target_sources(encodings_encoders INTERFACE
         FOREncoder.hpp
         OpenZLEncoder.hpp
         LZ4Encoder.hpp
-    FSEEncoder.hpp
+        FSEEncoder.hpp
 )
 
 target_include_directories(encodings_encoders INTERFACE

@@ -44,6 +44,7 @@ if(BUILD_TESTS)
     add_test(NAME test_bitset COMMAND test_bitset)
     add_test(NAME test_subint_encoder COMMAND test_subint_encoder)
     add_test(NAME test_fse_encoder COMMAND test_fse_encoder)
+    add_test(NAME test_frequency_partition_encoder COMMAND test_frequency_partition_encoder)
 endif()
 
 # Simple test for DeltaRunLengthEncoder
@@ -117,3 +118,9 @@ add_executable(test_fse_encoder test_fse_encoder.cpp)
 target_include_directories(test_fse_encoder PRIVATE ${CMAKE_SOURCE_DIR}/Source)
 target_link_libraries(test_fse_encoder PRIVATE encodings_core encodings_encodings encodings_encoders encodings_generators)
 set_target_properties(test_fse_encoder PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+# Tests for FrequencyPartitionEncoder (bitmap/tag index modes)
+add_executable(test_frequency_partition_encoder test_frequency_partition_encoder.cpp)
+target_include_directories(test_frequency_partition_encoder PRIVATE ${CMAKE_SOURCE_DIR}/Source)
+target_link_libraries(test_frequency_partition_encoder PRIVATE encodings_core encodings_encodings encodings_encoders encodings_generators)
+set_target_properties(test_frequency_partition_encoder PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
