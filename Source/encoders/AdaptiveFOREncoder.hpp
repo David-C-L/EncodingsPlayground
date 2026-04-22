@@ -80,7 +80,7 @@ public:
             return makeEmpty();
         }
 
-    const auto pick = choosePlan(data);
+        const auto pick = choosePlan(data);
 
         // Prepare storage
         const size_t numFrames = (N + pick.frameSize - 1) / pick.frameSize;
@@ -103,29 +103,27 @@ public:
         const uint64_t refBytes = static_cast<uint64_t>(refs.size() * sizeof(TIn));
         const uint64_t resBytes = static_cast<uint64_t>(residualEncoded.data().size());
 
-        std::vector<uint8_t> out;
-        out.reserve(headerSize() + refBytes + resBytes);
+        // Build output in one allocation: header + refs + residuals
+        const size_t total = headerSize() + static_cast<size_t>(refBytes) + static_cast<size_t>(resBytes);
+        std::vector<uint8_t> out(total);
+        uint8_t* p = out.data();
 
-        // Header
-        appendU64(out, static_cast<uint64_t>(N));
-        appendU32(out, static_cast<uint32_t>(pick.frameSize));
+        writeU64(p, static_cast<uint64_t>(N));          p += 8;
+        writeU32(p, static_cast<uint32_t>(pick.frameSize)); p += 4;
         if (bitpacked) {
-            out.push_back(static_cast<uint8_t>(kBitpackedFlag | pick.resBits));
+            *p++ = static_cast<uint8_t>(kBitpackedFlag | pick.resBits);
         } else {
-            out.push_back(static_cast<uint8_t>(pick.resWidth));
+            *p++ = static_cast<uint8_t>(pick.resWidth);
         }
-        out.push_back(static_cast<uint8_t>(0)); // refPolicy MIN (reserved)
-        out.push_back(0); out.push_back(0);     // pad to 16-byte alignment of offsets
-        appendU64(out, refBytes);
-        appendU64(out, resBytes);
+        *p++ = 0;  // refPolicy MIN (reserved)
+        *p++ = 0;  // pad
+        *p++ = 0;  // pad
+        writeU64(p, refBytes);  p += 8;
+        writeU64(p, resBytes);  p += 8;
 
-        // Refs
-        const size_t refOff = out.size();
-        out.resize(refOff + refBytes);
-        std::memcpy(out.data() + refOff, refs.data(), refBytes);
-
-        // Residual payload
-        out.insert(out.end(), residualEncoded.data().begin(), residualEncoded.data().end());
+        std::memcpy(p, refs.data(), static_cast<size_t>(refBytes));
+        p += static_cast<size_t>(refBytes);
+        std::memcpy(p, residualEncoded.data().data(), static_cast<size_t>(resBytes));
 
         encodings::EncodingMetadata meta;
         meta.encodingName         = name();
@@ -158,13 +156,56 @@ public:
         const auto h = parseHeader(encoded);
         if (h.N == 0) return {};
 
-        const auto& residualView = getCachedResidualView(encoded, h);
-        const auto residuals = decodeResidualsAll(residualView, h);
+        const TIn*     refs    = reinterpret_cast<const TIn*>(encoded.data().data() + h.refOffset);
+        const uint8_t* resData = encoded.data().data() + h.resOffset;
+
         std::vector<TIn> out(h.N);
-        const TIn* refs = reinterpret_cast<const TIn*>(encoded.data().data() + h.refOffset);
-        for (size_t i = 0; i < h.N; ++i) {
-            const size_t f = i / h.frameSize;
-            out[i] = refs[f] + static_cast<TIn>(residuals[i]);
+
+        if (h.resBits) {
+            encodings::core::BitReader r(resData, h.resBytes, encodings::core::BitOrder::LSB);
+            size_t frameIdx = 0;
+            size_t frameEnd = h.frameSize;
+            for (size_t i = 0; i < h.N; ++i) {
+                if (i == frameEnd) { ++frameIdx; frameEnd += h.frameSize; }
+                out[i] = refs[frameIdx] + static_cast<TIn>(r.readFast(h.resBits));
+            }
+        } else {
+            size_t frameIdx = 0;
+            size_t frameEnd = h.frameSize;
+            switch (h.resWidth) {
+                case ResidualWidth::W8: {
+                    const auto* res = reinterpret_cast<const int8_t*>(resData);
+                    for (size_t i = 0; i < h.N; ++i) {
+                        if (i == frameEnd) { ++frameIdx; frameEnd += h.frameSize; }
+                        out[i] = refs[frameIdx] + static_cast<TIn>(res[i]);
+                    }
+                    break;
+                }
+                case ResidualWidth::W16: {
+                    const auto* res = reinterpret_cast<const int16_t*>(resData);
+                    for (size_t i = 0; i < h.N; ++i) {
+                        if (i == frameEnd) { ++frameIdx; frameEnd += h.frameSize; }
+                        out[i] = refs[frameIdx] + static_cast<TIn>(res[i]);
+                    }
+                    break;
+                }
+                case ResidualWidth::W32: {
+                    const auto* res = reinterpret_cast<const int32_t*>(resData);
+                    for (size_t i = 0; i < h.N; ++i) {
+                        if (i == frameEnd) { ++frameIdx; frameEnd += h.frameSize; }
+                        out[i] = refs[frameIdx] + static_cast<TIn>(res[i]);
+                    }
+                    break;
+                }
+                case ResidualWidth::W64: {
+                    const auto* res = reinterpret_cast<const int64_t*>(resData);
+                    for (size_t i = 0; i < h.N; ++i) {
+                        if (i == frameEnd) { ++frameIdx; frameEnd += h.frameSize; }
+                        out[i] = refs[frameIdx] + static_cast<TIn>(res[i]);
+                    }
+                    break;
+                }
+            }
         }
         return out;
     }
@@ -174,13 +215,24 @@ public:
         const auto h = parseHeader(encoded);
         if (index >= h.N) return std::nullopt;
 
-        const TIn* refs = reinterpret_cast<const TIn*>(encoded.data().data() + h.refOffset);
-        const TIn ref = refs[index / h.frameSize];
+        const TIn*     refs    = reinterpret_cast<const TIn*>(encoded.data().data() + h.refOffset);
+        const TIn      ref     = refs[index / h.frameSize];
+        const uint8_t* resData = encoded.data().data() + h.resOffset;
 
-        const auto& residualView = getCachedResidualView(encoded, h);
-        const auto residual = decodeResidualAt(residualView, h, index);
-        if (!residual) return std::nullopt;
-        return ref + static_cast<TIn>(*residual);
+        int64_t residual = 0;
+        if (h.resBits) {
+            encodings::core::BitReader r(resData, h.resBytes, encodings::core::BitOrder::LSB);
+            r.seekToBit(index * static_cast<size_t>(h.resBits));
+            residual = static_cast<int64_t>(r.read(h.resBits));
+        } else {
+            switch (h.resWidth) {
+                case ResidualWidth::W8:  residual = reinterpret_cast<const int8_t* >(resData)[index]; break;
+                case ResidualWidth::W16: residual = reinterpret_cast<const int16_t*>(resData)[index]; break;
+                case ResidualWidth::W32: residual = reinterpret_cast<const int32_t*>(resData)[index]; break;
+                case ResidualWidth::W64: residual = reinterpret_cast<const int64_t*>(resData)[index]; break;
+            }
+        }
+        return ref + static_cast<TIn>(residual);
     }
 
     // Decode range -----------------------------------------------------------
@@ -190,15 +242,58 @@ public:
         if (start >= end) return {};
         const size_t count = end - start;
 
-        const TIn* refs = reinterpret_cast<const TIn*>(encoded.data().data() + h.refOffset);
-        const auto& residualView = getCachedResidualView(encoded, h);
-        const auto residuals = decodeResidualRange(residualView, h, start, end);
+        const TIn*     refs    = reinterpret_cast<const TIn*>(encoded.data().data() + h.refOffset);
+        const uint8_t* resData = encoded.data().data() + h.resOffset;
 
-        std::vector<TIn> out;
-        out.reserve(count);
-        for (size_t i = 0; i < count; ++i) {
-            const size_t idx = start + i;
-            out.push_back(refs[idx / h.frameSize] + static_cast<TIn>(residuals[i]));
+        std::vector<TIn> out(count);
+
+        if (h.resBits) {
+            encodings::core::BitReader r(resData, h.resBytes, encodings::core::BitOrder::LSB);
+            r.seekToBit(start * static_cast<size_t>(h.resBits));
+            size_t frameIdx = start / h.frameSize;
+            size_t frameEnd = (frameIdx + 1) * h.frameSize;
+            for (size_t i = 0; i < count; ++i) {
+                const size_t idx = start + i;
+                if (idx == frameEnd) { ++frameIdx; frameEnd += h.frameSize; }
+                out[i] = refs[frameIdx] + static_cast<TIn>(r.readFast(h.resBits));
+            }
+        } else {
+            size_t frameIdx = start / h.frameSize;
+            size_t frameEnd = (frameIdx + 1) * h.frameSize;
+            switch (h.resWidth) {
+                case ResidualWidth::W8: {
+                    const auto* res = reinterpret_cast<const int8_t*>(resData);
+                    for (size_t i = 0; i < count; ++i) {
+                        if (start + i == frameEnd) { ++frameIdx; frameEnd += h.frameSize; }
+                        out[i] = refs[frameIdx] + static_cast<TIn>(res[start + i]);
+                    }
+                    break;
+                }
+                case ResidualWidth::W16: {
+                    const auto* res = reinterpret_cast<const int16_t*>(resData);
+                    for (size_t i = 0; i < count; ++i) {
+                        if (start + i == frameEnd) { ++frameIdx; frameEnd += h.frameSize; }
+                        out[i] = refs[frameIdx] + static_cast<TIn>(res[start + i]);
+                    }
+                    break;
+                }
+                case ResidualWidth::W32: {
+                    const auto* res = reinterpret_cast<const int32_t*>(resData);
+                    for (size_t i = 0; i < count; ++i) {
+                        if (start + i == frameEnd) { ++frameIdx; frameEnd += h.frameSize; }
+                        out[i] = refs[frameIdx] + static_cast<TIn>(res[start + i]);
+                    }
+                    break;
+                }
+                case ResidualWidth::W64: {
+                    const auto* res = reinterpret_cast<const int64_t*>(resData);
+                    for (size_t i = 0; i < count; ++i) {
+                        if (start + i == frameEnd) { ++frameIdx; frameEnd += h.frameSize; }
+                        out[i] = refs[frameIdx] + static_cast<TIn>(res[start + i]);
+                    }
+                    break;
+                }
+            }
         }
         return out;
     }
@@ -232,16 +327,10 @@ private:
 
     static constexpr size_t headerSize() { return 32; }
 
-    static void appendU64(std::vector<uint8_t>& buf, uint64_t v) {
-        const size_t off = buf.size();
-        buf.resize(off + sizeof(uint64_t));
-        std::memcpy(buf.data() + off, &v, sizeof(uint64_t));
-    }
-    static void appendU32(std::vector<uint8_t>& buf, uint32_t v) {
-        const size_t off = buf.size();
-        buf.resize(off + sizeof(uint32_t));
-        std::memcpy(buf.data() + off, &v, sizeof(uint32_t));
-    }
+    static void writeU64(uint8_t* p, uint64_t v) { std::memcpy(p, &v, sizeof(uint64_t)); }
+    static void writeU32(uint8_t* p, uint32_t v) { std::memcpy(p, &v, sizeof(uint32_t)); }
+    static uint64_t readU64(const uint8_t* p) { uint64_t v; std::memcpy(&v, p, sizeof(uint64_t)); return v; }
+    static uint32_t readU32(const uint8_t* p) { uint32_t v; std::memcpy(&v, p, sizeof(uint32_t)); return v; }
 
     // Plan selection ---------------------------------------------------------
     Plan choosePlan(std::span<const TIn> data) const {
@@ -324,22 +413,22 @@ private:
         const size_t N = data.size();
         const size_t numFrames = refs.size();
 
-        std::vector<ResT> residuals;
-        residuals.reserve(N);
+        std::vector<ResT> residuals(N);
 
+        size_t idx = 0;
         for (size_t f = 0; f < numFrames; ++f) {
             const size_t lo = f * frameSize;
             const size_t hi = std::min(lo + frameSize, N);
             const TIn ref = *std::min_element(data.begin() + static_cast<ptrdiff_t>(lo),
                                               data.begin() + static_cast<ptrdiff_t>(hi));
             refs[f] = ref;
-            for (size_t i = lo; i < hi; ++i) {
+            for (size_t i = lo; i < hi; ++i, ++idx) {
                 const auto residual = data[i] - ref;
                 if (residual < static_cast<TIn>(std::numeric_limits<ResT>::min()) ||
                     residual > static_cast<TIn>(std::numeric_limits<ResT>::max())) {
                     throw std::overflow_error("AdaptiveFOR: residual overflow after plan selection");
                 }
-                residuals.push_back(static_cast<ResT>(residual));
+                residuals[idx] = static_cast<ResT>(residual);
             }
         }
 
@@ -354,10 +443,11 @@ private:
         const size_t N = data.size();
         const size_t numFrames = refs.size();
 
-        std::vector<uint64_t> residuals;
-        residuals.reserve(N);
+        // Pre-allocate output buffer; write residuals directly — no intermediate vector.
+        std::vector<uint8_t> buf;
+        buf.reserve((N * static_cast<size_t>(bits) + 7) / 8);
+        encodings::core::BitWriter wr(buf, encodings::core::BitOrder::LSB);
 
-        uint64_t maxResidual = 0;
         for (size_t f = 0; f < numFrames; ++f) {
             const size_t lo = f * frameSize;
             const size_t hi = std::min(lo + frameSize, N);
@@ -365,25 +455,8 @@ private:
                                               data.begin() + static_cast<ptrdiff_t>(hi));
             refs[f] = ref;
             for (size_t i = lo; i < hi; ++i) {
-                const uint64_t residual = static_cast<uint64_t>(data[i] - ref);
-                residuals.push_back(residual);
-                maxResidual = std::max(maxResidual, residual);
+                wr.write(static_cast<uint32_t>(data[i] - ref), bits);
             }
-        }
-
-        uint8_t bw = bits;
-        if (bw == 0) {
-            bw = maxResidual == 0 ? 1 : static_cast<uint8_t>(64 - std::countl_zero(maxResidual));
-        }
-        if (bw > 32) {
-            throw std::runtime_error("AdaptiveFOR: bitpacked residual width exceeds 32 bits");
-        }
-
-        std::vector<uint8_t> buf;
-        buf.reserve((residuals.size() * bw + 7) / 8);
-        encodings::core::BitWriter wr(buf, encodings::core::BitOrder::LSB);
-        for (uint64_t r : residuals) {
-            wr.write(static_cast<uint32_t>(r), bw);
         }
         wr.flush();
 
@@ -423,174 +496,18 @@ private:
             h.resWidth = static_cast<ResidualWidth>(resMode);
         }
         p += 3; // skip refPolicy + pad
-    const uint64_t refBytes = readU64(p); p += 8;
-    const uint64_t resBytes = readU64(p); p += 8;
+        const uint64_t refBytes = readU64(p); p += 8;
+        const uint64_t resBytes = readU64(p); p += 8;
 
-    h.refOffset = static_cast<size_t>(p - encoded.data().data());
-    h.resOffset = h.refOffset + static_cast<size_t>(refBytes);
-    h.resBytes  = static_cast<size_t>(resBytes);
+        h.refOffset = static_cast<size_t>(p - encoded.data().data());
+        h.resOffset = h.refOffset + static_cast<size_t>(refBytes);
+        h.resBytes  = static_cast<size_t>(resBytes);
 
-    const size_t end = h.resOffset + static_cast<size_t>(resBytes);
+        const size_t end = h.resOffset + static_cast<size_t>(resBytes);
         if (end > encoded.data().size()) {
             throw std::runtime_error("AdaptiveFOR: header sizes exceed buffer length");
         }
         return h;
-    }
-
-    template <typename ResT>
-    static std::vector<ResT> decodeResidualsAllTyped(const EncodedBuffer<uint8_t>& residualView,
-                                                     const ParsedHeader& /*h*/) {
-        RawEncoder<ResT> raw;
-        return raw.decodeAll(residualView);
-    }
-
-    static std::vector<int64_t> decodeResidualsAllBitpacked(const EncodedBuffer<uint8_t>& residualView,
-                                                            const ParsedHeader& h) {
-        if (h.resBits == 0) return std::vector<int64_t>(h.N, 0);
-        const uint8_t* data = residualView.data().data();
-        const size_t size = residualView.data().size();
-        encodings::core::BitReader r(data, size, encodings::core::BitOrder::LSB);
-        std::vector<int64_t> out;
-        out.reserve(h.N);
-        for (size_t i = 0; i < h.N; ++i) {
-            out.push_back(static_cast<int64_t>(r.read(h.resBits)));
-        }
-        return out;
-    }
-
-    std::vector<int64_t> decodeResidualsAll(const EncodedBuffer<uint8_t>& residualView,
-                                            const ParsedHeader& h) const {
-        if (h.resBits) {
-            return decodeResidualsAllBitpacked(residualView, h);
-        }
-        switch (h.resWidth) {
-            case ResidualWidth::W8:  return widen(decodeResidualsAllTyped<int8_t >(residualView, h));
-            case ResidualWidth::W16: return widen(decodeResidualsAllTyped<int16_t>(residualView, h));
-            case ResidualWidth::W32: return widen(decodeResidualsAllTyped<int32_t>(residualView, h));
-            case ResidualWidth::W64: return widen(decodeResidualsAllTyped<int64_t>(residualView, h));
-        }
-        return {};
-    }
-
-    template <typename ResT>
-    static std::optional<int64_t> decodeResidualAtTyped(const EncodedBuffer<uint8_t>& residualView,
-                                                        const ParsedHeader& /*h*/,
-                                                        size_t idx) {
-        RawEncoder<ResT> raw;
-        auto v = raw.decodeAt(residualView, idx);
-        if (!v) return std::nullopt;
-        return static_cast<int64_t>(*v);
-    }
-
-    static std::optional<int64_t> decodeResidualAtBitpacked(const EncodedBuffer<uint8_t>& residualView,
-                                                            const ParsedHeader& h,
-                                                            size_t idx) {
-        if (idx >= h.N) return std::nullopt;
-        if (h.resBits == 0) return static_cast<int64_t>(0);
-        const uint8_t* data = residualView.data().data();
-        const size_t size = residualView.data().size();
-        encodings::core::BitReader r(data, size, encodings::core::BitOrder::LSB);
-        r.seekToBit(idx * static_cast<size_t>(h.resBits));
-        return static_cast<int64_t>(r.read(h.resBits));
-    }
-
-    std::optional<int64_t> decodeResidualAt(const EncodedBuffer<uint8_t>& residualView,
-                                            const ParsedHeader& h,
-                                            size_t idx) const {
-        if (h.resBits) {
-            return decodeResidualAtBitpacked(residualView, h, idx);
-        }
-        switch (h.resWidth) {
-            case ResidualWidth::W8:  return decodeResidualAtTyped<int8_t >(residualView, h, idx);
-            case ResidualWidth::W16: return decodeResidualAtTyped<int16_t>(residualView, h, idx);
-            case ResidualWidth::W32: return decodeResidualAtTyped<int32_t>(residualView, h, idx);
-            case ResidualWidth::W64: return decodeResidualAtTyped<int64_t>(residualView, h, idx);
-        }
-        return std::nullopt;
-    }
-
-    template <typename ResT>
-    static std::vector<int64_t> decodeResidualRangeTyped(const EncodedBuffer<uint8_t>& residualView,
-                                                         const ParsedHeader& /*h*/,
-                                                         size_t start,
-                                                         size_t end) {
-        RawEncoder<ResT> raw;
-        auto vals = raw.decodeRange(residualView, start, end);
-        std::vector<int64_t> out;
-        out.reserve(vals.size());
-        for (auto v : vals) out.push_back(static_cast<int64_t>(v));
-        return out;
-    }
-
-    static std::vector<int64_t> decodeResidualRangeBitpacked(const EncodedBuffer<uint8_t>& residualView,
-                                                             const ParsedHeader& h,
-                                                             size_t start,
-                                                             size_t end) {
-        if (start >= end) return {};
-        if (h.resBits == 0) return std::vector<int64_t>(end - start, 0);
-        const uint8_t* data = residualView.data().data();
-        const size_t size = residualView.data().size();
-        encodings::core::BitReader r(data, size, encodings::core::BitOrder::LSB);
-        r.seekToBit(start * static_cast<size_t>(h.resBits));
-        std::vector<int64_t> out;
-        out.reserve(end - start);
-        for (size_t i = start; i < end; ++i) {
-            out.push_back(static_cast<int64_t>(r.read(h.resBits)));
-        }
-        return out;
-    }
-
-    std::vector<int64_t> decodeResidualRange(const EncodedBuffer<uint8_t>& residualView,
-                                             const ParsedHeader& h,
-                                             size_t start,
-                                             size_t end) const {
-        if (h.resBits) {
-            return decodeResidualRangeBitpacked(residualView, h, start, end);
-        }
-        switch (h.resWidth) {
-            case ResidualWidth::W8:  return decodeResidualRangeTyped<int8_t >(residualView, h, start, end);
-            case ResidualWidth::W16: return decodeResidualRangeTyped<int16_t>(residualView, h, start, end);
-            case ResidualWidth::W32: return decodeResidualRangeTyped<int32_t>(residualView, h, start, end);
-            case ResidualWidth::W64: return decodeResidualRangeTyped<int64_t>(residualView, h, start, end);
-        }
-        return {};
-    }
-
-    static uint64_t readU64(const uint8_t* p) {
-        uint64_t v; std::memcpy(&v, p, sizeof(uint64_t)); return v;
-    }
-    static uint32_t readU32(const uint8_t* p) {
-        uint32_t v; std::memcpy(&v, p, sizeof(uint32_t)); return v;
-    }
-
-    static std::vector<int64_t> widen(const std::vector<int8_t>& v)  { return {v.begin(), v.end()}; }
-    static std::vector<int64_t> widen(const std::vector<int16_t>& v) { return {v.begin(), v.end()}; }
-    static std::vector<int64_t> widen(const std::vector<int32_t>& v) { return {v.begin(), v.end()}; }
-    static std::vector<int64_t> widen(const std::vector<int64_t>& v) { return v; }
-
-    const EncodedBuffer<uint8_t>& getCachedResidualView(const EncodedBuffer<uint8_t>& encoded,
-                                                        const ParsedHeader& h) const {
-        const uint8_t* basePtr = encoded.data().data();
-        const size_t totalSize = encoded.data().size();
-
-        if (cachedOuterPtr_ != basePtr || cachedOuterSize_ != totalSize) {
-            std::vector<uint8_t> residualPayload(h.resBytes);
-            std::memcpy(residualPayload.data(), basePtr + h.resOffset, h.resBytes);
-
-            encodings::EncodingMetadata residualMeta;
-            residualMeta.elementCount     = h.N;
-            residualMeta.compressedSize   = h.resBytes;
-            residualMeta.uncompressedSize = h.resBits
-                ? (h.N * static_cast<size_t>(h.resBits) + 7) / 8
-                : h.N * static_cast<size_t>(static_cast<uint8_t>(h.resWidth));
-            residualMeta.supportsRandomAccess = true;
-
-            cachedResidualView_ = encodings::EncodedData(std::move(residualPayload), std::move(residualMeta));
-            cachedOuterPtr_ = basePtr;
-            cachedOuterSize_ = totalSize;
-        }
-
-        return cachedResidualView_;
     }
 
     static EncodedBuffer<uint8_t> makeEmpty() {
@@ -603,11 +520,6 @@ private:
         meta.supportsRandomAccess = true;
         return encodings::EncodedData(std::move(out), std::move(meta));
     }
-
-    // Cache of extracted residual payload keyed by outer encoded buffer identity.
-    mutable const uint8_t* cachedOuterPtr_{nullptr};
-    mutable size_t cachedOuterSize_{0};
-    mutable EncodedBuffer<uint8_t> cachedResidualView_;
 };
 
 // Convenience factory
