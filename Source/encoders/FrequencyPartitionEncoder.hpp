@@ -83,7 +83,8 @@ public:
 
     static constexpr size_t kMaxKeyBits     = sizeof(T) * 4; // half storage width in bits
     static constexpr size_t kMaxTierDefs    = 32;            // upper bound on distinct key widths
-    static constexpr size_t kTagChunkSize   = 256;           // tags unpacked per bulk call
+    static constexpr size_t kTagChunkSize       = 256; // tags unpacked per bulk call
+    static constexpr size_t kRankSampleStride   = 256; // TierTagArray sampled rank index granularity
 
     // Number of active tiers for this T: key widths 1..kMaxKeyBits (inclusive).
     // With non-power-of-2 widths the tier count equals kMaxKeyBits since we use
@@ -535,6 +536,12 @@ private:
         std::vector<size_t>   fallbackPrefixPop;
         // Prefix of decoded element counts per tier (for NoIndex mode).
         std::vector<size_t>   tierPrefix;
+
+        // TierTagArray sampled rank index.
+        // tierRankSamples[t][i] = count of elements with tag==t in positions [0, i*kRankSampleStride).
+        // tierRankSamples[numTiers][i] = fallback count (tag >= numTiers).
+        // Allows O(kRankSampleStride) random access instead of O(N).
+        std::vector<std::vector<uint32_t>> tierRankSamples;
     };
 
     struct HeaderCache {
@@ -616,23 +623,42 @@ private:
             const size_t tagBytes = (h.numElements * h.tagBits + 7) / 8;
             p += tagBytes;
 
-            // Single pass over the tag array to count elements per tier.
-            // Replaces the previous O(N * numTiers) per-tier scan loops.
+            // Single pass over the tag array: count elements per tier and build sampled rank index.
+            // tierRankSamples has numTiers+1 rows (one per tier + one for fallback).
+            // Row t, sample i = count of tag==t in [0, i*kRankSampleStride).
             {
-                const uint8_t* tagPtr = enc.data().data() + h.tagArrayOffset;
-                const uint8_t  tb     = h.tagBits;
-                const uint8_t  tmask  = static_cast<uint8_t>((1u << tb) - 1u);
+                const uint8_t* tagPtr    = enc.data().data() + h.tagArrayOffset;
+                const uint8_t  tb        = h.tagBits;
+                const uint8_t  tmask     = static_cast<uint8_t>((1u << tb) - 1u);
+                const size_t   numBuckets = static_cast<size_t>(h.numTiers) + 1; // +1 for fallback
+                const size_t   numSamples = (h.numElements + kRankSampleStride - 1) / kRankSampleStride + 1;
+
+                h.tierRankSamples.assign(numBuckets, std::vector<uint32_t>(numSamples, 0));
+
+                // counts[t] = running count for tier t; counts[numTiers] = fallback count.
+                uint32_t counts[kNumActiveTiers + 1] = {};
                 size_t bitCursor = 0;
-                // Use a fixed-size count array; numTiers <= kNumActiveTiers.
-                uint32_t counts[kNumActiveTiers] = {};
+
                 for (size_t i = 0; i < h.numElements; ++i) {
+                    if (i % kRankSampleStride == 0) {
+                        const size_t si = i / kRankSampleStride;
+                        for (size_t t = 0; t < numBuckets; ++t)
+                            h.tierRankSamples[t][si] = counts[t];
+                    }
                     const size_t by = bitCursor >> 3;
                     const size_t bo = bitCursor & 7;
                     uint16_t buf = tagPtr[by];
                     if (bo + tb > 8) buf |= static_cast<uint16_t>(tagPtr[by + 1]) << 8;
                     const uint8_t tag = static_cast<uint8_t>((buf >> bo) & tmask);
-                    if (tag < h.numTiers) ++counts[tag];
+                    const uint8_t bucket = (tag < h.numTiers) ? tag : h.numTiers;
+                    ++counts[bucket];
                     bitCursor += tb;
+                }
+                // Write sentinel sample past the last full stride.
+                {
+                    const size_t si = (h.numElements + kRankSampleStride - 1) / kRankSampleStride;
+                    for (size_t t = 0; t < numBuckets; ++t)
+                        h.tierRankSamples[t][si] = counts[t];
                 }
                 for (size_t t = 0; t < h.numTiers; ++t) h.tiers[t].tierCount = counts[t];
             }
@@ -1043,22 +1069,16 @@ private:
         const uint8_t* tagBase = enc.data().data() + h.tagArrayOffset;
         const uint8_t  tagBits = h.tagBits;
         const uint8_t  tag     = unpackTagAt(tagBase, i, tagBits);
+        const uint8_t  bucket  = (tag < h.numTiers) ? tag : h.numTiers;
 
-        // Scan [0, i) using bulk unpack to count the rank of this position's
-        // tier (or fallback index), without per-element unpackTagAt calls.
-        alignas(64) uint8_t scratch[kTagChunkSize];
-        size_t rank = 0; // rank within tier `tag` (or fallback index if tag >= numTiers)
-        size_t bitCursor = 0;
-        for (size_t j = 0; j < i; ) {
-            const size_t chunk = std::min<size_t>(kTagChunkSize, i - j);
-            unpackTagsInto(tagBase, bitCursor, tagBits, chunk, scratch);
-            bitCursor += chunk * tagBits;
-            if (tag < h.numTiers) {
-                for (size_t k = 0; k < chunk; ++k) if (scratch[k] == tag) ++rank;
-            } else {
-                for (size_t k = 0; k < chunk; ++k) if (scratch[k] >= h.numTiers) ++rank;
-            }
-            j += chunk;
+        // Jump to nearest sample, then scan at most kRankSampleStride positions.
+        const size_t sampleIdx = i / kRankSampleStride;
+        size_t rank = h.tierRankSamples[bucket][sampleIdx];
+        const size_t scanStart = sampleIdx * kRankSampleStride;
+        for (size_t j = scanStart; j < i; ++j) {
+            const uint8_t t = unpackTagAt(tagBase, j, tagBits);
+            const uint8_t b = (t < h.numTiers) ? t : h.numTiers;
+            if (b == bucket) ++rank;
         }
 
         if (tag < h.numTiers) {
