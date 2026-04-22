@@ -98,25 +98,20 @@ public:
     EncodedBuffer<uint8_t> encode(std::span<const T> input) override {
         const size_t N = input.size();
 
-        // Count symbol frequencies.
+        // --- Phase 1: frequency count ---
         ankerl::unordered_dense::map<T, uint64_t> freq;
-        freq.reserve(N < 1024 ? N : 1024);
+        freq.reserve(N < (size_t{1} << 20) ? N : (size_t{1} << 20));
         for (const T v : input) ++freq[v];
 
-        // Sort by frequency descending (ties broken by value for determinism).
+        // --- Phase 2: sort by frequency descending (ties broken by value) ---
         std::vector<std::pair<T, uint64_t>> sortedFreq(freq.begin(), freq.end());
         std::sort(sortedFreq.begin(), sortedFreq.end(),
                   [](const auto& a, const auto& b) {
                       return a.second != b.second ? a.second > b.second : a.first < b.first;
                   });
-
         const size_t numUnique = sortedFreq.size();
 
-        // Assign values to tiers with non-power-of-2 key widths.
-        // Tier t uses exactly ceil(log2(t_dictSize)) bits for its keys,
-        // where t_dictSize is however many values are assigned to it.
-        // We fill tiers greedily: tier 0 gets up to 2^1=2 values, tier 1 up to
-        // 2^2=4 values, ..., tier (kb-1) up to 2^kb values (kb = 1..kMaxKeyBits).
+        // --- Phase 3: assign to tiers; accumulate element counts from freq table ---
         // valueInfo maps value → (tierIdx, key).
         ankerl::unordered_dense::map<T, std::pair<uint8_t, uint32_t>> valueInfo;
         valueInfo.reserve(numUnique);
@@ -126,114 +121,88 @@ public:
             std::vector<T> dict; // dict[key] = value
         };
         TierMeta tiers[kNumActiveTiers];
-        size_t assigned = 0;
-
-        for (size_t t = 0; t < kNumActiveTiers && assigned < numUnique; ++t) {
-            // Tier t's capacity (using standard 1-indexed key width t+1 bits).
-            const size_t cap = static_cast<size_t>(1) << (t + 1);
-            const size_t toAssign = std::min(cap, numUnique - assigned);
-            tiers[t].dict.reserve(toAssign);
-            for (size_t i = 0; i < toAssign; ++i) {
-                const T val = sortedFreq[assigned + i].first;
-                tiers[t].dict.push_back(val);
-                valueInfo[val] = {static_cast<uint8_t>(t), static_cast<uint32_t>(i)};
+        size_t tierElemCount[kNumActiveTiers] = {}; // total input elements per tier (from freq)
+        size_t numTiersUsed = 0;
+        {
+            size_t assigned = 0;
+            for (; numTiersUsed < kNumActiveTiers && assigned < numUnique; ++numTiersUsed) {
+                const size_t t        = numTiersUsed;
+                const size_t cap      = size_t{1} << (t + 1);
+                const size_t toAssign = std::min(cap, numUnique - assigned);
+                tiers[t].dict.reserve(toAssign);
+                for (size_t i = 0; i < toAssign; ++i) {
+                    const auto& sf = sortedFreq[assigned + i];
+                    tiers[t].dict.push_back(sf.first);
+                    valueInfo[sf.first] = {static_cast<uint8_t>(t), static_cast<uint32_t>(i)};
+                    tierElemCount[t] += sf.second;
+                }
+                tiers[t].keyBits = static_cast<uint8_t>(
+                    toAssign <= 1 ? 1
+                                  : static_cast<uint8_t>(sizeof(size_t) * 8
+                                                         - static_cast<size_t>(__builtin_clzll(toAssign - 1))));
+                assigned += toAssign;
             }
-            // Set key width to ceil(log2(toAssign)), minimum 1 bit.
-            tiers[t].keyBits = static_cast<uint8_t>(
-                toAssign <= 1 ? 1
-                              : static_cast<uint8_t>(sizeof(size_t) * 8
-                                                     - static_cast<size_t>(__builtin_clzll(toAssign - 1))));
-            assigned += toAssign;
         }
 
-        // Bitmap and key lists per tier.
+        // --- Phase 4: prune tiers using freq-derived counts (no input scan needed) ---
         const size_t numWords = (N + 63) / 64;
-        std::vector<std::vector<uint64_t>> bitmaps(kNumActiveTiers,
-                                                    std::vector<uint64_t>(numWords, 0));
-        std::vector<std::vector<uint32_t>> tierKeys(kNumActiveTiers);
-        std::vector<std::vector<uint32_t>> tierPositions(kNumActiveTiers);
-        std::vector<T> fallback;
-
-        for (size_t pos = 0; pos < N; ++pos) {
-            const T val = input[pos];
-            auto it = valueInfo.find(val);
-            if (it != valueInfo.end()) {
-                const auto [t, key] = it->second;
-                bitmaps[t][pos / 64] |= (uint64_t{1} << (pos % 64));
-                tierKeys[t].push_back(key);
-                tierPositions[t].push_back(static_cast<uint32_t>(pos));
-            } else {
-                fallback.push_back(val);
-            }
-        }
-
-        // Optimal tier selection: include a tier only when its savings exceed its cost.
-        // Cost of including tier t: bitmap (numWords*64 bits) + dict + keys.
-        // Savings: tier elements no longer stored as raw fallback values.
-        // Values from excluded tiers are demoted to fallback.
-        std::vector<bool> includeTier(kNumActiveTiers, false);
-        for (size_t t = 0; t < kNumActiveTiers; ++t) {
+        bool includeTier[kNumActiveTiers] = {};
+        for (size_t t = 0; t < numTiersUsed; ++t) {
             const size_t dSize = tiers[t].dict.size();
             if (dSize == 0) continue;
-            const size_t count = tierKeys[t].size();
-            const uint8_t kb   = tiers[t].keyBits;
-            const size_t cost    = numWords * 64
-                                 + dSize * sizeof(T) * 8
-                                 + (count * kb + 7) / 8 * 8;
+            const size_t count   = tierElemCount[t];
+            const uint8_t kb     = tiers[t].keyBits;
+            const size_t cost    = numWords * 64 + dSize * sizeof(T) * 8 + (count * kb + 7) / 8 * 8;
             const size_t savings = count * sizeof(T) * 8;
-            if (savings > cost) includeTier[t] = true;
+            includeTier[t] = (savings > cost);
         }
 
-        // Rebuild fallback to include elements from excluded tiers (preserve position order).
-        // We need to re-scan input to get original order correct.
-        {
-            // Check if any tier was excluded that had elements.
-            bool anyExcluded = false;
-            for (size_t t = 0; t < kNumActiveTiers; ++t)
-                if (!includeTier[t] && !tiers[t].dict.empty()) { anyExcluded = true; break; }
-
-            if (anyExcluded) {
-                // Rebuild fallback in position order.
-                fallback.clear();
-                for (size_t pos = 0; pos < N; ++pos) {
-                    const T val = input[pos];
-                    auto it = valueInfo.find(val);
-                    if (it == valueInfo.end()) {
-                        fallback.push_back(val);
-                    } else {
-                        const uint8_t t = it->second.first;
-                        if (!includeTier[t]) fallback.push_back(val);
-                    }
-                }
-                // Clear excluded tier key lists and bitmaps.
-                for (size_t t = 0; t < kNumActiveTiers; ++t) {
-                    if (!includeTier[t]) {
-                        tierKeys[t].clear();
-                        tierPositions[t].clear();
-                        std::fill(bitmaps[t].begin(), bitmaps[t].end(), 0);
-                    }
-                }
+        uint8_t numTiersWithData  = 0;
+        size_t  includedElemCount = 0;
+        for (size_t t = 0; t < numTiersUsed; ++t) {
+            if (includeTier[t] && !tiers[t].dict.empty()) {
+                ++numTiersWithData;
+                includedElemCount += tierElemCount[t];
             }
         }
 
-        // Count tiers with data to emit.
-        uint8_t numTiersWithData = 0;
-        for (size_t t = 0; t < kNumActiveTiers; ++t)
-            if (includeTier[t] && !tiers[t].dict.empty()) ++numTiersWithData;
+        // --- Phase 5: pre-reserve per-tier key vectors and fallback ---
+        std::vector<std::vector<uint32_t>> tierKeys(kNumActiveTiers);
+        for (size_t t = 0; t < numTiersUsed; ++t)
+            if (includeTier[t]) tierKeys[t].reserve(tierElemCount[t]);
 
-        // Serialise.
+        std::vector<T> fallback;
+        fallback.reserve(N - includedElemCount);
+
+        // --- Phase 6: accurate output size estimate, then single input scan + serialize ---
         std::vector<uint8_t> out;
-        out.reserve(N * sizeof(T));
+        {
+            size_t estSize = 10; // numElements(8) + numTiers(1) + indexType(1)
+            for (size_t t = 0; t < numTiersUsed; ++t) {
+                if (!includeTier[t] || tiers[t].dict.empty()) continue;
+                const uint8_t kb = tiers[t].keyBits;
+                estSize += 1 + 4 + tiers[t].dict.size() * sizeof(T); // keyBits + dictCount + dict
+                estSize += packedKeyBytes(tierElemCount[t], kb);
+                if constexpr (IndexType == FreqPartIndexType::PerTierBitmaps)
+                    estSize += numWords * sizeof(uint64_t);
+                else if constexpr (IndexType == FreqPartIndexType::NoIndex)
+                    estSize += 4; // tierCount uint32
+                else if constexpr (IndexType == FreqPartIndexType::EliasFano)
+                    estSize += 4 + 1 + 4 + 4 + numWords * sizeof(uint64_t); // generous EF overhead
+            }
+            if constexpr (IndexType == FreqPartIndexType::TierTagArray) {
+                const uint8_t tb = ceilLog2WithMinOne(static_cast<uint32_t>(numTiersWithData) + 1u);
+                estSize += (N * tb + 7) / 8;
+            }
+            estSize += 4 + (N - includedElemCount) * sizeof(T);
+            out.reserve(estSize);
+        }
 
         const auto appendBytes = [&](const void* src, size_t n) {
             const auto* p = static_cast<const uint8_t*>(src);
             out.insert(out.end(), p, p + n);
         };
         const auto appendT = [&](auto v) { appendBytes(&v, sizeof(v)); };
-
-        appendT(static_cast<uint64_t>(N));
-        appendT(numTiersWithData);
-    appendT(static_cast<uint8_t>(IndexType));
 
         struct TierLogInfo {
             uint8_t logicalTier{0};
@@ -252,60 +221,91 @@ public:
                 ? ((N * ceilLog2WithMinOne(static_cast<uint32_t>(numTiersWithData) + 1u) + 7) / 8)
                 : 0;
 
+        appendT(static_cast<uint64_t>(N));
+        appendT(numTiersWithData);
+        appendT(static_cast<uint8_t>(IndexType));
+
         if constexpr (IndexType == FreqPartIndexType::PerTierBitmaps) {
-            for (size_t t = 0; t < kNumActiveTiers; ++t) {
+            // Allocate bitmaps only for included tiers.
+            std::vector<std::vector<uint64_t>> bitmaps(numTiersUsed);
+            for (size_t t = 0; t < numTiersUsed; ++t)
+                if (includeTier[t] && !tiers[t].dict.empty())
+                    bitmaps[t].assign(numWords, 0);
+
+            // Single input scan: fill bitmaps + tier keys + fallback.
+            for (size_t pos = 0; pos < N; ++pos) {
+                const T val = input[pos];
+                auto it = valueInfo.find(val);
+                if (it != valueInfo.end()) {
+                    const auto [t, key] = it->second;
+                    if (includeTier[t]) {
+                        bitmaps[t][pos / 64] |= uint64_t{1} << (pos % 64);
+                        tierKeys[t].push_back(key);
+                    } else {
+                        fallback.push_back(val);
+                    }
+                } else {
+                    fallback.push_back(val);
+                }
+            }
+
+            for (size_t t = 0; t < numTiersUsed; ++t) {
                 if (!includeTier[t] || tiers[t].dict.empty()) continue;
-                const uint8_t kb    = tiers[t].keyBits;
-                const auto&   dict  = tiers[t].dict;
-                const auto&   keys  = tierKeys[t];
-                const size_t dictBytes = dict.size() * sizeof(T);
-                const size_t keyBytes  = packedKeyBytes(keys.size(), kb);
+                const uint8_t kb     = tiers[t].keyBits;
+                const auto&   dict   = tiers[t].dict;
+                const auto&   keys   = tierKeys[t];
+                const size_t dictBytes   = dict.size() * sizeof(T);
+                const size_t keyBytes    = packedKeyBytes(keys.size(), kb);
                 const size_t bitmapBytes = numWords * sizeof(uint64_t);
                 appendT(kb);
                 appendT(static_cast<uint32_t>(dict.size()));
                 for (const T v : dict) appendT(v);
                 for (size_t w = 0; w < numWords; ++w) appendT(bitmaps[t][w]);
                 packKeys(out, keys, kb);
-
-                tierLogs.push_back(TierLogInfo{
-                    static_cast<uint8_t>(t + 1),
-                    kb,
-                    dict.size(),
-                    keys.size(),
-                    dictBytes,
-                    keyBytes,
-                    bitmapBytes,
-                });
+                tierLogs.push_back({static_cast<uint8_t>(t + 1), kb,
+                                    dict.size(), keys.size(), dictBytes, keyBytes, bitmapBytes});
             }
-    } else if constexpr (IndexType == FreqPartIndexType::TierTagArray) {
-            // TierTagArray: emit the tag array first, then per-tier dict+keys.
+
+        } else if constexpr (IndexType == FreqPartIndexType::TierTagArray) {
             // tagBits = ceil(log2(numTiersWithData + 1)), minimum 1.
             const uint8_t tagBits = ceilLog2WithMinOne(static_cast<uint32_t>(numTiersWithData) + 1u);
 
-            // Build a tier-index remap: active tier index → 0-based output index.
-            std::vector<uint8_t> tierRemap(kNumActiveTiers, 0xFF);
-            uint8_t remapIdx = 0;
-            for (size_t t = 0; t < kNumActiveTiers; ++t)
-                if (includeTier[t] && !tiers[t].dict.empty())
-                    tierRemap[t] = remapIdx++;
+            // Build tier remap: logical tier index → 0-based output index.
+            uint8_t tierRemap[kNumActiveTiers];
+            std::fill(tierRemap, tierRemap + kNumActiveTiers, uint8_t{0xFF});
+            {
+                uint8_t remapIdx = 0;
+                for (size_t t = 0; t < numTiersUsed; ++t)
+                    if (includeTier[t] && !tiers[t].dict.empty())
+                        tierRemap[t] = remapIdx++;
+            }
 
-            // Pack tag array (tag = remapped tier idx, or numTiersWithData for fallback).
-            const size_t tagBytes = (N * tagBits + 7) / 8;
-            const size_t tagBase  = out.size();
-            out.resize(out.size() + tagBytes, 0);
+            // Pre-allocate zeroed tag array in output; record base offset.
+            const size_t tagBytesLocal = (N * tagBits + 7) / 8;
+            const size_t tagBase       = out.size();
+            out.resize(out.size() + tagBytesLocal, 0);
+
+            // Single input scan: collect tier keys + write tags directly into
+            // the pre-allocated region (no second hash-lookup pass).
             for (size_t pos = 0; pos < N; ++pos) {
                 const T val = input[pos];
                 auto it = valueInfo.find(val);
-                uint8_t tag = numTiersWithData; // fallback
+                uint8_t tag = numTiersWithData; // fallback tag
                 if (it != valueInfo.end()) {
-                    const uint8_t t = it->second.first;
-                    if (includeTier[t]) tag = tierRemap[t];
+                    const auto [t, key] = it->second;
+                    if (includeTier[t]) {
+                        tag = tierRemap[t];
+                        tierKeys[t].push_back(key);
+                    } else {
+                        fallback.push_back(val);
+                    }
+                } else {
+                    fallback.push_back(val);
                 }
                 packSingleTag(out, tagBase, pos, tagBits, tag);
             }
 
-            // Per-tier dict and keys.
-            for (size_t t = 0; t < kNumActiveTiers; ++t) {
+            for (size_t t = 0; t < numTiersUsed; ++t) {
                 if (!includeTier[t] || tiers[t].dict.empty()) continue;
                 const uint8_t kb   = tiers[t].keyBits;
                 const auto&   dict = tiers[t].dict;
@@ -316,42 +316,58 @@ public:
                 appendT(static_cast<uint32_t>(dict.size()));
                 for (const T v : dict) appendT(v);
                 packKeys(out, keys, kb);
-
-                tierLogs.push_back(TierLogInfo{
-                    static_cast<uint8_t>(t + 1),
-                    kb,
-                    dict.size(),
-                    keys.size(),
-                    dictBytes,
-                    keyBytes,
-                    0,
-                });
+                tierLogs.push_back({static_cast<uint8_t>(t + 1), kb,
+                                    dict.size(), keys.size(), dictBytes, keyBytes, 0});
             }
-    } else if constexpr (IndexType == FreqPartIndexType::EliasFano) {
-            for (size_t t = 0; t < kNumActiveTiers; ++t) {
+
+        } else if constexpr (IndexType == FreqPartIndexType::EliasFano) {
+            // Allocate positions only for included tiers.
+            std::vector<std::vector<uint32_t>> tierPositions(numTiersUsed);
+            for (size_t t = 0; t < numTiersUsed; ++t)
+                if (includeTier[t] && !tiers[t].dict.empty())
+                    tierPositions[t].reserve(tierElemCount[t]);
+
+            // Single input scan.
+            for (size_t pos = 0; pos < N; ++pos) {
+                const T val = input[pos];
+                auto it = valueInfo.find(val);
+                if (it != valueInfo.end()) {
+                    const auto [t, key] = it->second;
+                    if (includeTier[t]) {
+                        tierPositions[t].push_back(static_cast<uint32_t>(pos));
+                        tierKeys[t].push_back(key);
+                    } else {
+                        fallback.push_back(val);
+                    }
+                } else {
+                    fallback.push_back(val);
+                }
+            }
+
+            for (size_t t = 0; t < numTiersUsed; ++t) {
                 if (!includeTier[t] || tiers[t].dict.empty()) continue;
                 const uint8_t kb   = tiers[t].keyBits;
                 const auto&   dict = tiers[t].dict;
                 const auto&   keys = tierKeys[t];
                 const auto&   posv = tierPositions[t];
-
                 const size_t dictBytes = dict.size() * sizeof(T);
                 const size_t keyBytes  = packedKeyBytes(keys.size(), kb);
 
                 const uint8_t lowBits = chooseEliasFanoLowBits(N, posv.size());
                 std::vector<uint32_t> lows;
                 lows.reserve(posv.size());
-                const uint32_t lowMask = (lowBits == 32) ? 0xFFFFFFFFu : ((lowBits == 0) ? 0u : ((1u << lowBits) - 1u));
+                const uint32_t lowMask = (lowBits == 32) ? 0xFFFFFFFFu
+                                       : ((lowBits == 0) ? 0u : ((1u << lowBits) - 1u));
                 for (uint32_t ppos : posv) lows.push_back(ppos & lowMask);
                 const size_t lowBytes = packedKeyBytes(lows.size(), lowBits);
 
-                const size_t highBitsLen = ((N >> lowBits) + posv.size() + 1);
+                const size_t highBitsLen   = (N >> lowBits) + posv.size() + 1;
                 const size_t highWordCount = (highBitsLen + 63) / 64;
                 std::vector<uint64_t> highBits(highWordCount, 0);
                 for (size_t i = 0; i < posv.size(); ++i) {
-                    const size_t hi = static_cast<size_t>(posv[i] >> lowBits);
+                    const size_t hi     = static_cast<size_t>(posv[i] >> lowBits);
                     const size_t bitPos = hi + i;
-                    highBits[bitPos / 64] |= (uint64_t{1} << (bitPos % 64));
+                    highBits[bitPos / 64] |= uint64_t{1} << (bitPos % 64);
                 }
 
                 appendT(kb);
@@ -364,43 +380,43 @@ public:
                 packKeys(out, lows, lowBits);
                 for (size_t w = 0; w < highWordCount; ++w) appendT(highBits[w]);
                 packKeys(out, keys, kb);
-
-                tierLogs.push_back(TierLogInfo{
-                    static_cast<uint8_t>(t + 1),
-                    kb,
-                    dict.size(),
-                    keys.size(),
-                    dictBytes,
-                    keyBytes,
-                    static_cast<size_t>(4 + 1 + 4 + 4) + lowBytes + highWordCount * sizeof(uint64_t),
-                });
+                tierLogs.push_back({static_cast<uint8_t>(t + 1), kb, dict.size(), keys.size(),
+                                    dictBytes, keyBytes,
+                                    static_cast<size_t>(4 + 1 + 4 + 4) + lowBytes + highWordCount * sizeof(uint64_t)});
             }
+
         } else {
-            // NoIndex: no positional index emitted; rows decode in reordered
-            // stream order (all values for tier0, then tier1, ..., fallback).
-            for (size_t t = 0; t < kNumActiveTiers; ++t) {
+            // NoIndex: no positional structures needed.
+            // Single input scan.
+            for (size_t pos = 0; pos < N; ++pos) {
+                const T val = input[pos];
+                auto it = valueInfo.find(val);
+                if (it != valueInfo.end()) {
+                    const auto [t, key] = it->second;
+                    if (includeTier[t]) {
+                        tierKeys[t].push_back(key);
+                    } else {
+                        fallback.push_back(val);
+                    }
+                } else {
+                    fallback.push_back(val);
+                }
+            }
+
+            for (size_t t = 0; t < numTiersUsed; ++t) {
                 if (!includeTier[t] || tiers[t].dict.empty()) continue;
                 const uint8_t kb   = tiers[t].keyBits;
                 const auto&   dict = tiers[t].dict;
                 const auto&   keys = tierKeys[t];
                 const size_t dictBytes = dict.size() * sizeof(T);
                 const size_t keyBytes  = packedKeyBytes(keys.size(), kb);
-
                 appendT(kb);
                 appendT(static_cast<uint32_t>(dict.size()));
                 for (const T v : dict) appendT(v);
                 appendT(static_cast<uint32_t>(keys.size()));
                 packKeys(out, keys, kb);
-
-                tierLogs.push_back(TierLogInfo{
-                    static_cast<uint8_t>(t + 1),
-                    kb,
-                    dict.size(),
-                    keys.size(),
-                    dictBytes,
-                    keyBytes,
-                    0,
-                });
+                tierLogs.push_back({static_cast<uint8_t>(t + 1), kb,
+                                    dict.size(), keys.size(), dictBytes, keyBytes, 0});
             }
         }
 
