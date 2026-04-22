@@ -604,23 +604,34 @@ private:
             const size_t tagBytes = (h.numElements * h.tagBits + 7) / 8;
             p += tagBytes;
 
-            // Per-tier dict and keys (no bitmaps stored).
+            // Single pass over the tag array to count elements per tier.
+            // Replaces the previous O(N * numTiers) per-tier scan loops.
+            {
+                const uint8_t* tagPtr = enc.data().data() + h.tagArrayOffset;
+                const uint8_t  tb     = h.tagBits;
+                const uint8_t  tmask  = static_cast<uint8_t>((1u << tb) - 1u);
+                size_t bitCursor = 0;
+                // Use a fixed-size count array; numTiers <= kNumActiveTiers.
+                uint32_t counts[kNumActiveTiers] = {};
+                for (size_t i = 0; i < h.numElements; ++i) {
+                    const size_t by = bitCursor >> 3;
+                    const size_t bo = bitCursor & 7;
+                    uint16_t buf = tagPtr[by];
+                    if (bo + tb > 8) buf |= static_cast<uint16_t>(tagPtr[by + 1]) << 8;
+                    const uint8_t tag = static_cast<uint8_t>((buf >> bo) & tmask);
+                    if (tag < h.numTiers) ++counts[tag];
+                    bitCursor += tb;
+                }
+                for (size_t t = 0; t < h.numTiers; ++t) h.tiers[t].tierCount = counts[t];
+            }
+
+            // Parse per-tier metadata sequentially; tierCount is now known so p advances correctly.
             for (auto& td : h.tiers) {
                 td.keyBits = readU8();
                 const uint32_t dictCount = readU32();
                 td.dict.resize(dictCount);
                 for (auto& v : td.dict) v = readT();
-                // tierCount determined by scanning tag array — defer; we use keysOffset.
                 td.keysOffset = static_cast<size_t>(p - enc.data().data());
-                // We don't know tierCount yet without scanning tags; we'll compute it lazily.
-                // Instead, store keysOffset and use a two-pass approach in decode methods.
-                // For now, scan tags to count.
-                const uint8_t thisTierIdx = static_cast<uint8_t>(&td - h.tiers.data());
-                td.tierCount = 0;
-                const uint8_t* tagBase = enc.data().data() + h.tagArrayOffset;
-                for (size_t i = 0; i < h.numElements; ++i) {
-                    if (unpackTagAt(tagBase, i, h.tagBits) == thisTierIdx) ++td.tierCount;
-                }
                 p += packedKeyBytes(td.tierCount, td.keyBits);
             }
     } else if constexpr (IndexType == FreqPartIndexType::EliasFano) {
@@ -876,19 +887,41 @@ private:
         const size_t N = static_cast<size_t>(h.numElements);
         std::vector<T> out(N);
         const uint8_t* tagBase = enc.data().data() + h.tagArrayOffset;
+        const uint8_t  tagBits = h.tagBits;
+        const uint8_t  tagMask = static_cast<uint8_t>((1u << tagBits) - 1u);
 
-        std::vector<size_t> tierRank(h.numTiers, 0);
+        // Per-tier key base pointers and incremental bit-position cursors.
+        // Using bit cursors avoids the rank * keyBits multiply inside the hot loop.
         std::vector<const uint8_t*> tierKeysBase(h.numTiers, nullptr);
-        for (size_t t = 0; t < h.numTiers; ++t) tierKeysBase[t] = enc.data().data() + h.tiers[t].keysOffset;
+        std::vector<size_t>         tierBitPos(h.numTiers, 0);
+        for (size_t t = 0; t < h.numTiers; ++t)
+            tierKeysBase[t] = enc.data().data() + h.tiers[t].keysOffset;
 
         const T* fp = reinterpret_cast<const T*>(enc.data().data() + h.fallbackOffset + 4);
         size_t fi = 0;
+        size_t tagBitCursor = 0; // incremental tag bit position (avoids pos * tagBits per step)
+
         for (size_t pos = 0; pos < N; ++pos) {
-            const uint8_t tag = unpackTagAt(tagBase, pos, h.tagBits);
+            // Inline incremental tag unpack: avoids pos * tagBits multiply.
+            const size_t tgBy = tagBitCursor >> 3;
+            const size_t tgBo = tagBitCursor & 7;
+            uint16_t tgBuf = tagBase[tgBy];
+            if (tgBo + tagBits > 8) tgBuf |= static_cast<uint16_t>(tagBase[tgBy + 1]) << 8;
+            const uint8_t tag = static_cast<uint8_t>((tgBuf >> tgBo) & tagMask);
+            tagBitCursor += tagBits;
+
             if (tag < h.numTiers) {
                 const auto& td = h.tiers[tag];
-                out[pos] = td.dict[unpackKey(tierKeysBase[tag], tierRank[tag], td.keyBits)];
-                ++tierRank[tag];
+                const uint8_t kb = td.keyBits;
+                // Inline incremental key unpack: avoids rank * keyBits multiply.
+                const size_t  kBp  = tierBitPos[tag];
+                const size_t  kBy  = kBp >> 3;
+                const size_t  kBo  = kBp & 7;
+                const uint32_t kMask = (kb == 32) ? ~0u : ((1u << kb) - 1u);
+                uint64_t kBuf = 0;
+                std::memcpy(&kBuf, tierKeysBase[tag] + kBy, (kBo + kb + 7) >> 3);
+                out[pos] = td.dict[static_cast<uint32_t>((kBuf >> kBo) & kMask)];
+                tierBitPos[tag] += kb;
             } else {
                 T v; std::memcpy(&v, fp + fi, sizeof(T));
                 out[pos] = v;
