@@ -695,20 +695,26 @@ private:
                 p += packedKeyBytes(td.tierCount, td.keyBits);
             }
 
-            h.coveredBitmap.assign(h.numWords, 0);
-            for (const auto& td : h.tiers) {
-                for (uint32_t pos : td.positions) {
-                    h.coveredBitmap[pos / 64] |= (uint64_t{1} << (pos % 64));
-                }
-            }
+            // Only build the covered bitmap and fallback prefix-pop table when there
+            // is actually a fallback section — peek at fallbackCount without advancing p.
+            {
+                uint32_t peekedFallbackCount = 0;
+                std::memcpy(&peekedFallbackCount, p, 4);
+                if (peekedFallbackCount > 0) {
+                    h.coveredBitmap.assign(h.numWords, 0);
+                    for (const auto& td : h.tiers)
+                        for (uint32_t pos : td.positions)
+                            h.coveredBitmap[pos / 64] |= uint64_t{1} << (pos % 64);
 
-            h.fallbackPrefixPop.resize(h.numWords + 1, 0);
-            for (size_t w = 0; w < h.numWords; ++w) {
-                uint64_t uncov = ~h.coveredBitmap[w];
-                if (w == h.numWords - 1 && (h.numElements % 64) != 0)
-                    uncov &= (uint64_t{1} << (h.numElements % 64)) - 1;
-                h.fallbackPrefixPop[w + 1] = h.fallbackPrefixPop[w]
-                                           + static_cast<size_t>(__builtin_popcountll(uncov));
+                    h.fallbackPrefixPop.resize(h.numWords + 1, 0);
+                    for (size_t w = 0; w < h.numWords; ++w) {
+                        uint64_t uncov = ~h.coveredBitmap[w];
+                        if (w == h.numWords - 1 && (h.numElements % 64) != 0)
+                            uncov &= (uint64_t{1} << (h.numElements % 64)) - 1;
+                        h.fallbackPrefixPop[w + 1] = h.fallbackPrefixPop[w]
+                                                   + static_cast<size_t>(__builtin_popcountll(uncov));
+                    }
+                }
             }
         } else {
             // NoIndex: tiers contain only dict + tierCount + packed keys.
