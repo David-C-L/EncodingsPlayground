@@ -514,8 +514,9 @@ private:
         struct TierData {
             uint8_t  keyBits{0};
             std::vector<T>        dict;
-            std::vector<uint64_t> bitmap;   // only for PerTierBitmaps
-            std::vector<uint32_t> positions; // for EliasFano
+            std::vector<uint64_t> bitmap;     // only for PerTierBitmaps
+            std::vector<uint32_t> rankIndex;  // Rank9 superblock: rankIndex[b] = popcount(bitmap[0..8b-1])
+            std::vector<uint32_t> positions;  // for EliasFano
             size_t   keysOffset{0};
             size_t   tierCount{0};
         };
@@ -578,6 +579,16 @@ private:
 
                 td.tierCount = 0;
                 for (uint64_t w : td.bitmap) td.tierCount += static_cast<size_t>(__builtin_popcountll(w));
+
+                // Build Rank9 superblock index: one cumulative count per 8-word (512-bit) block.
+                const size_t numBlocks = (h.numWords + 7) / 8;
+                td.rankIndex.resize(numBlocks + 1, 0);
+                for (size_t blk = 0; blk < numBlocks; ++blk) {
+                    td.rankIndex[blk + 1] = td.rankIndex[blk];
+                    const size_t wEnd = std::min((blk + 1) * 8, h.numWords);
+                    for (size_t w = blk * 8; w < wEnd; ++w)
+                        td.rankIndex[blk + 1] += static_cast<uint32_t>(__builtin_popcountll(td.bitmap[w]));
+                }
 
                 td.keysOffset = static_cast<size_t>(p - enc.data().data());
                 p += packedKeyBytes(td.tierCount, td.keyBits);
@@ -842,7 +853,7 @@ private:
         }
     }
 
-    // Popcount of all bits in `bitmap` strictly before position `i`.
+    // Popcount of all bits in `bitmap` strictly before position `i` — O(N/64), kept for coveredBitmap.
     static size_t popcountPrefix(const std::vector<uint64_t>& bitmap, size_t i) {
         size_t rank = 0;
         const size_t fullWords = i / 64;
@@ -851,6 +862,21 @@ private:
         const size_t rem = i % 64;
         if (rem > 0)
             rank += static_cast<size_t>(__builtin_popcountll(bitmap[fullWords] & ((uint64_t{1} << rem) - 1)));
+        return rank;
+    }
+
+    // O(1) rank query using the Rank9 superblock index stored in TierData.
+    // Returns the number of set bits in td.bitmap strictly before position `i`.
+    static size_t popcountPrefixFast(const typename ParsedHeader::TierData& td, size_t i) {
+        const size_t blk     = i / 512;
+        const size_t wordOff = (i % 512) / 64;
+        const size_t bitOff  = i % 64;
+        size_t rank = td.rankIndex[blk];
+        for (size_t w = blk * 8; w < blk * 8 + wordOff; ++w)
+            rank += static_cast<size_t>(__builtin_popcountll(td.bitmap[w]));
+        if (bitOff)
+            rank += static_cast<size_t>(__builtin_popcountll(
+                td.bitmap[blk * 8 + wordOff] & ((uint64_t{1} << bitOff) - 1)));
         return rank;
     }
 
@@ -1003,7 +1029,7 @@ private:
     std::optional<T> decodeAtPerTierBitmaps(const EncodedBuffer<uint8_t>& enc, const ParsedHeader& h, size_t i) const {
         for (const auto& td : h.tiers) {
             if (td.bitmap[i / 64] & (uint64_t{1} << (i % 64))) {
-                const size_t rank = popcountPrefix(td.bitmap, i);
+                const size_t rank = popcountPrefixFast(td, i);
                 return td.dict[unpackKey(enc.data().data() + td.keysOffset, rank, td.keyBits)];
             }
         }
@@ -1076,7 +1102,7 @@ private:
         const size_t rangeLen = end - start;
         std::vector<T> out(rangeLen);
         for (const auto& td : h.tiers) {
-            size_t rank = popcountPrefix(td.bitmap, start);
+            size_t rank = popcountPrefixFast(td, start);
             const uint8_t* keysBase = enc.data().data() + td.keysOffset;
             for (size_t pos = start; pos < end; ++pos) {
                 if (td.bitmap[pos / 64] & (uint64_t{1} << (pos % 64))) {
