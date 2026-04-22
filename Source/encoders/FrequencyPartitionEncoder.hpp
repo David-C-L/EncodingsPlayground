@@ -287,24 +287,39 @@ public:
             const size_t tagBase       = out.size();
             out.resize(out.size() + tagBytesLocal, 0);
 
-            // Single input scan: collect tier keys + write tags directly into
-            // the pre-allocated region (no second hash-lookup pass).
-            for (size_t pos = 0; pos < N; ++pos) {
-                const T val = input[pos];
-                auto it = valueInfo.find(val);
-                uint8_t tag = numTiersWithData; // fallback tag
-                if (it != valueInfo.end()) {
-                    const auto [t, key] = it->second;
-                    if (includeTier[t]) {
-                        tag = tierRemap[t];
-                        tierKeys[t].push_back(key);
+            // Single input scan: collect tier keys + write tags into the pre-allocated region.
+            // Tags are accumulated in a uint64_t and flushed one byte at a time, eliminating
+            // the per-element read-modify-write of packSingleTag.
+            {
+                uint64_t tagAcc     = 0;
+                size_t   tagAccBits = 0;
+                size_t   tagByteOut = 0;
+
+                for (size_t pos = 0; pos < N; ++pos) {
+                    const T val = input[pos];
+                    auto it = valueInfo.find(val);
+                    uint8_t tag = numTiersWithData;
+                    if (it != valueInfo.end()) {
+                        const auto [t, key] = it->second;
+                        if (includeTier[t]) {
+                            tag = tierRemap[t];
+                            tierKeys[t].push_back(key);
+                        } else {
+                            fallback.push_back(val);
+                        }
                     } else {
                         fallback.push_back(val);
                     }
-                } else {
-                    fallback.push_back(val);
+                    tagAcc |= static_cast<uint64_t>(tag) << tagAccBits;
+                    tagAccBits += tagBits;
+                    if (tagAccBits >= 8) {
+                        out[tagBase + tagByteOut++] = static_cast<uint8_t>(tagAcc & 0xFF);
+                        tagAcc     >>= 8;
+                        tagAccBits  -= 8;
+                    }
                 }
-                packSingleTag(out, tagBase, pos, tagBits, tag);
+                if (tagAccBits > 0)
+                    out[tagBase + tagByteOut] = static_cast<uint8_t>(tagAcc & 0xFF);
             }
 
             for (size_t t = 0; t < numTiersUsed; ++t) {
@@ -427,11 +442,16 @@ public:
         appendT(static_cast<uint32_t>(fallback.size()));
         for (const T v : fallback) appendT(v);
 
+        // 8-byte zero padding so unpackKey can always do a single 8-byte memcpy
+        // without reading past the buffer end.  Not counted in compressedSize.
+        const size_t logicalSize = out.size();
+        out.resize(out.size() + 8, 0);
+
         EncodedBuffer<uint8_t> result;
         result.metadata().elementCount         = N;
         result.metadata().encodingName         = name();
         result.metadata().supportsRandomAccess = true;
-        result.metadata().compressedSize       = out.size();
+        result.metadata().compressedSize       = logicalSize;
         result.metadata().uncompressedSize     = N * sizeof(T);
         result.data() = std::move(out);
 
@@ -821,17 +841,14 @@ private:
     }
 
     // Unpack key at rank `r` from packed keys at `base`, with `keyBits` bits per key.
+    // Requires 8 bytes of zero-padding past the end of the packed array (guaranteed by encode).
     static uint32_t unpackKey(const uint8_t* base, size_t r, uint8_t keyBits) {
         const size_t  bitPos  = r * keyBits;
-        const size_t  byteIdx = bitPos / 8;
-        const size_t  bitOff  = bitPos % 8;
+        const size_t  byteIdx = bitPos >> 3;
+        const size_t  bitOff  = bitPos & 7;
         const uint32_t mask   = (keyBits == 32) ? ~0u : ((1u << keyBits) - 1u);
-
-        // Read up to 5 bytes to cover any key width ≤ 32 bits crossing byte boundaries.
         uint64_t buf = 0;
-        const size_t bytesNeeded = (bitOff + keyBits + 7) / 8;
-        for (size_t b = 0; b < bytesNeeded; ++b)
-            buf |= static_cast<uint64_t>(base[byteIdx + b]) << (b * 8);
+        std::memcpy(&buf, base + byteIdx, sizeof(uint64_t));
         return static_cast<uint32_t>((buf >> bitOff) & mask);
     }
 
