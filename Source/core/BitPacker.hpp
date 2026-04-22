@@ -194,15 +194,54 @@ public:
     }
 
     /**
+     * @brief LSB-only fast path: word-at-a-time bit extraction.
+     *
+     * Maintains a 64-bit accumulator so bytes are loaded in bulk and each
+     * call is a single shift+mask with no inner loop. Significantly faster
+     * than read() for dense sequential decoding of fixed-width codes.
+     *
+     * Must only be used with LSB-ordered streams. Compatible with seekToBit:
+     * the accumulator is flushed on every seek so bit alignment is preserved.
+     *
+     * @param width  Number of bits to extract (1–32).
+     * @throws std::out_of_range if the buffer is exhausted.
+     */
+    uint32_t readFast(uint32_t width) {
+        if (wbitsAvail_ < width) [[unlikely]] {
+            // Consume initial partial byte left over from a seekToBit call.
+            if (bitOffset_ > 0 && bytePos_ < size_) {
+                wbuf_      = static_cast<uint64_t>(data_[bytePos_++]) >> bitOffset_;
+                wbitsAvail_ = 8u - bitOffset_;
+                bitOffset_  = 0;
+            }
+            // Fill the accumulator as full as possible.
+            while (wbitsAvail_ <= 56 && bytePos_ < size_) {
+                wbuf_ |= static_cast<uint64_t>(data_[bytePos_++]) << wbitsAvail_;
+                wbitsAvail_ += 8;
+            }
+            if (wbitsAvail_ < width) [[unlikely]]
+                throw std::out_of_range("BitReader: read past end of buffer");
+        }
+        const uint32_t mask   = (width >= 32u) ? ~0u : ((1u << width) - 1u);
+        const uint32_t result = static_cast<uint32_t>(wbuf_) & mask;
+        wbuf_       >>= width;
+        wbitsAvail_  -= width;
+        return result;
+    }
+
+    /**
      * @brief Seek to an absolute bit position in the buffer.
      * Enables O(1) random access when combined with a pre-computed bit offset.
+     * Resets the readFast accumulator so readFast() can be used after seeking.
      *
      * @param bitPos  Absolute bit index (0 = first bit of first byte).
      * @throws std::out_of_range if bitPos is beyond the buffer.
      */
     void seekToBit(size_t bitPos) {
-        bytePos_   = bitPos >> 3;
-        bitOffset_ = static_cast<uint32_t>(bitPos & 7u);
+        bytePos_    = bitPos >> 3;
+        bitOffset_  = static_cast<uint32_t>(bitPos & 7u);
+        wbuf_       = 0;
+        wbitsAvail_ = 0;
         if (bytePos_ > size_) {
             throw std::out_of_range("BitReader::seekToBit: position out of range");
         }
@@ -222,6 +261,8 @@ private:
     BitOrder       order_;
     size_t         bytePos_{0};
     uint32_t       bitOffset_{0};
+    uint64_t       wbuf_{0};       // readFast accumulator
+    uint32_t       wbitsAvail_{0}; // valid bits in wbuf_
 };
 
 } // namespace encodings::core
