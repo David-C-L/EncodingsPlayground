@@ -1247,18 +1247,22 @@ private:
     std::vector<T> decodeRangeNoIndex(const EncodedBuffer<uint8_t>& enc, const ParsedHeader& h, size_t start, size_t end) const {
         const size_t rangeLen = end - start;
         std::vector<T> out(rangeLen);
-        for (size_t idx = start; idx < end; ++idx) {
+        const T* fp = reinterpret_cast<const T*>(enc.data().data() + h.fallbackOffset + 4);
+
+        // Locate the starting tier once, then advance across boundaries — O(numTiers) total.
+        auto it = std::upper_bound(h.tierPrefix.begin(), h.tierPrefix.end(), start);
+        size_t t = static_cast<size_t>(it - h.tierPrefix.begin() - 1);
+
+        for (size_t idx = start, outIdx = 0; idx < end; ++idx, ++outIdx) {
+            while (t + 1 < h.tiers.size() && idx >= h.tierPrefix[t + 1]) ++t;
+
             if (idx < h.tierPrefix.back()) {
-                const auto it = std::upper_bound(h.tierPrefix.begin(), h.tierPrefix.end(), idx);
-                const size_t t = static_cast<size_t>(it - h.tierPrefix.begin() - 1);
-                const size_t rank = idx - h.tierPrefix[t];
                 const auto& td = h.tiers[t];
-                out[idx - start] = td.dict[unpackKey(enc.data().data() + td.keysOffset, rank, td.keyBits)];
+                const size_t rank = idx - h.tierPrefix[t];
+                out[outIdx] = td.dict[unpackKey(enc.data().data() + td.keysOffset, rank, td.keyBits)];
             } else {
-                const size_t fi = idx - h.tierPrefix.back();
-                const T* fp = reinterpret_cast<const T*>(enc.data().data() + h.fallbackOffset + 4);
-                T v; std::memcpy(&v, fp + fi, sizeof(T));
-                out[idx - start] = v;
+                T v; std::memcpy(&v, fp + (idx - h.tierPrefix.back()), sizeof(T));
+                out[outIdx] = v;
             }
         }
         return out;
