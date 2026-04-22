@@ -83,6 +83,7 @@ public:
 
     static constexpr size_t kMaxKeyBits     = sizeof(T) * 4; // half storage width in bits
     static constexpr size_t kMaxTierDefs    = 32;            // upper bound on distinct key widths
+    static constexpr size_t kTagChunkSize   = 256;           // tags unpacked per bulk call
 
     // Number of active tiers for this T: key widths 1..kMaxKeyBits (inclusive).
     // With non-power-of-2 widths the tier count equals kMaxKeyBits since we use
@@ -821,6 +822,26 @@ private:
         return static_cast<uint8_t>((buf >> bitOff) & mask);
     }
 
+    // Unpack `count` consecutive tags starting at bit offset `startBit` into dst[].
+    // dst must be caller-allocated (at least `count` bytes); no heap allocation occurs.
+    // The loop is branch-free on the tag value, enabling auto-vectorisation of the
+    // unpack itself independently of the dispatch logic in the callers.
+    static void unpackTagsInto(const uint8_t* __restrict__ base,
+                                size_t startBit, uint8_t tagBits,
+                                size_t count,
+                                uint8_t* __restrict__ dst) noexcept {
+        const uint8_t mask = static_cast<uint8_t>((1u << tagBits) - 1u);
+        size_t bitCursor = startBit;
+        for (size_t i = 0; i < count; ++i) {
+            const size_t by = bitCursor >> 3;
+            const size_t bo = bitCursor & 7;
+            uint16_t buf = base[by];
+            if (bo + tagBits > 8) buf |= static_cast<uint16_t>(base[by + 1]) << 8;
+            dst[i] = static_cast<uint8_t>((buf >> bo) & mask);
+            bitCursor += tagBits;
+        }
+    }
+
     // Popcount of all bits in `bitmap` strictly before position `i`.
     static size_t popcountPrefix(const std::vector<uint64_t>& bitmap, size_t i) {
         size_t rank = 0;
@@ -888,10 +909,7 @@ private:
         std::vector<T> out(N);
         const uint8_t* tagBase = enc.data().data() + h.tagArrayOffset;
         const uint8_t  tagBits = h.tagBits;
-        const uint8_t  tagMask = static_cast<uint8_t>((1u << tagBits) - 1u);
 
-        // Per-tier key base pointers and incremental bit-position cursors.
-        // Using bit cursors avoids the rank * keyBits multiply inside the hot loop.
         std::vector<const uint8_t*> tierKeysBase(h.numTiers, nullptr);
         std::vector<size_t>         tierBitPos(h.numTiers, 0);
         for (size_t t = 0; t < h.numTiers; ++t)
@@ -899,33 +917,36 @@ private:
 
         const T* fp = reinterpret_cast<const T*>(enc.data().data() + h.fallbackOffset + 4);
         size_t fi = 0;
-        size_t tagBitCursor = 0; // incremental tag bit position (avoids pos * tagBits per step)
+        size_t tagBitCursor = 0;
 
-        for (size_t pos = 0; pos < N; ++pos) {
-            // Inline incremental tag unpack: avoids pos * tagBits multiply.
-            const size_t tgBy = tagBitCursor >> 3;
-            const size_t tgBo = tagBitCursor & 7;
-            uint16_t tgBuf = tagBase[tgBy];
-            if (tgBo + tagBits > 8) tgBuf |= static_cast<uint16_t>(tagBase[tgBy + 1]) << 8;
-            const uint8_t tag = static_cast<uint8_t>((tgBuf >> tgBo) & tagMask);
-            tagBitCursor += tagBits;
+        // Unpack tags in fixed-size chunks into a stack buffer.
+        // The unpack loop (branch-free) and the dispatch loop are separate, letting
+        // the compiler vectorise the unpack independently of the key/dict logic.
+        alignas(64) uint8_t tagScratch[kTagChunkSize];
 
-            if (tag < h.numTiers) {
-                const auto& td = h.tiers[tag];
-                const uint8_t kb = td.keyBits;
-                // Inline incremental key unpack: avoids rank * keyBits multiply.
-                const size_t  kBp  = tierBitPos[tag];
-                const size_t  kBy  = kBp >> 3;
-                const size_t  kBo  = kBp & 7;
-                const uint32_t kMask = (kb == 32) ? ~0u : ((1u << kb) - 1u);
-                uint64_t kBuf = 0;
-                std::memcpy(&kBuf, tierKeysBase[tag] + kBy, (kBo + kb + 7) >> 3);
-                out[pos] = td.dict[static_cast<uint32_t>((kBuf >> kBo) & kMask)];
-                tierBitPos[tag] += kb;
-            } else {
-                T v; std::memcpy(&v, fp + fi, sizeof(T));
-                out[pos] = v;
-                ++fi;
+        for (size_t pos = 0; pos < N; ) {
+            const size_t chunk = std::min<size_t>(kTagChunkSize, N - pos);
+            unpackTagsInto(tagBase, tagBitCursor, tagBits, chunk, tagScratch);
+            tagBitCursor += chunk * tagBits;
+
+            for (size_t i = 0; i < chunk; ++i, ++pos) {
+                const uint8_t tag = tagScratch[i];
+                if (tag < h.numTiers) {
+                    const auto& td = h.tiers[tag];
+                    const uint8_t  kb    = td.keyBits;
+                    const size_t   kBp   = tierBitPos[tag];
+                    const size_t   kBy   = kBp >> 3;
+                    const size_t   kBo   = kBp & 7;
+                    const uint32_t kMask = (kb == 32) ? ~0u : ((1u << kb) - 1u);
+                    uint64_t kBuf = 0;
+                    std::memcpy(&kBuf, tierKeysBase[tag] + kBy, (kBo + kb + 7) >> 3);
+                    out[pos] = td.dict[static_cast<uint32_t>((kBuf >> kBo) & kMask)];
+                    tierBitPos[tag] += kb;
+                } else {
+                    T v; std::memcpy(&v, fp + fi, sizeof(T));
+                    out[pos] = v;
+                    ++fi;
+                }
             }
         }
         return out;
@@ -994,17 +1015,32 @@ private:
 
     std::optional<T> decodeAtTierTagArray(const EncodedBuffer<uint8_t>& enc, const ParsedHeader& h, size_t i) const {
         const uint8_t* tagBase = enc.data().data() + h.tagArrayOffset;
-        const uint8_t tag = unpackTagAt(tagBase, i, h.tagBits);
+        const uint8_t  tagBits = h.tagBits;
+        const uint8_t  tag     = unpackTagAt(tagBase, i, tagBits);
+
+        // Scan [0, i) using bulk unpack to count the rank of this position's
+        // tier (or fallback index), without per-element unpackTagAt calls.
+        alignas(64) uint8_t scratch[kTagChunkSize];
+        size_t rank = 0; // rank within tier `tag` (or fallback index if tag >= numTiers)
+        size_t bitCursor = 0;
+        for (size_t j = 0; j < i; ) {
+            const size_t chunk = std::min<size_t>(kTagChunkSize, i - j);
+            unpackTagsInto(tagBase, bitCursor, tagBits, chunk, scratch);
+            bitCursor += chunk * tagBits;
+            if (tag < h.numTiers) {
+                for (size_t k = 0; k < chunk; ++k) if (scratch[k] == tag) ++rank;
+            } else {
+                for (size_t k = 0; k < chunk; ++k) if (scratch[k] >= h.numTiers) ++rank;
+            }
+            j += chunk;
+        }
+
         if (tag < h.numTiers) {
             const auto& td = h.tiers[tag];
-            size_t rank = 0;
-            for (size_t j = 0; j < i; ++j) if (unpackTagAt(tagBase, j, h.tagBits) == tag) ++rank;
             return td.dict[unpackKey(enc.data().data() + td.keysOffset, rank, td.keyBits)];
         }
-        size_t fi = 0;
-        for (size_t j = 0; j < i; ++j) if (unpackTagAt(tagBase, j, h.tagBits) >= h.numTiers) ++fi;
         const T* fp = reinterpret_cast<const T*>(enc.data().data() + h.fallbackOffset + 4);
-        T v; std::memcpy(&v, fp + fi, sizeof(T));
+        T v; std::memcpy(&v, fp + rank, sizeof(T));
         return v;
     }
 
@@ -1068,31 +1104,63 @@ private:
         const size_t rangeLen = end - start;
         std::vector<T> out(rangeLen);
         const uint8_t* tagBase = enc.data().data() + h.tagArrayOffset;
+        const uint8_t  tagBits = h.tagBits;
 
-        std::vector<size_t> tierRankAtStart(h.numTiers, 0);
+        // tierBitPos[t] accumulates directly in bits so no rank*keyBits multiply
+        // is needed when entering the range decode below.
+        std::vector<size_t> tierBitPos(h.numTiers, 0);
         size_t fallbackRankAtStart = 0;
-        for (size_t j = 0; j < start; ++j) {
-            const uint8_t tag = unpackTagAt(tagBase, j, h.tagBits);
-            if (tag < h.numTiers) ++tierRankAtStart[tag];
-            else ++fallbackRankAtStart;
+
+        alignas(64) uint8_t scratch[kTagChunkSize];
+
+        // Prefix scan [0, start): accumulate per-tier key bit positions and fallback rank.
+        {
+            size_t bitCursor = 0;
+            for (size_t j = 0; j < start; ) {
+                const size_t chunk = std::min<size_t>(kTagChunkSize, start - j);
+                unpackTagsInto(tagBase, bitCursor, tagBits, chunk, scratch);
+                bitCursor += chunk * tagBits;
+                for (size_t k = 0; k < chunk; ++k) {
+                    const uint8_t t = scratch[k];
+                    if (t < h.numTiers) tierBitPos[t] += h.tiers[t].keyBits;
+                    else                ++fallbackRankAtStart;
+                }
+                j += chunk;
+            }
         }
 
         std::vector<const uint8_t*> tierKeysBase(h.numTiers, nullptr);
-        for (size_t t = 0; t < h.numTiers; ++t) tierKeysBase[t] = enc.data().data() + h.tiers[t].keysOffset;
+        for (size_t t = 0; t < h.numTiers; ++t)
+            tierKeysBase[t] = enc.data().data() + h.tiers[t].keysOffset;
         const T* fp = reinterpret_cast<const T*>(enc.data().data() + h.fallbackOffset + 4);
-
-        std::vector<size_t> tierRank = tierRankAtStart;
         size_t fi = fallbackRankAtStart;
-        for (size_t pos = start; pos < end; ++pos) {
-            const uint8_t tag = unpackTagAt(tagBase, pos, h.tagBits);
-            if (tag < h.numTiers) {
-                const auto& td = h.tiers[tag];
-                out[pos - start] = td.dict[unpackKey(tierKeysBase[tag], tierRank[tag], td.keyBits)];
-                ++tierRank[tag];
-            } else {
-                T v; std::memcpy(&v, fp + fi, sizeof(T));
-                out[pos - start] = v;
-                ++fi;
+
+        // Range decode [start, end) with chunked tag unpack + incremental key bit cursors.
+        size_t tagBitCursor = start * tagBits;
+        size_t outIdx = 0;
+        for (size_t pos = start; pos < end; ) {
+            const size_t chunk = std::min<size_t>(kTagChunkSize, end - pos);
+            unpackTagsInto(tagBase, tagBitCursor, tagBits, chunk, scratch);
+            tagBitCursor += chunk * tagBits;
+
+            for (size_t i = 0; i < chunk; ++i, ++pos, ++outIdx) {
+                const uint8_t tag = scratch[i];
+                if (tag < h.numTiers) {
+                    const auto& td = h.tiers[tag];
+                    const uint8_t  kb    = td.keyBits;
+                    const size_t   kBp   = tierBitPos[tag];
+                    const size_t   kBy   = kBp >> 3;
+                    const size_t   kBo   = kBp & 7;
+                    const uint32_t kMask = (kb == 32) ? ~0u : ((1u << kb) - 1u);
+                    uint64_t kBuf = 0;
+                    std::memcpy(&kBuf, tierKeysBase[tag] + kBy, (kBo + kb + 7) >> 3);
+                    out[outIdx] = td.dict[static_cast<uint32_t>((kBuf >> kBo) & kMask)];
+                    tierBitPos[tag] += kb;
+                } else {
+                    T v; std::memcpy(&v, fp + fi, sizeof(T));
+                    out[outIdx] = v;
+                    ++fi;
+                }
             }
         }
         return out;
