@@ -360,7 +360,6 @@ public:
 		if (doResidual) res.initFromFirst(uv0);
 
 		T      prev             = v0;
-		size_t currentRunLength = 1;
 
 		// --- Main loop (i=0 already handled in prolog) ---
 		for (size_t i = 1; i < n; ++i) {
@@ -372,10 +371,8 @@ public:
 
 			if (doRun) {
 				if (v == prev) {
-					++currentRunLength;
 				} else {
 					++out.runCount;
-					currentRunLength = 1;
 				}
 			}
 
