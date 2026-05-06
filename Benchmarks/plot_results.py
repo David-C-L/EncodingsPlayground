@@ -1200,6 +1200,530 @@ def plot_time_memory_paired(results, output_dir, colours, source_label, group_en
 
 
 # ---------------------------------------------------------------------------
+# Sub-stream stacked variants (SubIntSplitEncoder profiling variants only)
+# ---------------------------------------------------------------------------
+
+def _rows_for_dataset(results, encoders, dataset, size):
+    rows = [(enc, _row(results, enc, dataset, size)) for enc in encoders]
+    return [(enc, row) for enc, row in rows if row]
+
+
+def _substream_initials(name):
+    cleaned = (name or '').strip()
+    if not cleaned:
+        return '?'
+    parts = re.findall(r'[A-Z]+(?=[A-Z][a-z]|\d|$)|[A-Z]?[a-z]+|\d+', cleaned)
+    if parts:
+        initials = ''.join(part[0] for part in parts if part)
+    else:
+        initials = re.sub(r'[^A-Za-z0-9]+', '', cleaned)[:3]
+    initials = initials.upper()
+    return initials or '?'
+
+
+def _substream_segment_label(ss):
+    return _substream_initials(ss.get('name', '?'))
+
+
+def _substream_legend_label(ss):
+    name = ss.get('name', '?')
+    if not name or name == '?':
+        return '?'
+    initials = _substream_initials(name)
+    bit_width = ss.get('bitWidth', '?')
+    if bit_width in (None, '', '?'):
+        return f'{initials}: {name}'
+    return f'{initials}: {name} ({bit_width}b)'
+
+
+def _substream_legend_handles(prepared, section_cmap):
+    seen = set()
+    handles = []
+    for _, _, streams, _, _ in prepared:
+        for si, ss in enumerate(streams):
+            name = ss.get('name', '?')
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            handles.append(
+                mpatches.Patch(
+                    facecolor=section_cmap(si % 20),
+                    edgecolor='black',
+                    label=_substream_legend_label(ss),
+                )
+            )
+    return handles
+
+
+def _format_metric_value(value, fmt='.3g', unit=''):
+    label = f'{value:{fmt}}'
+    return f'{label} {unit}'.rstrip()
+
+
+def _plot_stacked_substream_panel(
+    ax,
+    rows,
+    colours,
+    metric_key,
+    aggregate_getter,
+    title,
+    xlabel,
+    unit='',
+    fmt='.3g',
+    scale=1.0,
+    log=False,
+    section_cmap=None,
+    xmin=None,
+    xmax=None,
+):
+    section_cmap = section_cmap or cm.get_cmap('tab20')
+    y = np.arange(len(rows))
+    bar_h = 0.72
+
+    prepared = []
+    for enc_name, row in rows:
+        streams = row.get('metrics', {}).get('subStreamMetrics') or []
+        if streams:
+            segments = [(ss.get(metric_key, 0) or 0) * scale for ss in streams]
+            total = sum(segments)
+        else:
+            segments = None
+            total = (aggregate_getter(row) if row else 0) * scale
+        prepared.append((enc_name, row, streams, segments, total))
+
+    x_max = max((total for _, _, _, _, total in prepared if total > 0), default=1.0)
+    any_positive = False
+
+    for idx, (enc_name, row, streams, segments, total) in enumerate(prepared):
+        if segments is not None:
+            left = 0.0
+            small_label_idx = 0
+            for si, (ss, val) in enumerate(zip(streams, segments)):
+                if val <= 0:
+                    continue
+                any_positive = True
+                color = section_cmap(si % 20)
+                initials = _substream_initials(ss.get('name', '?'))
+                ax.barh(idx, val, left=left, height=bar_h, color=color,
+                        edgecolor='black', linewidth=0.4)
+                if total > 0 and val / total >= 0.14:
+                    lum = 0.299 * color[0] + 0.587 * color[1] + 0.114 * color[2]
+                    txt_color = 'white' if lum < 0.5 else 'black'
+                    ax.text(left + val * 0.5, idx, initials,
+                            va='center', ha='center', fontsize=6, color=txt_color,
+                            fontweight='bold')
+                else:
+                    side = -1 if small_label_idx % 2 == 0 else 1
+                    level = small_label_idx // 2
+                    small_label_idx += 1
+                    edge_y = idx - bar_h / 2 if side < 0 else idx + bar_h / 2
+                    text_y = idx + side * (bar_h / 2 + 0.18 + level * 0.12)
+                    ax.annotate(
+                        initials,
+                        xy=(left + val * 0.5, edge_y),
+                        xytext=(left + val * 0.5, text_y),
+                        textcoords='data',
+                        ha='center',
+                        va='center',
+                        fontsize=6,
+                        color='black',
+                        fontweight='bold',
+                        bbox=dict(boxstyle='round,pad=0.15', fc='white', ec='black', alpha=0.85),
+                        arrowprops=dict(arrowstyle='-', color='black', lw=0.6, shrinkA=0, shrinkB=0),
+                        annotation_clip=False,
+                    )
+                left += val
+
+            if total > 0:
+                ax.text(total + x_max * 0.01, idx, _format_metric_value(total, fmt, unit),
+                        va='center', ha='left', fontsize=8, fontweight='bold')
+                if not _is_random_access_encoder(enc_name):
+                    ax.barh(idx, total, height=bar_h, left=0.0, facecolor='none',
+                            edgecolor='black', hatch='///', linewidth=0.8)
+            else:
+                ax.text(x_max * 0.01, idx, 'N/A', va='center', ha='left',
+                        fontsize=8, color='grey')
+        else:
+            bar = ax.barh(idx, total, height=bar_h, color=[colours[enc_name]])[0]
+            if not _is_random_access_encoder(enc_name):
+                bar.set_hatch('///')
+                bar.set_edgecolor('black')
+                bar.set_linewidth(0.6)
+            if total > 0:
+                any_positive = True
+                ax.text(total + x_max * 0.01, idx, _format_metric_value(total, fmt, unit),
+                        va='center', ha='left', fontsize=8, fontweight='bold')
+            else:
+                ax.text(x_max * 0.01, idx, 'N/A', va='center', ha='left',
+                        fontsize=8, color='grey')
+
+    _set_encoder_axis_labels(ax, y, [enc for enc, _ in rows])
+    ax.invert_yaxis()
+    ax.grid(axis='x', alpha=0.3)
+    if log and any_positive:
+        ax.set_xscale('log')
+    ax.set_xlim(left=xmin, right=xmax)
+    ax.set_xlabel(xlabel, fontsize=9)
+    ax.set_title(title, fontsize=10)
+
+    return _substream_legend_handles(prepared, section_cmap)
+
+
+def plot_encode_decode_time_substreams(results, output_dir, colours, source_label, group_encoders=False):
+    """Stacked sub-stream breakdown for encode and bulk-decode time."""
+    if not _has_substream_data(results):
+        return
+
+    datasets = sorted(set(r['datasetName'] for r in results['results']))
+    encoders = _sorted_encoders(results, group_encoders=group_encoders)
+
+    for dataset in datasets:
+        size = _pick_size_for_dataset(results, dataset)
+        rows = _rows_for_dataset(results, encoders, dataset, size)
+        if not any(row.get('metrics', {}).get('subStreamMetrics') for _, row in rows):
+            continue
+
+        h = max(4.5, len(rows) * 0.8 + 1.8)
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, h))
+        fig.suptitle(f'Encode / Decode time — sub-stream stacked — {dataset}  (n={size:,})',
+                     fontsize=13, y=1.04)
+        _annotate_source(fig, source_label)
+
+        substream_handles = _plot_stacked_substream_panel(
+            ax1, rows, colours,
+            metric_key='encodeTime_ns',
+            aggregate_getter=lambda row: row['metrics']['timing']['encodeTime_ns'],
+            title='Encode time (stacked by sub-stream)',
+            xlabel='Time (ms, log scale, lower = better)',
+            unit='ms',
+            fmt='.1f',
+            scale=1e-6,
+            log=True,
+        )
+        ax1.legend(handles=_ra_bar_legend_handles(), fontsize=8, loc='upper right', title='Access capability')
+
+        _plot_stacked_substream_panel(
+            ax2, rows, colours,
+            metric_key='decodeBulkTime_ns',
+            aggregate_getter=lambda row: row['metrics']['timing']['decodeBulkTime_ns'],
+            title='Bulk decode time (stacked by sub-stream)',
+            xlabel='Time (ms, log scale, lower = better)',
+            unit='ms',
+            fmt='.1f',
+            scale=1e-6,
+            log=True,
+        )
+        ax2.legend(handles=_ra_bar_legend_handles(), fontsize=8, loc='upper right', title='Access capability')
+
+        if substream_handles:
+            fig.legend(
+                handles=substream_handles,
+                fontsize=7,
+                loc='lower center',
+                bbox_to_anchor=(0.5, 0.01),
+                ncol=2 if len(substream_handles) > 3 else 1,
+                framealpha=0.9,
+                title='Subencoder key',
+                title_fontsize=7,
+            )
+
+        plt.tight_layout(rect=[0, 0.08, 1, 0.93])
+        safe_ds = dataset.replace('/', '_').replace(' ', '_')
+        fname = output_dir / f'encode_decode_time_substreams_{safe_ds}.png'
+        plt.savefig(fname, dpi=150, bbox_inches='tight')
+        print(f"Saved: {fname}")
+        plt.close(fig)
+
+
+def plot_random_access_substreams(results, output_dir, colours, source_label, group_encoders=False):
+    """Stacked sub-stream breakdown for average random-access time."""
+    if not _has_substream_data(results):
+        return
+
+    datasets = sorted(set(r['datasetName'] for r in results['results']))
+    encoders = _sorted_encoders(results, group_encoders=group_encoders)
+
+    for dataset in datasets:
+        size = _pick_size_for_dataset(results, dataset)
+        rows = _rows_for_dataset(results, encoders, dataset, size)
+        if not any(row.get('metrics', {}).get('subStreamMetrics') for _, row in rows):
+            continue
+
+        avg_ns, strided_ns = [], []
+        for enc, row in rows:
+            ra = row['metrics']['randomAccess']
+            avg_ns.append(ra.get('averageRandomAccessTime_ns', 0))
+            strided_ns.append(ra.get('averageStridedAccessTime_ns', 0))
+
+        h = max(4.5, len(rows) * 0.8 + 1.8)
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15.5, h))
+        fig.suptitle(f'Random / Strided access — sub-stream stacked — {dataset}  (n={size:,})',
+                     fontsize=13, y=1.04)
+        _annotate_source(fig, source_label)
+
+        substream_handles = _plot_stacked_substream_panel(
+            ax1, rows, colours,
+            metric_key='decodeAtTime_ns',
+            aggregate_getter=lambda row: row['metrics']['randomAccess']['averageRandomAccessTime_ns'],
+            title='Avg random access (stacked by sub-stream)',
+            xlabel='Time (ns, log scale, lower = better)',
+            unit='ns',
+            fmt='.0f',
+            scale=1.0,
+            log=True,
+            xmin=1.0,  # Avoid log(0) when no data; will show as "N/A" labels instead of tiny bars
+        )
+        ax1.legend(handles=_ra_bar_legend_handles(), fontsize=8, loc='upper right', title='Access capability')
+
+        _hbar(ax2, encoders, strided_ns, colours, unit='ns', fmt='.0f', log=True)
+        ax2.set_xlabel('Time (ns, log scale, lower = better)')
+        ax2.set_title('Avg strided access (stride from config)')
+        ax2.legend(handles=_ra_bar_legend_handles(), fontsize=8, loc='upper right', title='Access capability')
+
+        if substream_handles:
+            fig.legend(
+                handles=substream_handles,
+                fontsize=7,
+                loc='lower center',
+                bbox_to_anchor=(0.5, 0.01),
+                ncol=2 if len(substream_handles) > 3 else 1,
+                framealpha=0.9,
+                title='Subencoder key',
+                title_fontsize=7,
+            )
+
+        plt.tight_layout(rect=[0, 0.08, 1, 0.93])
+        safe_ds = dataset.replace('/', '_').replace(' ', '_')
+        fname = output_dir / f'random_access_substreams_{safe_ds}.png'
+        plt.savefig(fname, dpi=150, bbox_inches='tight')
+        print(f"Saved: {fname}")
+        plt.close(fig)
+
+
+def plot_range_access_substreams(results, output_dir, colours, source_label, group_encoders=False):
+    """Stacked sub-stream breakdown for average range-query latency."""
+    if not _has_substream_data(results):
+        return
+
+    datasets = sorted(set(r['datasetName'] for r in results['results']))
+    encoders = _sorted_encoders(results, group_encoders=group_encoders)
+
+    for dataset in datasets:
+        size = _pick_size_for_dataset(results, dataset)
+        rows = _rows_for_dataset(results, encoders, dataset, size)
+        if not any(row.get('metrics', {}).get('subStreamMetrics') for _, row in rows):
+            continue
+
+        avg_ms, range_sz, tp_vals = [], [], []
+        for enc, row in rows:
+            ra = row['metrics']['randomAccess']
+            avg_ns = ra.get('averageRangeAccessTime_ns', 0)
+            r_size = ra.get('averageRangeSize', 0)
+            avg_ms.append(avg_ns / 1e6)
+            range_sz.append(r_size)
+            tp_vals.append((r_size / (avg_ns / 1e9)) / 1e6 if avg_ns > 0 else 0)
+
+        rng_label = f'{int(max(range_sz)):,}' if range_sz else '?'
+        h = max(4.5, len(rows) * 0.8 + 1.8)
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15.5, h))
+        fig.suptitle(
+            f'Range access (avg range = {rng_label} elems) — sub-stream stacked — {dataset}  (n={size:,})',
+            fontsize=13, y=1.04)
+        _annotate_source(fig, source_label)
+
+        substream_handles = _plot_stacked_substream_panel(
+            ax1, rows, colours,
+            metric_key='decodeRangeTime_ns',
+            aggregate_getter=lambda row: row['metrics']['randomAccess']['averageRangeAccessTime_ns'],
+            title='Avg range-query latency (stacked by sub-stream)',
+            xlabel='Time (ms, log scale, lower = better)',
+            unit='ms',
+            fmt='.2f',
+            scale=1e-6,
+            log=True,
+        )
+        ax1.legend(handles=_ra_bar_legend_handles(), fontsize=8, loc='upper right', title='Access capability')
+
+        _hbar(ax2, encoders, tp_vals, colours, unit='M e/s', fmt='.1f', log=True)
+        ax2.set_xlabel('Throughput (M elem/s, log scale, higher = better)')
+        ax2.set_title('Range-query decode throughput')
+        ax2.legend(handles=_ra_bar_legend_handles(), fontsize=8, loc='upper right', title='Access capability')
+
+        if substream_handles:
+            fig.legend(
+                handles=substream_handles,
+                fontsize=7,
+                loc='lower center',
+                bbox_to_anchor=(0.5, 0.01),
+                ncol=2 if len(substream_handles) > 3 else 1,
+                framealpha=0.9,
+                title='Subencoder key',
+                title_fontsize=7,
+            )
+
+        plt.tight_layout(rect=[0, 0.08, 1, 0.93])
+        safe_ds = dataset.replace('/', '_').replace(' ', '_')
+        fname = output_dir / f'range_access_substreams_{safe_ds}.png'
+        plt.savefig(fname, dpi=150, bbox_inches='tight')
+        print(f"Saved: {fname}")
+        plt.close(fig)
+
+
+def plot_compression_size_substreams(results, output_dir, colours, source_label, group_encoders=False):
+    """Stacked sub-stream breakdown for total compressed size."""
+    if not _has_substream_data(results):
+        return
+
+    datasets = sorted(set(r['datasetName'] for r in results['results']))
+    encoders = _sorted_encoders(results, group_encoders=group_encoders)
+
+    for dataset in datasets:
+        size = _pick_size_for_dataset(results, dataset)
+        rows = _rows_for_dataset(results, encoders, dataset, size)
+        if not any(row.get('metrics', {}).get('subStreamMetrics') for _, row in rows):
+            continue
+
+        bpe_vals = []
+        for enc, row in rows:
+            bpe_vals.append(row['metrics']['memory']['bitsPerElement'])
+
+        h = max(4.5, len(rows) * 0.8 + 1.8)
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15.5, h))
+        fig.suptitle(f'Compression size — sub-stream stacked — {dataset}  (n={size:,})',
+                     fontsize=13, y=1.04)
+        _annotate_source(fig, source_label)
+
+        substream_handles = _plot_stacked_substream_panel(
+            ax1, rows, colours,
+            metric_key='encodedBytes',
+            aggregate_getter=lambda row: row['metrics']['memory']['encodedSize'],
+            title='Total compressed size (stacked by sub-stream)',
+            xlabel='Compressed size (MB, log scale, lower = better)',
+            unit='MB',
+            fmt='.2f',
+            scale=1.0 / (1024 * 1024),
+            log=True,
+        )
+        ax1.legend(handles=_ra_bar_legend_handles(), fontsize=8, loc='upper right', title='Access capability')
+
+        _hbar(ax2, encoders, bpe_vals, colours, unit='bits', fmt='.2f', log=False)
+        ax2.set_xlabel('Bits per element (lower = better)')
+        ax2.set_title('Bits per element')
+        ax2.legend(handles=_ra_bar_legend_handles(), fontsize=8, loc='upper right', title='Access capability')
+
+        if substream_handles:
+            fig.legend(
+                handles=substream_handles,
+                fontsize=7,
+                loc='lower center',
+                bbox_to_anchor=(0.5, 0.01),
+                ncol=2 if len(substream_handles) > 3 else 1,
+                framealpha=0.9,
+                title='Subencoder key',
+                title_fontsize=7,
+            )
+
+        plt.tight_layout(rect=[0, 0.08, 1, 0.93])
+        safe_ds = dataset.replace('/', '_').replace(' ', '_')
+        fname = output_dir / f'compression_size_substreams_{safe_ds}.png'
+        plt.savefig(fname, dpi=150, bbox_inches='tight')
+        print(f"Saved: {fname}")
+        plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# Sub-stream breakdown (SubIntSplitEncoder profiling variants only)
+# ---------------------------------------------------------------------------
+
+def _has_substream_data(results) -> bool:
+    return any(
+        r.get('metrics', {}).get('subStreamMetrics')
+        for r in results['results']
+    )
+
+
+def plot_substream_breakdown(results, output_dir, colours, source_label, group_encoders=False):
+    """
+    Stacked horizontal bar charts showing how each sub-stream codec contributes
+    to compressed size, encode time, bulk-decode time, random-access decode time,
+    and range-decode time.  Only emits plots for datasets that have at least one
+    encoder with subStreamMetrics present (i.e. a SubIntSplitEncoder profiling
+    variant was registered in the benchmark run).
+    """
+    if not _has_substream_data(results):
+        return
+
+    datasets = sorted(set(r['datasetName'] for r in results['results']))
+    encoders = _sorted_encoders(results, group_encoders=group_encoders)
+
+    metrics_cfg = [
+        ('encodedBytes',       'Compressed size (bytes)',        'Compression per sub-stream',          False),
+        ('encodeTime_ns',      'Encode time (ns)',               'Encode time per sub-stream',           True),
+        ('decodeBulkTime_ns',  'Bulk decode time (ns)',          'Bulk decode time per sub-stream',      True),
+        ('decodeAtTime_ns',    'Avg per-decodeAt time (ns)',     'Random-access time per sub-stream',    True),
+        ('decodeRangeTime_ns', 'Avg per-decodeRange time (ns)', 'Range-decode time per sub-stream',     True),
+    ]
+    section_cmap = cm.get_cmap('tab10')
+
+    for dataset in datasets:
+        size = _pick_size_for_dataset(results, dataset)
+
+        # Keep only encoders that have subStreamMetrics for this dataset/size
+        rows = [(enc, _row(results, enc, dataset, size)) for enc in encoders]
+        rows = [(enc, r) for enc, r in rows
+                if r and r.get('metrics', {}).get('subStreamMetrics')]
+        if not rows:
+            continue
+
+        n_panels = len(metrics_cfg)
+        h = max(4, len(rows) * 0.9 + 1.5)
+        fig, axes = plt.subplots(1, n_panels, figsize=(5 * n_panels, h))
+        fig.suptitle(f'Sub-stream breakdown — {dataset}  (n={size:,})', fontsize=13, y=1.04)
+        _annotate_source(fig, source_label)
+
+        for ax, (metric_key, xlabel, title, use_log) in zip(axes, metrics_cfg):
+            y_pos = np.arange(len(rows))
+            bar_h = 0.6
+            any_nonzero = False
+
+            for idx, (enc_name, row) in enumerate(rows):
+                streams = row['metrics']['subStreamMetrics']
+                total = sum(ss.get(metric_key, 0) or 0 for ss in streams)
+                left = 0.0
+                for si, ss in enumerate(streams):
+                    val = ss.get(metric_key, 0) or 0
+                    if val <= 0:
+                        continue
+                    any_nonzero = True
+                    color = section_cmap(si % 10)
+                    ax.barh(idx, val, left=left, height=bar_h, color=color,
+                            edgecolor='black', linewidth=0.4)
+                    if total > 0 and val / total > 0.08:
+                        lum = 0.299 * color[0] + 0.587 * color[1] + 0.114 * color[2]
+                        txt_color = 'white' if lum < 0.5 else 'black'
+                        label = f"{ss.get('name', '?')}\n({ss.get('bitWidth', '?')}b)"
+                        ax.text(left + val * 0.5, idx, label, va='center', ha='center',
+                                fontsize=6, color=txt_color, fontweight='bold')
+                    left += val
+
+            ax.set_yticks(y_pos)
+            ax.set_yticklabels([enc for enc, _ in rows], fontsize=9)
+            ax.invert_yaxis()
+            ax.set_xlabel(xlabel, fontsize=9)
+            ax.set_title(title, fontsize=10)
+            ax.grid(axis='x', alpha=0.3)
+            if use_log and any_nonzero:
+                ax.set_xscale('log')
+
+        plt.tight_layout()
+        safe_ds = dataset.replace('/', '_').replace(' ', '_')
+        fname = output_dir / f'substream_breakdown_{safe_ds}.png'
+        plt.savefig(fname, dpi=150, bbox_inches='tight')
+        print(f"Saved: {fname}")
+        plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -1236,6 +1760,17 @@ def main():
     plot_throughput_summary(results, args.output, colours, source_label, group_encoders=args.group_encoders)
     plot_compression_vs_random_access(results, args.output, colours, source_label, group_encoders=args.group_encoders)
     # selection time (if present) is shown inside the encode plot
+
+    # ── Sub-stream stacked variants (skipped if no profiling variants present) ──
+    if _has_substream_data(results):
+        print("\nSub-stream profiling data detected — generating stacked variant plots...")
+        plot_encode_decode_time_substreams(results, args.output, colours, source_label, group_encoders=args.group_encoders)
+        plot_random_access_substreams(results, args.output, colours, source_label, group_encoders=args.group_encoders)
+        plot_range_access_substreams(results, args.output, colours, source_label, group_encoders=args.group_encoders)
+        plot_compression_size_substreams(results, args.output, colours, source_label, group_encoders=args.group_encoders)
+    else:
+        print("\nNo sub-stream profiling data found — skipping sub-stream variant plots.")
+        print("  (Register a SubIntSplitEncoder<T, true> or SubIntSplitAutoEncoder<T, true> variant to collect it.)")
 
     # ── Memory plots (skipped silently if no memory data present) ────────
     if _has_memory_data(results):
