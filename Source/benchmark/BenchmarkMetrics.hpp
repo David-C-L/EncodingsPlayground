@@ -137,6 +137,19 @@ struct RandomAccessMetrics {
 };
 
 /**
+ * @brief Per-sub-stream breakdown metrics (non-empty only for SubIntSplitEncoder profiling variants)
+ */
+struct SubStreamMetrics {
+    std::string name;                   ///< sub-codec name, e.g. "Dictionary(13bit)"
+    uint8_t     bitWidth{0};            ///< bit width of this section
+    size_t      encodedBytes{0};        ///< encoded bytes for this section
+    double      encodeTime_ns{0.0};     ///< average encode time per iteration (ns)
+    double      decodeBulkTime_ns{0.0}; ///< average bulk-decode time per iteration (ns)
+    double      decodeAtTime_ns{0.0};   ///< average per-decodeAt call time (ns)
+    double      decodeRangeTime_ns{0.0};///< average per-decodeRange call time (ns)
+};
+
+/**
  * @brief Complete benchmark results for a single encoding run
  */
 struct BenchmarkMetrics {
@@ -161,6 +174,9 @@ struct BenchmarkMetrics {
     
     // Custom metrics for specific encodings
     std::map<std::string, double> customMetrics;
+
+    // Per-sub-stream breakdown (non-empty only for SubIntSplitEncoder<T, true>)
+    std::vector<SubStreamMetrics> subStreamMetrics;
     
     /**
      * @brief Calculate overall performance score (higher is better)
@@ -231,7 +247,7 @@ struct BenchmarkConfig {
     // Output
     bool verboseOutput{false};
     bool saveResults{true};
-    std::string outputPath{"/home/david/Documents/PhD/symbol-store/EncodingsPlayground/Benchmarks/results"};
+    std::string outputPath{"/home/david/Documents/PhD/symbol-store/MetaNimbleProject/EncodingsPlayground/Benchmarks/results"};
 
     // Memory measurement
     /// When true, each benchmark is run a second time (after timing) to measure
