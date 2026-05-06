@@ -43,14 +43,19 @@ using encodings::encoders::selectors::costs::FrequencyPartitionCostModel;
 
 namespace encodings::encoders {
 
-// Generic sub-integer split encoder (N-way split where sum(bits)=bit-width of T)
-template <typename T>
+// Generic sub-integer split encoder (N-way split where sum(bits)=bit-width of T).
+// EnableProfiling=true activates per-section timing and fills
+// EncodingMetadata::subStreamEncodeMetrics on each encode() call, and accumulates
+// per-section decode times accessible via the subStream*() virtual methods.
+// EnableProfiling=false (default) is identical to the pre-profiling code path.
+template <typename T, bool EnableProfiling = false>
     requires (std::is_same_v<T, int64_t> || std::is_same_v<T, int32_t>)
 class SubIntSplitEncoder final : public Codec<T, uint8_t> {
 public:
     using ValueT = T;
     using SectionT = std::conditional_t<(sizeof(T) <= 4), uint32_t, uint64_t>;
-    static constexpr uint8_t kTotalBits = static_cast<uint8_t>(sizeof(T) * 8);
+    static constexpr uint8_t kTotalBits   = static_cast<uint8_t>(sizeof(T) * 8);
+    static constexpr bool    kProfileSections = EnableProfiling;
 
     explicit SubIntSplitEncoder(SubIntSplitConfigIntegral<SectionT> cfg) : cfg_(std::move(cfg)) {
         cfg_.validate();
@@ -111,11 +116,21 @@ public:
         encodedSections.reserve(splits);
         std::vector<uint64_t> sectionSizes;
         sectionSizes.reserve(splits);
+        std::vector<int64_t> sectionEncodeTimes(splits, 0);
 
         for (size_t s = 0; s < splits; ++s) {
-            auto enc = cfg_.codecs[s]->encode(std::span<const SectionT>(&sectionsRaw[s * N], N));
-            sectionSizes.push_back(enc.data().size());
-            encodedSections.push_back(std::move(enc));
+            if constexpr (kProfileSections) {
+                const auto t0 = std::chrono::high_resolution_clock::now();
+                auto enc = cfg_.codecs[s]->encode(std::span<const SectionT>(&sectionsRaw[s * N], N));
+                sectionEncodeTimes[s] = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::high_resolution_clock::now() - t0).count();
+                sectionSizes.push_back(enc.data().size());
+                encodedSections.push_back(std::move(enc));
+            } else {
+                auto enc = cfg_.codecs[s]->encode(std::span<const SectionT>(&sectionsRaw[s * N], N));
+                sectionSizes.push_back(enc.data().size());
+                encodedSections.push_back(std::move(enc));
+            }
         }
 
         // Build output in a single pre-sized allocation: header + all payloads.
@@ -148,6 +163,18 @@ public:
         meta.compressedSize       = out.size();
         meta.uncompressedSize     = N * sizeof(T);
         meta.supportsRandomAccess = allSectionsRandomAccess();
+
+        if constexpr (kProfileSections) {
+            meta.subStreamEncodeMetrics.resize(splits);
+            for (size_t s = 0; s < splits; ++s) {
+                meta.subStreamEncodeMetrics[s] = {
+                    cfg_.codecs[s]->name(),
+                    cfg_.bits[s],
+                    sectionSizes[s],
+                    sectionEncodeTimes[s]
+                };
+            }
+        }
 
         if (verboseEnabled()) {
             const double bitsPerElemTotal = N ? (static_cast<double>(out.size()) * 8.0 / static_cast<double>(N)) : 0.0;
@@ -186,8 +213,18 @@ public:
         auto tmpRaw = std::make_unique_for_overwrite<SectionT[]>(h.N);
         SectionT* tmp = tmpRaw.get();
 
+        if constexpr (kProfileSections)
+            bulkDecodeTimeNs_.assign(splits, 0);
+
         for (size_t s = 0; s < splits; ++s) {
-            cfg_.codecs[s]->decodeAllInto(h.views[s], tmp, h.N);
+            if constexpr (kProfileSections) {
+                const auto t0 = std::chrono::high_resolution_clock::now();
+                cfg_.codecs[s]->decodeAllInto(h.views[s], tmp, h.N);
+                bulkDecodeTimeNs_[s] = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::high_resolution_clock::now() - t0).count();
+            } else {
+                cfg_.codecs[s]->decodeAllInto(h.views[s], tmp, h.N);
+            }
             if (s == 0) assignSectionInto(tmp, acc, h.N, h.shifts[0]);
             else        combineSectionInto(tmp, acc, h.N, h.shifts[s]);
         }
@@ -205,8 +242,19 @@ public:
         // Inline combine using precomputed shifts — no allocation.
         SectionT v = 0;
         const size_t splits = h.bits.size();
+        if constexpr (kProfileSections) {
+            if (decodeAtAccumNs_.size() != splits)
+                decodeAtAccumNs_.assign(splits, 0);
+        }
         for (size_t s = 0; s < splits; ++s) {
-            v |= static_cast<SectionT>(decodeOneSection(*cfg_.codecs[s], h.views[s], index)) << h.shifts[s];
+            if constexpr (kProfileSections) {
+                const auto t0 = std::chrono::high_resolution_clock::now();
+                v |= static_cast<SectionT>(decodeOneSection(*cfg_.codecs[s], h.views[s], index)) << h.shifts[s];
+                decodeAtAccumNs_[s] += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::high_resolution_clock::now() - t0).count();
+            } else {
+                v |= static_cast<SectionT>(decodeOneSection(*cfg_.codecs[s], h.views[s], index)) << h.shifts[s];
+            }
         }
         return static_cast<T>(v);
     }
@@ -225,8 +273,20 @@ public:
         auto tmpRaw = std::make_unique_for_overwrite<SectionT[]>(count);
         SectionT* tmp = tmpRaw.get();
 
+        if constexpr (kProfileSections) {
+            if (decodeRangeAccumNs_.size() != splits)
+                decodeRangeAccumNs_.assign(splits, 0);
+        }
+
         for (size_t s = 0; s < splits; ++s) {
-            cfg_.codecs[s]->decodeRangeInto(h.views[s], start, end, tmp, count);
+            if constexpr (kProfileSections) {
+                const auto t0 = std::chrono::high_resolution_clock::now();
+                cfg_.codecs[s]->decodeRangeInto(h.views[s], start, end, tmp, count);
+                decodeRangeAccumNs_[s] += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::high_resolution_clock::now() - t0).count();
+            } else {
+                cfg_.codecs[s]->decodeRangeInto(h.views[s], start, end, tmp, count);
+            }
             if (s == 0) assignSectionInto(tmp, acc, count, h.shifts[0]);
             else        combineSectionInto(tmp, acc, count, h.shifts[s]);
         }
@@ -507,11 +567,39 @@ private:
         return encodings::EncodedData(std::move(out), std::move(meta));
     }
 
+public:
+    // ── Per-section decode-timing virtual overrides ──────────────────────────
+    // Only meaningful when EnableProfiling=true; the false variant returns empty
+    // via the Codec base-class defaults, so no vtable cost beyond the call site.
+
+    std::vector<int64_t> subStreamBulkDecodeTimeNs() const override {
+        if constexpr (kProfileSections) return bulkDecodeTimeNs_; else return {};
+    }
+    std::vector<int64_t> subStreamDecodeAtAccumNs() const override {
+        if constexpr (kProfileSections) return decodeAtAccumNs_;  else return {};
+    }
+    std::vector<int64_t> subStreamDecodeRangeAccumNs() const override {
+        if constexpr (kProfileSections) return decodeRangeAccumNs_; else return {};
+    }
+    void resetSubStreamDecodeAtAccum() override {
+        if constexpr (kProfileSections) decodeAtAccumNs_.assign(cfg_.splitCount(), 0);
+    }
+    void resetSubStreamDecodeRangeAccum() override {
+        if constexpr (kProfileSections) decodeRangeAccumNs_.assign(cfg_.splitCount(), 0);
+    }
+
 private:
     SubIntSplitConfigIntegral<SectionT> cfg_;
     mutable const uint8_t* cachedOuterPtr_{nullptr};
     mutable size_t cachedOuterSize_{0};
     mutable ParsedHeader cachedHeader_{};
+
+    // Per-section decode timing state — zero-size when EnableProfiling=false.
+    struct NoDecodeState {};
+    using DecodeTimingVec = std::conditional_t<EnableProfiling, std::vector<int64_t>, NoDecodeState>;
+    [[no_unique_address]] mutable DecodeTimingVec bulkDecodeTimeNs_;
+    [[no_unique_address]] mutable DecodeTimingVec decodeAtAccumNs_;
+    [[no_unique_address]] mutable DecodeTimingVec decodeRangeAccumNs_;
 };
 
 // ---------------------------------------------------------------------------
@@ -621,6 +709,126 @@ inline std::shared_ptr<SubIntSplitEncoder<T>> makeSubIntSplitEncoderManual(
 using SubIntSplitEncoder64 = SubIntSplitEncoder<int64_t>;
 using SubIntSplitEncoder32 = SubIntSplitEncoder<int32_t>;
 
+// Profiling variants — identical behaviour but fill subStreamEncodeMetrics and
+// expose per-section decode times via the subStream*() virtual methods.
+template<typename T> using SubIntSplitEncoderProf = SubIntSplitEncoder<T, true>;
+using SubIntSplitEncoder64Prof = SubIntSplitEncoder<int64_t, true>;
+using SubIntSplitEncoder32Prof = SubIntSplitEncoder<int32_t, true>;
+
+// ---------------------------------------------------------------------------
+// Profiling factory functions for SubIntSplitEncoder<T, true>
+// Mirror every non-profiling factory; return profiling variants.
+// ---------------------------------------------------------------------------
+
+template <typename T>
+inline std::shared_ptr<SubIntSplitEncoderProf<T>> makeSubIntSplitEncoderProf(
+    SubIntSplitConfigIntegral<std::conditional_t<(sizeof(T) <= 4), uint32_t, uint64_t>> cfg) {
+    return std::make_shared<SubIntSplitEncoderProf<T>>(std::move(cfg));
+}
+
+template <typename T>
+inline std::shared_ptr<SubIntSplitEncoderProf<T>> makeSubIntSplitEncoderFromSegmentsProf(
+    const std::vector<selectors::SegmentPlan>& segments) {
+    using SectionT = std::conditional_t<(sizeof(T) <= 4), uint32_t, uint64_t>;
+    auto cfg = SubIntSplitConfigIntegral<SectionT>::fromSegments(segments);
+    return makeSubIntSplitEncoderProf<T>(std::move(cfg));
+}
+
+template <typename T>
+inline std::shared_ptr<SubIntSplitEncoderProf<T>> makeSubIntSplitEncoderFromSegmentsProf(
+    const std::vector<selectors::SegmentPlan>& segments,
+    BitSplitOrder orderHint) {
+    using SectionT = std::conditional_t<(sizeof(T) <= 4), uint32_t, uint64_t>;
+    auto cfg = SubIntSplitConfigIntegral<SectionT>::fromSegments(segments, orderHint);
+    return makeSubIntSplitEncoderProf<T>(std::move(cfg));
+}
+
+template <typename T>
+inline std::shared_ptr<SubIntSplitEncoderProf<T>> makeSubIntSplitEncoderManualProf(
+    const std::vector<uint8_t>& bits,
+    const std::vector<encodings::EncodingType>& encs,
+    BitSplitOrder orderHint = BitSplitOrder::LSB_TO_MSB) {
+    using SectionT = std::conditional_t<(sizeof(T) <= 4), uint32_t, uint64_t>;
+    if (bits.size() != encs.size())
+        throw std::invalid_argument("makeSubIntSplitEncoderManualProf: bits/encodings size mismatch");
+    SubIntSplitConfigIntegral<SectionT> cfg;
+    cfg.order = orderHint;
+    cfg.bits  = bits;
+    cfg.codecs.reserve(bits.size());
+    for (size_t i = 0; i < bits.size(); ++i) {
+        const uint8_t width = bits[i];
+        switch (encs[i]) {
+            case encodings::EncodingType::RawEncoding:
+                cfg.codecs.push_back(detail_trisplit::makeRawSection<SectionT>(width)); break;
+            case encodings::EncodingType::DictionaryEncoding:
+                cfg.codecs.push_back(detail_trisplit::makeDictionarySection<SectionT>(width)); break;
+            case encodings::EncodingType::FrameOfReference:
+                cfg.codecs.push_back(detail_trisplit::makeFORSection<512, SectionT>(width)); break;
+            case encodings::EncodingType::AdaptiveFrameOfReference:
+                cfg.codecs.push_back(detail_trisplit::makeAdaptiveFORSection<SectionT>(width)); break;
+            case encodings::EncodingType::OpenZL:
+                cfg.codecs.push_back(detail_trisplit::makeOpenZLSection<0, SectionT>(width)); break;
+            case encodings::EncodingType::BitPacking:
+                cfg.codecs.push_back(detail_trisplit::makeRawBitPackedSection<SectionT>(width)); break;
+            case encodings::EncodingType::AdaptiveFramedBitPrefix:
+                cfg.codecs.push_back(detail_trisplit::makeAdaptiveFramedBitPrefixSection<SectionT>(width)); break;
+            case encodings::EncodingType::RunLengthEncoding:
+                cfg.codecs.push_back(detail_trisplit::makeRLESection<SectionT>(width)); break;
+            case encodings::EncodingType::HuffmanEncoding:
+                cfg.codecs.push_back(detail_trisplit::makeHuffmanSection<SectionT>(width)); break;
+            case encodings::EncodingType::LZ4:
+                cfg.codecs.push_back(detail_trisplit::makeLZ4Section<SectionT>(width)); break;
+            case encodings::EncodingType::FSEEncoding:
+                cfg.codecs.push_back(detail_trisplit::makeFSESection<SectionT>(width)); break;
+            default:
+                throw std::invalid_argument("makeSubIntSplitEncoderManualProf: unsupported encoding type");
+        }
+    }
+    cfg.validate();
+    return makeSubIntSplitEncoderProf<T>(std::move(cfg));
+}
+
+template <typename T>
+inline std::shared_ptr<SubIntSplitEncoderProf<T>> makeSubIntSplitEncoderManualProf(
+    const std::vector<uint8_t>& bits,
+    std::vector<std::shared_ptr<ISectionCodecIntegral<std::conditional_t<(sizeof(T) <= 4), uint32_t, uint64_t>>>> codecs,
+    BitSplitOrder orderHint = BitSplitOrder::LSB_TO_MSB) {
+    using SectionT = std::conditional_t<(sizeof(T) <= 4), uint32_t, uint64_t>;
+    SubIntSplitConfigIntegral<SectionT> cfg;
+    cfg.order  = orderHint;
+    cfg.bits   = bits;
+    cfg.codecs = std::move(codecs);
+    cfg.validate();
+    return makeSubIntSplitEncoderProf<T>(std::move(cfg));
+}
+
+// int64_t convenience overloads (no explicit template argument needed)
+inline std::shared_ptr<SubIntSplitEncoder64Prof> makeSubIntSplitEncoderProf(
+    SubIntSplitConfigIntegral<uint64_t> cfg) {
+    return makeSubIntSplitEncoderProf<int64_t>(std::move(cfg));
+}
+
+inline std::shared_ptr<SubIntSplitEncoder64Prof> makeSubIntSplitEncoderFromSegmentsProf(
+    const std::vector<selectors::SegmentPlan>& segments) {
+    return makeSubIntSplitEncoderFromSegmentsProf<int64_t>(segments);
+}
+
+inline std::shared_ptr<SubIntSplitEncoder64Prof> makeSubIntSplitEncoderFromSegmentsProf(
+    const std::vector<selectors::SegmentPlan>& segments, BitSplitOrder orderHint) {
+    return makeSubIntSplitEncoderFromSegmentsProf<int64_t>(segments, orderHint);
+}
+
+inline std::shared_ptr<SubIntSplitEncoder64Prof> makeSubIntSplitEncoderManualProf(
+    const std::vector<uint8_t>& bits,
+    const std::vector<encodings::EncodingType>& encs,
+    BitSplitOrder orderHint = BitSplitOrder::LSB_TO_MSB) {
+    return makeSubIntSplitEncoderManualProf<int64_t>(bits, encs, orderHint);
+}
+
+// ---------------------------------------------------------------------------
+// Non-profiling int64_t convenience overloads (unchanged)
+// ---------------------------------------------------------------------------
+
 inline std::shared_ptr<SubIntSplitEncoder64> makeSubIntSplitEncoder(SubIntSplitConfigIntegral<uint64_t> cfg) {
     return makeSubIntSplitEncoder<int64_t>(std::move(cfg));
 }
@@ -640,18 +848,24 @@ inline std::shared_ptr<SubIntSplitEncoder64> makeSubIntSplitEncoderFromSegments(
 // Auto-selecting wrapper (lazy instantiation via sampling + selector)
 // ---------------------------------------------------------------------------
 
+// Config is independent of EnableProfiling — defined once so that the profiling
+// and non-profiling variants share the same Config type and factory helpers can
+// return either without any type-conversion overhead.
 template <typename T>
+struct SubIntSplitAutoEncoderConfig {
+    selectors::IDSubStreamEncodingSelector::Config selectorConfig{};
+    generators::samplers::StreamSampler<T>::Config samplerConfig{};
+    std::vector<std::unique_ptr<selectors::costs::EncodingCostModel>> costModels;
+    std::optional<BitSplitOrder> orderHint{}; // allow forcing MSB/LSB ordering
+    bool debugLogging{true};
+    bool enableSelectionTiming{false};
+};
+
+template <typename T, bool EnableProfiling = false>
     requires (std::is_same_v<T, int64_t> || std::is_same_v<T, int32_t>)
 class SubIntSplitAutoEncoder final : public Codec<T, uint8_t> {
 public:
-    struct Config {
-        selectors::IDSubStreamEncodingSelector::Config selectorConfig{};
-        generators::samplers::StreamSampler<T>::Config samplerConfig{};
-        std::vector<std::unique_ptr<selectors::costs::EncodingCostModel>> costModels;
-        std::optional<BitSplitOrder> orderHint{}; // allow forcing MSB/LSB ordering
-        bool debugLogging{true};
-        bool enableSelectionTiming{false};
-    };
+    using Config = SubIntSplitAutoEncoderConfig<T>;
 
     explicit SubIntSplitAutoEncoder(Config cfg)
         : selector_(cfg.selectorConfig), samplerCfg_(cfg.samplerConfig), orderHint_(cfg.orderHint), debugLogging_(cfg.debugLogging),
@@ -704,6 +918,20 @@ public:
         // RandomAccess unknown until encoder chosen
         return props;
     }
+
+    // Forward per-section decode-timing methods to impl_ (only populated when
+    // EnableProfiling=true; otherwise impl_->subStream*() returns empty by default).
+    std::vector<int64_t> subStreamBulkDecodeTimeNs()   const override {
+        return impl_ ? impl_->subStreamBulkDecodeTimeNs()   : std::vector<int64_t>{};
+    }
+    std::vector<int64_t> subStreamDecodeAtAccumNs()    const override {
+        return impl_ ? impl_->subStreamDecodeAtAccumNs()    : std::vector<int64_t>{};
+    }
+    std::vector<int64_t> subStreamDecodeRangeAccumNs() const override {
+        return impl_ ? impl_->subStreamDecodeRangeAccumNs() : std::vector<int64_t>{};
+    }
+    void resetSubStreamDecodeAtAccum() override    { if (impl_) impl_->resetSubStreamDecodeAtAccum(); }
+    void resetSubStreamDecodeRangeAccum() override { if (impl_) impl_->resetSubStreamDecodeRangeAccum(); }
 
 private:
     using UnsignedT = std::make_unsigned_t<T>;
@@ -784,7 +1012,7 @@ private:
             : SubIntSplitConfigIntegral<SectionT>::fromSegments(segments);
         // Reflect remapped segments in the cached selection for accurate logging
         lastSelection_.segments = segments;
-        impl_ = makeSubIntSplitEncoder<T>(std::move(cfg));
+        impl_ = std::make_shared<SubIntSplitEncoder<T, EnableProfiling>>(std::move(cfg));
     }
 
     void ensureDecoderInitialized() const {
@@ -798,7 +1026,7 @@ private:
     generators::samplers::StreamSampler<T>::Config samplerCfg_{};
     std::optional<BitSplitOrder> orderHint_{};
     std::vector<std::unique_ptr<selectors::costs::EncodingCostModel>> costModels_;
-    std::shared_ptr<SubIntSplitEncoder<T>> impl_{};
+    std::shared_ptr<SubIntSplitEncoder<T, EnableProfiling>> impl_{};
     bool debugLogging_{true};
     bool selectionTimingEnabled_{false};
     std::optional<std::chrono::nanoseconds> lastSelectionTimeNs_{};
@@ -989,6 +1217,57 @@ inline std::shared_ptr<SubIntSplitAutoEncoder<T>> makeDefaultAutoSubIntSplitEnco
 
 using SubIntSplitAutoEncoder64 = SubIntSplitAutoEncoder<int64_t>;
 using SubIntSplitAutoEncoder32 = SubIntSplitAutoEncoder<int32_t>;
+
+// Profiling variants of the auto-selecting encoder.
+template<typename T> using SubIntSplitAutoEncoderProf = SubIntSplitAutoEncoder<T, true>;
+using SubIntSplitAutoEncoder64Prof = SubIntSplitAutoEncoder<int64_t, true>;
+using SubIntSplitAutoEncoder32Prof = SubIntSplitAutoEncoder<int32_t, true>;
+
+// ---------------------------------------------------------------------------
+// Profiling factory functions for SubIntSplitAutoEncoder<T, true>
+// ---------------------------------------------------------------------------
+
+template <typename T>
+inline std::shared_ptr<SubIntSplitAutoEncoderProf<T>> makeAutoSubIntSplitEncoderProf(
+    typename SubIntSplitAutoEncoderProf<T>::Config cfg) {
+    return std::make_shared<SubIntSplitAutoEncoderProf<T>>(std::move(cfg));
+}
+
+template <typename T>
+inline std::shared_ptr<SubIntSplitAutoEncoderProf<T>> makeDefaultAutoSubIntSplitEncoderProf(
+    BitSplitOrder order = BitSplitOrder::LSB_TO_MSB,
+    bool exhaustiveSearch = false,
+    bool enablePrune = true,
+    bool enableSelectionTiming = false,
+    std::vector<encodings::EncodingType> costModelTypes = {}) {
+    // Config type is identical to the non-profiling variant (EnableProfiling only affects runtime)
+    auto cfg = makeDefaultAutoSubIntSplitConfig<T>(order, enableSelectionTiming, std::move(costModelTypes));
+    cfg.selectorConfig.orderHint          = order;
+    cfg.selectorConfig.useExhaustiveSearch = exhaustiveSearch;
+    cfg.selectorConfig.enablePrune         = enablePrune;
+    cfg.selectorConfig.costGridCsvPath     = "../Source/encoders/auto_subintsplit_cost_grid_twitter_snowflake_64.csv";
+    return makeAutoSubIntSplitEncoderProf<T>(std::move(cfg));
+}
+
+// int64_t convenience overloads
+inline std::shared_ptr<SubIntSplitAutoEncoder64Prof> makeAutoSubIntSplitEncoderProf(
+    SubIntSplitAutoEncoder64Prof::Config cfg) {
+    return makeAutoSubIntSplitEncoderProf<int64_t>(std::move(cfg));
+}
+
+inline std::shared_ptr<SubIntSplitAutoEncoder64Prof> makeDefaultAutoSubIntSplitEncoderProf(
+    BitSplitOrder order = BitSplitOrder::LSB_TO_MSB,
+    bool exhaustiveSearch = false,
+    bool enablePrune = true,
+    bool enableSelectionTiming = false,
+    std::vector<encodings::EncodingType> costModelTypes = {}) {
+    return makeDefaultAutoSubIntSplitEncoderProf<int64_t>(
+        order, exhaustiveSearch, enablePrune, enableSelectionTiming, std::move(costModelTypes));
+}
+
+// ---------------------------------------------------------------------------
+// Non-profiling int64_t convenience overloads (unchanged)
+// ---------------------------------------------------------------------------
 
 inline std::shared_ptr<SubIntSplitAutoEncoder64> makeAutoSubIntSplitEncoder(SubIntSplitAutoEncoder64::Config cfg) {
     return makeAutoSubIntSplitEncoder<int64_t>(std::move(cfg));
