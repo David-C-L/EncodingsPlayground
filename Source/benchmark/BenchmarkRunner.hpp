@@ -176,7 +176,8 @@ public:
         std::vector<nanoseconds> encodeTimes;
         std::vector<nanoseconds> decodeTimes;
         encodings::EncodedData encoded;
-        
+        std::vector<SubStreamMetrics> substreamAccum; // filled on first iteration with subStream data
+
         for (size_t i = 0; i < config_.iterations; ++i) {
             if (config_.verboseOutput) {
                 std::cout << "  [" << encoderName << "/" << datasetName << "] encode..." << std::flush;
@@ -201,6 +202,18 @@ public:
                 }
             }
 
+            // Accumulate per-section encode metrics (only populated by profiling variants)
+            const auto& ssEnc = encoded.metadata().subStreamEncodeMetrics;
+            if (!ssEnc.empty()) {
+                if (substreamAccum.empty()) substreamAccum.resize(ssEnc.size());
+                for (size_t s = 0; s < ssEnc.size(); ++s) {
+                    substreamAccum[s].name         = ssEnc[s].name;
+                    substreamAccum[s].bitWidth     = ssEnc[s].bitWidth;
+                    substreamAccum[s].encodedBytes = ssEnc[s].encodedBytes;
+                    substreamAccum[s].encodeTime_ns += static_cast<double>(ssEnc[s].encodeTime_ns);
+                }
+            }
+
             if (config_.verboseOutput) {
                 std::cout << "  [" << encoderName << "/" << datasetName << "] decode (bulk)..." << std::flush;
             }
@@ -209,6 +222,11 @@ public:
             auto decoded = encoder->decodeAll(encoded);
             auto decodeEnd = high_resolution_clock::now();
             decodeTimes.push_back(duration_cast<nanoseconds>(decodeEnd - decodeStart));
+
+            // Accumulate per-section bulk decode times
+            const auto& bulkTimes = encoder->subStreamBulkDecodeTimeNs();
+            for (size_t s = 0; s < substreamAccum.size() && s < bulkTimes.size(); ++s)
+                substreamAccum[s].decodeBulkTime_ns += static_cast<double>(bulkTimes[s]);
             if (config_.verboseOutput) {
                 std::cout << " done ("
                           << duration_cast<nanoseconds>(decodeEnd - decodeStart).count() / 1'000'000.0
@@ -226,17 +244,35 @@ public:
         // Calculate timing statistics
         calculateTimingStats(encodeTimes, decodeTimes, result);
 
+        // Average per-section encode/decode times across iterations
+        if (!substreamAccum.empty()) {
+            const double iters = static_cast<double>(config_.iterations);
+            for (auto& ss : substreamAccum) {
+                ss.encodeTime_ns     /= iters;
+                ss.decodeBulkTime_ns /= iters;
+            }
+        }
+
         // Memory metrics
         result.metrics.memory.originalSize = dataSize * sizeof(T);
         result.metrics.memory.encodedSize = encoded.size();
 
-        // Random access benchmarks
+        // Random access benchmarks — reset decodeAt accumulator first so we capture
+        // only the access-pattern phase (not the warmup/timing iterations above).
+        encoder->resetSubStreamDecodeAtAccum();
         if (config_.testRandomAccess) {
             if (config_.verboseOutput) {
                 std::cout << "  [" << encoderName << "/" << datasetName << "] random access..." << std::flush;
             }
             benchmarkRandomAccess(encoder, encoded, result.originalData, result.metrics);
             if (config_.verboseOutput) { std::cout << " done\n"; }
+        }
+        // Read per-section random-access timing (divide by number of decodeAt calls made)
+        {
+            const auto& atTimes = encoder->subStreamDecodeAtAccumNs();
+            const size_t atCount = std::max<size_t>(1, result.metrics.randomAccess.randomAccessCount);
+            for (size_t s = 0; s < substreamAccum.size() && s < atTimes.size(); ++s)
+                substreamAccum[s].decodeAtTime_ns = static_cast<double>(atTimes[s]) / atCount;
         }
 
         if (config_.testStridedAccess) {
@@ -247,6 +283,8 @@ public:
             if (config_.verboseOutput) { std::cout << " done\n"; }
         }
 
+        // Range access — reset decodeRange accumulator before the loop.
+        encoder->resetSubStreamDecodeRangeAccum();
         if (config_.testRangeAccess) {
             if (config_.verboseOutput) {
                 std::cout << "  [" << encoderName << "/" << datasetName << "] range access..." << std::flush;
@@ -254,6 +292,17 @@ public:
             benchmarkRangeAccess(encoder, encoded, result.originalData, result.metrics);
             if (config_.verboseOutput) { std::cout << " done\n"; }
         }
+        // Read per-section range-access timing (divide by number of decodeRange calls made)
+        {
+            const auto& rangeTimes = encoder->subStreamDecodeRangeAccumNs();
+            const size_t rangeCount = std::max<size_t>(1, result.metrics.randomAccess.rangeQueryCount);
+            for (size_t s = 0; s < substreamAccum.size() && s < rangeTimes.size(); ++s)
+                substreamAccum[s].decodeRangeTime_ns = static_cast<double>(rangeTimes[s]) / rangeCount;
+        }
+
+        // Store final sub-stream breakdown
+        if (!substreamAccum.empty())
+            result.metrics.subStreamMetrics = std::move(substreamAccum);
 
         // ── Memory measurement pass ──────────────────────────────────────
         // Run each workload a second time, measuring heap usage with a background
