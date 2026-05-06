@@ -68,12 +68,10 @@ public:
         }
 
         size_t offset = 0;
-        size_t totalCompressed = 0;
         for (size_t b = 0; b < blockCount; ++b) {
             const size_t elems = std::min(effectiveBlock, totalElems - offset);
             const auto blockSpan = data.subspan(offset, elems);
             std::vector<uint8_t> compressed = compressBlock(blockSpan);
-            totalCompressed += compressed.size();
 
             if constexpr (BlockSize != 0) {
                 appendUint64(buffer, static_cast<uint64_t>(elems));
@@ -287,7 +285,10 @@ private:
             throw std::runtime_error("OpenZLCodec: failed to create compressor");
         }
 
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wc99-extensions"
         const ZL_GraphID gid = ZL_GRAPH_NUMERIC;
+#pragma clang diagnostic pop
         if (ZL_isError(ZL_Compressor_selectStartingGraphID(graph, gid))) {
             ZL_Compressor_free(graph);
             ZL_TypedRef_free(inRef);
