@@ -107,6 +107,20 @@ public:
         return ss.str();
     }
     
+    static std::string toJSON(const SubStreamMetrics& ss) {
+        std::ostringstream o;
+        o << "{\n";
+        o << "        \"name\": \""            << escape(ss.name)           << "\",\n";
+        o << "        \"bitWidth\": "          << static_cast<int>(ss.bitWidth) << ",\n";
+        o << "        \"encodedBytes\": "      << ss.encodedBytes            << ",\n";
+        o << "        \"encodeTime_ns\": "     << ss.encodeTime_ns           << ",\n";
+        o << "        \"decodeBulkTime_ns\": " << ss.decodeBulkTime_ns       << ",\n";
+        o << "        \"decodeAtTime_ns\": "   << ss.decodeAtTime_ns         << ",\n";
+        o << "        \"decodeRangeTime_ns\": "<< ss.decodeRangeTime_ns      << "\n";
+        o << "      }";
+        return o.str();
+    }
+
     static std::string toJSON(const BenchmarkMetrics& metrics) {
         std::ostringstream ss;
         ss << "  {\n";
@@ -123,6 +137,15 @@ public:
         ss << "    \"memory\": " << toJSON(metrics.memory, metrics.elementCount) << ",\n";
         ss << "    \"accuracy\": " << toJSON(metrics.accuracy) << ",\n";
         ss << "    \"randomAccess\": " << toJSON(metrics.randomAccess);
+        if (!metrics.subStreamMetrics.empty()) {
+            ss << ",\n    \"subStreamMetrics\": [\n";
+            for (size_t i = 0; i < metrics.subStreamMetrics.size(); ++i) {
+                ss << "      " << toJSON(metrics.subStreamMetrics[i]);
+                if (i + 1 < metrics.subStreamMetrics.size()) ss << ",";
+                ss << "\n";
+            }
+            ss << "    ]";
+        }
         if (!metrics.customMetrics.empty()) {
             ss << ",\n    \"customMetrics\": {\n";
             size_t idx = 0;
