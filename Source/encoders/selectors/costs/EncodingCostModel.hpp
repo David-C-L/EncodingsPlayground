@@ -590,55 +590,80 @@ public:
 };
 
 // Cost model for FrequencyPartitionEncoding.
-// Active tiers: key widths {1,2,4,8,16,32} where keyBits < storageTypeBits/2.
-// Cost = header + dict storage + per-tier bitmaps + key payload + fallback raw storage.
+// Tiers use non-power-of-2 key widths: tier t gets key width ceil(log2(tierSize)).
+// Tiers are pruned when their bitmap+dict cost exceeds savings over raw fallback storage.
+// Cost = header + included-tier bitmaps + dict + keys + fallback raw storage.
 class FrequencyPartitionCostModel final : public EncodingCostModel {
 public:
     double computeCost(const SegmentMetrics& metrics, size_t numValues, size_t bitWidth) const override {
         if (numValues == 0) return 0.0;
 
         const size_t storageTypeBits = storageWidthBits(static_cast<uint8_t>(bitWidth));
-        const size_t maxKeyBits = storageTypeBits / 2;
-
-        static constexpr uint8_t kAllTierBits[] = {1, 2, 4, 8, 16, 32};
-
-        size_t totalCapacity = 0;
-        size_t numTiers      = 0;
-        size_t lastTierBits  = 0;
-        for (const uint8_t kb : kAllTierBits) {
-            if (kb >= maxKeyBits) break;
-            totalCapacity += (size_t{1} << kb);
-            ++numTiers;
-            lastTierBits = kb;
+        // TEMP DEBUG
+        if (bitWidth >= 33 && bitWidth <= 64) {
+            std::cout << "[FreqPartCost] bw=" << bitWidth << " N=" << numValues
+                      << " unique=" << metrics.uniqueCount << " capped=" << metrics.uniqueCountCapped
+                      << " entropy=" << metrics.entropyEstimate << std::endl;
         }
+        const size_t maxKeyBits      = storageTypeBits / 2;
 
-        if (numTiers == 0) return static_cast<double>(numValues * bitWidth);
+        // Tiers use key widths 1..maxKeyBits (non-power-of-2).
+        // Tier t (0-indexed) has capacity 2^(t+1) and key width (t+1) bits.
+        const size_t numTierDefs = maxKeyBits;
+        if (numTierDefs == 0) return static_cast<double>(numValues * bitWidth);
 
         const size_t uniqueEst = metrics.uniqueCountCapped
             ? static_cast<size_t>(size_t{1} << std::min(bitWidth, size_t{20}))
             : metrics.uniqueCount;
 
-        // Covered fraction: capped at 1.0. For uint64_t the 32-bit tier has ~4B capacity
-        // so virtually all practical datasets are fully covered.
-        const double coveredFraction = (uniqueEst == 0 || uniqueEst <= totalCapacity)
-            ? 1.0
-            : static_cast<double>(totalCapacity) / static_cast<double>(uniqueEst);
+        // 2^entropy gives the "active alphabet size" for skewed distributions.
+        // When uniqueCount is capped the entropy estimate is computed from a binary
+        // approximation (H(cap/n, 1-cap/n)) which severely underestimates the true
+        // entropy. Fall back to uniqueEst so the coverage fraction stays sensible.
+        const double effectiveUnique = metrics.uniqueCountCapped
+            ? static_cast<double>(uniqueEst)
+            : std::max(1.0, std::exp2(metrics.entropyEstimate));
+        const double N               = static_cast<double>(numValues);
+        const double storageBits     = static_cast<double>(storageTypeBits);
 
-        // Average key bits bounded by entropy and the widest active tier.
-        const double avgKeyBits = std::min(metrics.entropyEstimate,
-                                           static_cast<double>(lastTierBits));
+        // Simulate the greedy tier-fill and marginal-cost pruning the encoder applies.
+        double totalCost   = (8 + 1 + 1 + 4) * 8.0; // header: numElements+numTiers+indexType+fallbackCount
+        double coveredFrac = 0.0;   // fraction of element occurrences in included tiers
+        size_t cumCapacity = 0;
 
-        const double storageBits = static_cast<double>(storageTypeBits);
-        // Dict overhead capped at uniqueEst to avoid inflating cost for large-capacity tiers.
-        const double coveredUniqueEst = std::min(static_cast<double>(totalCapacity),
-                                                  static_cast<double>(uniqueEst));
-        const double dictBits       = coveredUniqueEst * storageBits;
-        const double bitmapBits     = static_cast<double>(numTiers * numValues);
-        const double keyPayloadBits = static_cast<double>(numValues) * coveredFraction * avgKeyBits;
-        const double fallbackBits   = static_cast<double>(numValues) * (1.0 - coveredFraction) * storageBits;
-        constexpr double headerBits = (8 + 1 + 4) * 8.0;
+        for (size_t t = 0; t < numTierDefs; ++t) {
+            const size_t tierCap  = size_t{1} << (t + 1);
+            const double kb       = static_cast<double>(t + 1); // key width in bits
+            // Estimate how many unique values are newly assigned to this tier.
+            const double prevCumUnique = std::min(static_cast<double>(cumCapacity),
+                                                   static_cast<double>(uniqueEst));
+            cumCapacity += tierCap;
+            const double newCumUnique  = std::min(static_cast<double>(cumCapacity),
+                                                   static_cast<double>(uniqueEst));
+            const double tierDictSize  = newCumUnique - prevCumUnique;
+            if (tierDictSize <= 0.0) break; // no more unique values to cover
 
-        return headerBits + dictBits + bitmapBits + keyPayloadBits + fallbackBits;
+            // Coverage fraction of element occurrences for this tier.
+            const double newCumFrac = std::min(1.0, static_cast<double>(cumCapacity) / effectiveUnique);
+            const double tierFrac   = newCumFrac - coveredFrac;
+            const double tierCount  = tierFrac * N;
+
+            // Marginal cost vs savings (mirror of encoder's includeTier logic).
+            // numWords × 64 approximated as N (bitmap bits = N bits per tier).
+            const double tierCostBits    = N + tierDictSize * storageBits + tierCount * kb;
+            const double tierSavingsBits = tierCount * storageBits;
+            if (tierSavingsBits <= tierCostBits) continue; // encoder would prune this tier
+
+            // Include this tier.
+            totalCost   += tierCostBits;
+            coveredFrac  = newCumFrac;
+        }
+
+        // Fallback cost for uncovered element occurrences.
+        const double fallbackBits = N * (1.0 - coveredFrac) * storageBits;
+        totalCost += fallbackBits;
+
+        return totalCost;
     }
 
     MetricFlags requiredMetrics() const override {
