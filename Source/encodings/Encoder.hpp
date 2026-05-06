@@ -194,6 +194,25 @@ public:
     using Decoder<TIn, TOut>::decodeAt;
     using Decoder<TIn, TOut>::decodeRange;
 
+    // Per-sub-stream decode profiling — overridden by SubIntSplitEncoder<T, true> only.
+    // Default implementations return empty / no-op so all other codecs are unaffected.
+
+    /// Per-section decode times (ns) from the most recent decodeAll() call.
+    /// Index matches subStreamEncodeMetrics order in the encoded buffer's metadata.
+    virtual std::vector<int64_t> subStreamBulkDecodeTimeNs()   const { return {}; }
+
+    /// Per-section accumulated ns across decodeAt() calls since the last reset.
+    virtual std::vector<int64_t> subStreamDecodeAtAccumNs()    const { return {}; }
+
+    /// Per-section accumulated ns across decodeRange() calls since the last reset.
+    virtual std::vector<int64_t> subStreamDecodeRangeAccumNs() const { return {}; }
+
+    /// Zero the decodeAt accumulator — call before each random-access benchmark loop.
+    virtual void resetSubStreamDecodeAtAccum()    {}
+
+    /// Zero the decodeRange accumulator — call before each range-access benchmark loop.
+    virtual void resetSubStreamDecodeRangeAccum() {}
+
     // Single encodingType() implementation for both interfaces
     EncodingType encodingType() const override = 0;
 
