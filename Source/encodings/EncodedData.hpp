@@ -10,6 +10,15 @@ namespace encodings {
 
     using core::DataType;
 
+/// Per-section metrics populated by SubIntSplitEncoder<T, true>::encode().
+/// Empty for all other codecs and for the non-profiling SubIntSplitEncoder.
+struct SubStreamEncodeMetrics {
+    std::string name;         ///< sub-codec name, e.g. "Dictionary(13bit)"
+    uint8_t     bitWidth{0};  ///< bit width of this section
+    size_t      encodedBytes{0};
+    int64_t     encodeTime_ns{0};
+};
+
 /**
  * @brief Metadata about an encoding scheme
  */
@@ -24,6 +33,9 @@ struct EncodingMetadata {
     DataType encodedType = DataType::UInt8; // Default to byte-oriented encoding, can be overridden for other encodings
     // Additional encoding-specific metadata can be stored here
     std::map<std::string, std::string> customMetadata;
+
+    // Per-sub-stream encode metrics (non-empty only for SubIntSplitEncoder<T, true>)
+    std::vector<SubStreamEncodeMetrics> subStreamEncodeMetrics;
     
     /**
      * @brief Calculate compression ratio
