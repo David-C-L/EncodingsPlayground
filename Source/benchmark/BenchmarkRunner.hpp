@@ -178,11 +178,19 @@ public:
         encodings::EncodedData encoded;
         
         for (size_t i = 0; i < config_.iterations; ++i) {
+            if (config_.verboseOutput) {
+                std::cout << "  [" << encoderName << "/" << datasetName << "] encode..." << std::flush;
+            }
             // Measure encoding
             auto encodeStart = high_resolution_clock::now();
             encoded = encoder->encode(result.originalData);
             auto encodeEnd = high_resolution_clock::now();
             encodeTimes.push_back(duration_cast<nanoseconds>(encodeEnd - encodeStart));
+            if (config_.verboseOutput) {
+                std::cout << " done ("
+                          << duration_cast<nanoseconds>(encodeEnd - encodeStart).count() / 1'000'000.0
+                          << " ms)\n";
+            }
 
             auto selectionIt = encoded.metadata().customMetadata.find("selectionTime_ns");
             if (selectionIt != encoded.metadata().customMetadata.end()) {
@@ -192,39 +200,59 @@ public:
                     // ignore parse errors
                 }
             }
-            
+
+            if (config_.verboseOutput) {
+                std::cout << "  [" << encoderName << "/" << datasetName << "] decode (bulk)..." << std::flush;
+            }
             // Measure decoding
             auto decodeStart = high_resolution_clock::now();
             auto decoded = encoder->decodeAll(encoded);
             auto decodeEnd = high_resolution_clock::now();
             decodeTimes.push_back(duration_cast<nanoseconds>(decodeEnd - decodeStart));
-            
+            if (config_.verboseOutput) {
+                std::cout << " done ("
+                          << duration_cast<nanoseconds>(decodeEnd - decodeStart).count() / 1'000'000.0
+                          << " ms)\n";
+            }
+
             // Validation on first iteration
             if (i == 0 && config_.validateCorrectness) {
                 validateCorrectness(result.originalData, decoded, result.metrics.accuracy);
             }
         }
-        
+
         result.encodedData = encoded;
-        
+
         // Calculate timing statistics
         calculateTimingStats(encodeTimes, decodeTimes, result);
-        
+
         // Memory metrics
         result.metrics.memory.originalSize = dataSize * sizeof(T);
         result.metrics.memory.encodedSize = encoded.size();
-        
+
         // Random access benchmarks
         if (config_.testRandomAccess) {
+            if (config_.verboseOutput) {
+                std::cout << "  [" << encoderName << "/" << datasetName << "] random access..." << std::flush;
+            }
             benchmarkRandomAccess(encoder, encoded, result.originalData, result.metrics);
+            if (config_.verboseOutput) { std::cout << " done\n"; }
         }
-        
+
         if (config_.testStridedAccess) {
+            if (config_.verboseOutput) {
+                std::cout << "  [" << encoderName << "/" << datasetName << "] strided access..." << std::flush;
+            }
             benchmarkStridedAccess(encoder, encoded, result.originalData, result.metrics);
+            if (config_.verboseOutput) { std::cout << " done\n"; }
         }
-        
+
         if (config_.testRangeAccess) {
+            if (config_.verboseOutput) {
+                std::cout << "  [" << encoderName << "/" << datasetName << "] range access..." << std::flush;
+            }
             benchmarkRangeAccess(encoder, encoded, result.originalData, result.metrics);
+            if (config_.verboseOutput) { std::cout << " done\n"; }
         }
 
         // ── Memory measurement pass ──────────────────────────────────────
