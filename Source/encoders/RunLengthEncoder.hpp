@@ -163,6 +163,28 @@ public:
         }
     }
 
+    void decodeRangeInto(const EncodedData& encoded, size_t start, size_t end,
+                         T* dst, size_t n) override {
+        const View v = getView(encoded);
+        end = std::min(end, v.totalElements);
+        if (start >= end) {
+            if (n != 0) throw std::runtime_error("RunLengthEncoder::decodeRangeInto: empty range, n!=0");
+            return;
+        }
+        if ((end - start) != n) [[unlikely]]
+            throw std::runtime_error("RunLengthEncoder::decodeRangeInto: size mismatch");
+        if (v.numRuns == 0) return;
+        const size_t firstRun = v.findRun(start);
+        for (size_t r = firstRun; r < v.numRuns; ++r) {
+            const size_t rs = v.runStarts[r];
+            const size_t re = (r + 1 < v.numRuns) ? v.runStarts[r + 1] : v.totalElements;
+            if (rs >= end) break;
+            std::fill(dst + (std::max(rs, start) - start),
+                      dst + (std::min(re, end)   - start),
+                      v.runValues[r]);
+        }
+    }
+
     std::optional<T> decodeAt(const EncodedData& encoded, size_t index) override {
         const View v = getView(encoded);
         if (v.numRuns == 0 || index >= v.totalElements) [[unlikely]] {
