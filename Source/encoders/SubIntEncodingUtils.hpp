@@ -249,12 +249,7 @@ public:
                                   SectionCodecTIn* acc, size_t n,
                                   uint8_t shift, bool isFirst) override {
         ensureScratch(n);
-        // Use the default decodeRange path (writes into a vector) then copy into
-        // scratch.  A future decodeRangeInto on Codec<T> would eliminate this copy.
-        auto vals = impl_->decodeRange(enc, start, end);
-        if (vals.size() != n) [[unlikely]]
-            throw std::runtime_error("TypedSectionCodecAdapter::decodeRangeAndAccumulate: size mismatch");
-        std::copy(vals.begin(), vals.end(), sectionScratch_.get());
+        impl_->decodeRangeInto(enc, start, end, sectionScratch_.get(), n);
         accumulateScratch(acc, n, shift, isFirst);
     }
 

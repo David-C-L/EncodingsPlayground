@@ -54,8 +54,13 @@ class SubIntSplitEncoder final : public Codec<T, uint8_t> {
 public:
     using ValueT = T;
     using SectionT = std::conditional_t<(sizeof(T) <= 4), uint32_t, uint64_t>;
-    static constexpr uint8_t kTotalBits   = static_cast<uint8_t>(sizeof(T) * 8);
+    static constexpr uint8_t kTotalBits      = static_cast<uint8_t>(sizeof(T) * 8);
     static constexpr bool    kProfileSections = EnableProfiling;
+    // Chunk size for the inner decode loop.  Chosen so that one acc slice
+    // (kDecodeChunkSize * sizeof(SectionT)) plus per-section scratch (at most
+    // kDecodeChunkSize * sizeof(SectionT) total) comfortably fits in L2 cache.
+    // 8192 * 8 * 2 = 128 KB — fits in most 256 KB L2 caches.
+    static constexpr size_t  kDecodeChunkSize = 8192;
     static_assert(sizeof(T) == sizeof(SectionT),
                   "T and SectionT must be same width for safe reinterpret_cast in decode paths");
 
@@ -206,24 +211,33 @@ public:
 
         const size_t splits = h.bits.size();
 
-        // Accumulate directly into the output vector to avoid a separate accRaw
-        // allocation and the 80 MB final memcpy.  T and SectionT are the same-width
-        // signed/unsigned pair, so treating out.data() as SectionT* is a safe
-        // same-representation reinterpret (guarded by the static_assert in the class).
+        // Chunk-based decode: process kDecodeChunkSize elements at a time so that
+        // the acc slice and section scratch buffers stay in L2 cache across all
+        // splits for a given chunk.  This eliminates the DRAM bandwidth bottleneck
+        // from streaming the full 80 MB acc buffer once per section.
         std::vector<T> out(h.N);
         SectionT* acc = reinterpret_cast<SectionT*>(out.data());
 
         if constexpr (kProfileSections)
             bulkDecodeTimeNs_.assign(splits, 0);
 
-        for (size_t s = 0; s < splits; ++s) {
-            if constexpr (kProfileSections) {
-                const auto t0 = std::chrono::high_resolution_clock::now();
-                cfg_.codecs[s]->decodeAllAndAccumulate(h.views[s], acc, h.N, h.shifts[s], s == 0);
-                bulkDecodeTimeNs_[s] = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::high_resolution_clock::now() - t0).count();
-            } else {
-                cfg_.codecs[s]->decodeAllAndAccumulate(h.views[s], acc, h.N, h.shifts[s], s == 0);
+        for (size_t chunkStart = 0; chunkStart < h.N; chunkStart += kDecodeChunkSize) {
+            const size_t chunkEnd   = std::min(chunkStart + kDecodeChunkSize, h.N);
+            const size_t chunkCount = chunkEnd - chunkStart;
+
+            for (size_t s = 0; s < splits; ++s) {
+                if constexpr (kProfileSections) {
+                    const auto t0 = std::chrono::high_resolution_clock::now();
+                    cfg_.codecs[s]->decodeRangeAndAccumulate(
+                        h.views[s], chunkStart, chunkEnd,
+                        acc + chunkStart, chunkCount, h.shifts[s], s == 0);
+                    bulkDecodeTimeNs_[s] += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::high_resolution_clock::now() - t0).count();
+                } else {
+                    cfg_.codecs[s]->decodeRangeAndAccumulate(
+                        h.views[s], chunkStart, chunkEnd,
+                        acc + chunkStart, chunkCount, h.shifts[s], s == 0);
+                }
             }
         }
 
@@ -271,14 +285,23 @@ public:
                 decodeRangeAccumNs_.assign(splits, 0);
         }
 
-        for (size_t s = 0; s < splits; ++s) {
-            if constexpr (kProfileSections) {
-                const auto t0 = std::chrono::high_resolution_clock::now();
-                cfg_.codecs[s]->decodeRangeAndAccumulate(h.views[s], start, end, acc, count, h.shifts[s], s == 0);
-                decodeRangeAccumNs_[s] += std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::high_resolution_clock::now() - t0).count();
-            } else {
-                cfg_.codecs[s]->decodeRangeAndAccumulate(h.views[s], start, end, acc, count, h.shifts[s], s == 0);
+        for (size_t chunkStart = start; chunkStart < end; chunkStart += kDecodeChunkSize) {
+            const size_t chunkEnd   = std::min(chunkStart + kDecodeChunkSize, end);
+            const size_t chunkCount = chunkEnd - chunkStart;
+
+            for (size_t s = 0; s < splits; ++s) {
+                if constexpr (kProfileSections) {
+                    const auto t0 = std::chrono::high_resolution_clock::now();
+                    cfg_.codecs[s]->decodeRangeAndAccumulate(
+                        h.views[s], chunkStart, chunkEnd,
+                        acc + (chunkStart - start), chunkCount, h.shifts[s], s == 0);
+                    decodeRangeAccumNs_[s] += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::high_resolution_clock::now() - t0).count();
+                } else {
+                    cfg_.codecs[s]->decodeRangeAndAccumulate(
+                        h.views[s], chunkStart, chunkEnd,
+                        acc + (chunkStart - start), chunkCount, h.shifts[s], s == 0);
+                }
             }
         }
 
