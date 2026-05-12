@@ -106,6 +106,28 @@ public:
 		unpackValuesInto(payload, count, bitWidth, base, dst);
 	}
 
+	void decodeRangeInto(const EncodedData& encoded, size_t start, size_t end,
+	                     T* dst, size_t n) override {
+		if (encoded.size() < headerSize()) {
+			if (n != 0) throw std::runtime_error("RawBitPackedEncoder::decodeRangeInto: empty buffer, n!=0");
+			return;
+		}
+		size_t count;
+		uint8_t bitWidth;
+		T base;
+		readHeader(encoded.data().data(), count, bitWidth, base);
+		end = std::min(end, count);
+		if (start >= end) {
+			if (n != 0) throw std::runtime_error("RawBitPackedEncoder::decodeRangeInto: empty range, n!=0");
+			return;
+		}
+		if ((end - start) != n) [[unlikely]]
+			throw std::runtime_error("RawBitPackedEncoder::decodeRangeInto: size mismatch");
+		if (bitWidth == 0) { std::fill(dst, dst + n, base); return; }
+		const uint8_t* payload = encoded.data().data() + headerSize();
+		unpackValuesInto(payload, n, bitWidth, base, dst, start);
+	}
+
 	std::optional<T> decodeAt(const EncodedData& encoded, size_t index) override {
 		if (encoded.size() < headerSize()) {
 			return std::nullopt;
@@ -329,9 +351,10 @@ private:
 		return value & mask;
 	}
 
-	static void unpackValuesInto(const uint8_t* payload, size_t count, uint8_t bitWidth, T base, T* dst) {
+	static void unpackValuesInto(const uint8_t* payload, size_t count, uint8_t bitWidth, T base, T* dst,
+	                             size_t startElement = 0) {
 		const uint64_t mask = bitMask(bitWidth);
-		size_t bitPos = 0;
+		size_t bitPos = startElement * static_cast<size_t>(bitWidth);
 		for (size_t i = 0; i < count; ++i, bitPos += bitWidth) {
 			dst[i] = addBase(extractAt(payload, bitPos, bitWidth, mask), base);
 		}
