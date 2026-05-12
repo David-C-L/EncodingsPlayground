@@ -90,6 +90,22 @@ public:
 		return unpackValues(payload, count, bitWidth, base);
 	}
 
+	void decodeAllInto(const EncodedData& encoded, T* dst, size_t n) override {
+		if (encoded.size() < headerSize()) {
+			if (n != 0) throw std::runtime_error("RawBitPackedEncoder::decodeAllInto: empty buffer, n!=0");
+			return;
+		}
+		size_t count;
+		uint8_t bitWidth;
+		T base;
+		readHeader(encoded.data().data(), count, bitWidth, base);
+		if (count != n) [[unlikely]]
+			throw std::runtime_error("RawBitPackedEncoder::decodeAllInto: size mismatch");
+		if (bitWidth == 0) { std::fill(dst, dst + n, base); return; }
+		const uint8_t* payload = encoded.data().data() + headerSize();
+		unpackValuesInto(payload, count, bitWidth, base, dst);
+	}
+
 	std::optional<T> decodeAt(const EncodedData& encoded, size_t index) override {
 		if (encoded.size() < headerSize()) {
 			return std::nullopt;
@@ -134,12 +150,12 @@ public:
 		}
 
 		const uint8_t* payload = encoded.data().data() + headerSize();
-		std::vector<T> out(outCount);
-		T* dst = out.data();
+		std::vector<T> out;
+		out.reserve(outCount);
 		size_t bitPos = static_cast<size_t>(bitWidth) * start;
 		const uint64_t mask = bitMask(bitWidth);
 		for (size_t i = 0; i < outCount; ++i, bitPos += bitWidth) {
-			dst[i] = addBase(extractAt(payload, bitPos, bitWidth, mask), base);
+			out.push_back(addBase(extractAt(payload, bitPos, bitWidth, mask), base));
 		}
 		return out;
 	}
@@ -313,16 +329,22 @@ private:
 		return value & mask;
 	}
 
-	static std::vector<T> unpackValues(const uint8_t* payload, size_t count, uint8_t bitWidth, T base) {
-		// Read directly from the encoded byte payload via unaligned loads — no
-		// intermediate uint64_t[] copy needed. Pre-size output and write by index
-		// to eliminate push_back bookkeeping and enable auto-vectorisation.
-		std::vector<T> out(count);
-		T* dst = out.data();
+	static void unpackValuesInto(const uint8_t* payload, size_t count, uint8_t bitWidth, T base, T* dst) {
 		const uint64_t mask = bitMask(bitWidth);
 		size_t bitPos = 0;
 		for (size_t i = 0; i < count; ++i, bitPos += bitWidth) {
 			dst[i] = addBase(extractAt(payload, bitPos, bitWidth, mask), base);
+		}
+	}
+
+	static std::vector<T> unpackValues(const uint8_t* payload, size_t count, uint8_t bitWidth, T base) {
+		// reserve avoids zero-initialisation that vector<T>(count) would perform.
+		std::vector<T> out;
+		out.reserve(count);
+		const uint64_t mask = bitMask(bitWidth);
+		size_t bitPos = 0;
+		for (size_t i = 0; i < count; ++i, bitPos += bitWidth) {
+			out.push_back(addBase(extractAt(payload, bitPos, bitWidth, mask), base));
 		}
 		return out;
 	}
