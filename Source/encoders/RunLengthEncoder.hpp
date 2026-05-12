@@ -150,6 +150,19 @@ public:
         return result;
     }
 
+    void decodeAllInto(const EncodedData& encoded, T* dst, size_t n) override {
+        const View v = getView(encoded);
+        if (v.numRuns == 0) {
+            if (n != 0) throw std::runtime_error("RunLengthEncoder::decodeAllInto: empty but n!=0");
+            return;
+        }
+        for (size_t r = 0; r < v.numRuns; ++r) {
+            const size_t runStart = v.runStarts[r];
+            const size_t runEnd   = (r + 1 < v.numRuns) ? v.runStarts[r + 1] : n;
+            std::fill(dst + runStart, dst + runEnd, v.runValues[r]);
+        }
+    }
+
     std::optional<T> decodeAt(const EncodedData& encoded, size_t index) override {
         const View v = getView(encoded);
         if (v.numRuns == 0 || index >= v.totalElements) [[unlikely]] {
