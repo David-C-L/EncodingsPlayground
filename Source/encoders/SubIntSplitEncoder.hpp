@@ -204,14 +204,12 @@ public:
 
         const size_t splits = h.bits.size();
 
-        // Decode each section directly into a single reused temp buffer, then
-        // assign/OR-shift into acc.  This replaces splits separate vector<SectionT>
-        // allocations with one shared buffer, reducing peak working set from
-        // (splits+1)*N*sizeof(SectionT) to 2*N*sizeof(SectionT).
+        // Fused decode-and-accumulate: each section is decoded and OR-shifted directly
+        // into acc without an intermediate wide tmp buffer.  For a uint8_t section at
+        // N=10M this eliminates an 80 MB write + 80 MB read of tmp per section,
+        // halving DRAM traffic vs the earlier two-buffer approach.
         auto accRaw = std::make_unique_for_overwrite<SectionT[]>(h.N);
         SectionT* acc = accRaw.get();
-        auto tmpRaw = std::make_unique_for_overwrite<SectionT[]>(h.N);
-        SectionT* tmp = tmpRaw.get();
 
         if constexpr (kProfileSections)
             bulkDecodeTimeNs_.assign(splits, 0);
@@ -219,14 +217,12 @@ public:
         for (size_t s = 0; s < splits; ++s) {
             if constexpr (kProfileSections) {
                 const auto t0 = std::chrono::high_resolution_clock::now();
-                cfg_.codecs[s]->decodeAllInto(h.views[s], tmp, h.N);
+                cfg_.codecs[s]->decodeAllAndAccumulate(h.views[s], acc, h.N, h.shifts[s], s == 0);
                 bulkDecodeTimeNs_[s] = std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::high_resolution_clock::now() - t0).count();
             } else {
-                cfg_.codecs[s]->decodeAllInto(h.views[s], tmp, h.N);
+                cfg_.codecs[s]->decodeAllAndAccumulate(h.views[s], acc, h.N, h.shifts[s], s == 0);
             }
-            if (s == 0) assignSectionInto(tmp, acc, h.N, h.shifts[0]);
-            else        combineSectionInto(tmp, acc, h.N, h.shifts[s]);
         }
 
         // Bit-cast the unsigned accumulator to the signed output type (same width).
@@ -270,8 +266,6 @@ public:
 
         auto accRaw = std::make_unique_for_overwrite<SectionT[]>(count);
         SectionT* acc = accRaw.get();
-        auto tmpRaw = std::make_unique_for_overwrite<SectionT[]>(count);
-        SectionT* tmp = tmpRaw.get();
 
         if constexpr (kProfileSections) {
             if (decodeRangeAccumNs_.size() != splits)
@@ -281,14 +275,12 @@ public:
         for (size_t s = 0; s < splits; ++s) {
             if constexpr (kProfileSections) {
                 const auto t0 = std::chrono::high_resolution_clock::now();
-                cfg_.codecs[s]->decodeRangeInto(h.views[s], start, end, tmp, count);
+                cfg_.codecs[s]->decodeRangeAndAccumulate(h.views[s], start, end, acc, count, h.shifts[s], s == 0);
                 decodeRangeAccumNs_[s] += std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::high_resolution_clock::now() - t0).count();
             } else {
-                cfg_.codecs[s]->decodeRangeInto(h.views[s], start, end, tmp, count);
+                cfg_.codecs[s]->decodeRangeAndAccumulate(h.views[s], start, end, acc, count, h.shifts[s], s == 0);
             }
-            if (s == 0) assignSectionInto(tmp, acc, count, h.shifts[0]);
-            else        combineSectionInto(tmp, acc, count, h.shifts[s]);
         }
 
         std::vector<T> out(count);
@@ -482,6 +474,8 @@ private:
             const __m128i vshift = _mm_cvtsi64_si128(static_cast<int64_t>(shift));
             size_t i = 0;
             for (; i + 4 <= N; i += 4) {
+                _mm_prefetch(reinterpret_cast<const char*>(src + i + 32), _MM_HINT_T1);
+                _mm_prefetch(reinterpret_cast<const char*>(dst + i + 32), _MM_HINT_T1);
                 __m256i vs = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + i));
                 vs = _mm256_sll_epi64(vs, vshift);
                 _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + i), vs);
@@ -491,6 +485,8 @@ private:
             const __m128i vshift = _mm_cvtsi32_si128(static_cast<int32_t>(shift));
             size_t i = 0;
             for (; i + 8 <= N; i += 8) {
+                _mm_prefetch(reinterpret_cast<const char*>(src + i + 64), _MM_HINT_T1);
+                _mm_prefetch(reinterpret_cast<const char*>(dst + i + 64), _MM_HINT_T1);
                 __m256i vs = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + i));
                 vs = _mm256_sll_epi32(vs, vshift);
                 _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + i), vs);
@@ -515,6 +511,8 @@ private:
             const __m128i vshift = _mm_cvtsi64_si128(static_cast<int64_t>(shift));
             size_t i = 0;
             for (; i + 4 <= N; i += 4) {
+                _mm_prefetch(reinterpret_cast<const char*>(src + i + 32), _MM_HINT_T1);
+                _mm_prefetch(reinterpret_cast<const char*>(dst + i + 32), _MM_HINT_T1);
                 __m256i vs = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + i));
                 __m256i vd = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(dst + i));
                 vs = _mm256_sll_epi64(vs, vshift);
@@ -527,6 +525,8 @@ private:
             const __m128i vshift = _mm_cvtsi32_si128(static_cast<int32_t>(shift));
             size_t i = 0;
             for (; i + 8 <= N; i += 8) {
+                _mm_prefetch(reinterpret_cast<const char*>(src + i + 64), _MM_HINT_T1);
+                _mm_prefetch(reinterpret_cast<const char*>(dst + i + 64), _MM_HINT_T1);
                 __m256i vs = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + i));
                 __m256i vd = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(dst + i));
                 vs = _mm256_sll_epi32(vs, vshift);

@@ -55,6 +55,36 @@ public:
                                   size_t start, size_t end,
                                   TIn* dst, size_t n) = 0;
 
+    // Fused decode-and-accumulate: decode and OR-shift directly into acc, avoiding
+    // a separate wide tmp buffer.  isFirst=true: pure write (acc[i] = v << shift);
+    // isFirst=false: read-modify-write (acc[i] |= v << shift).
+    // Default implementation allocates a temporary via decodeAllInto; override in
+    // TypedSectionCodecAdapter (and any other concrete codec) for the hot path.
+    virtual void decodeAllAndAccumulate(const EncodedBuffer<uint8_t>& enc,
+                                        TIn* acc, size_t n,
+                                        uint8_t shift, bool isFirst) {
+        std::vector<TIn> tmp(n);
+        decodeAllInto(enc, tmp.data(), n);
+        if (isFirst) {
+            for (size_t i = 0; i < n; ++i) acc[i] = tmp[i] << shift;
+        } else {
+            for (size_t i = 0; i < n; ++i) acc[i] |= tmp[i] << shift;
+        }
+    }
+
+    virtual void decodeRangeAndAccumulate(const EncodedBuffer<uint8_t>& enc,
+                                          size_t start, size_t end,
+                                          TIn* acc, size_t n,
+                                          uint8_t shift, bool isFirst) {
+        std::vector<TIn> tmp(n);
+        decodeRangeInto(enc, start, end, tmp.data(), n);
+        if (isFirst) {
+            for (size_t i = 0; i < n; ++i) acc[i] = tmp[i] << shift;
+        } else {
+            for (size_t i = 0; i < n; ++i) acc[i] |= tmp[i] << shift;
+        }
+    }
+
     virtual EncodingProperties properties() const = 0;
     virtual std::string name() const = 0;
 };
@@ -195,6 +225,40 @@ public:
         } else {
             for (size_t i = 0; i < n; ++i)
                 dst[i] = static_cast<SectionCodecTIn>(vals[i]);
+        }
+    }
+
+    // Optimised fused overrides: decode into narrow vector<T> (e.g. 10 MB for uint8_t
+    // at N=10M) then stream directly into the wide acc buffer, avoiding the 80 MB
+    // SectionCodecTIn tmp buffer that decodeAllInto + a separate combine pass would need.
+    void decodeAllAndAccumulate(const EncodedBuffer<uint8_t>& enc,
+                                SectionCodecTIn* acc, size_t n,
+                                uint8_t shift, bool isFirst) override {
+        auto vals = impl_->decodeAll(enc);
+        if (vals.size() != n) [[unlikely]]
+            throw std::runtime_error("TypedSectionCodecAdapter::decodeAllAndAccumulate: size mismatch");
+        if (isFirst) {
+            for (size_t i = 0; i < n; ++i)
+                acc[i] = static_cast<SectionCodecTIn>(vals[i]) << shift;
+        } else {
+            for (size_t i = 0; i < n; ++i)
+                acc[i] |= static_cast<SectionCodecTIn>(vals[i]) << shift;
+        }
+    }
+
+    void decodeRangeAndAccumulate(const EncodedBuffer<uint8_t>& enc,
+                                  size_t start, size_t end,
+                                  SectionCodecTIn* acc, size_t n,
+                                  uint8_t shift, bool isFirst) override {
+        auto vals = impl_->decodeRange(enc, start, end);
+        if (vals.size() != n) [[unlikely]]
+            throw std::runtime_error("TypedSectionCodecAdapter::decodeRangeAndAccumulate: size mismatch");
+        if (isFirst) {
+            for (size_t i = 0; i < n; ++i)
+                acc[i] = static_cast<SectionCodecTIn>(vals[i]) << shift;
+        } else {
+            for (size_t i = 0; i < n; ++i)
+                acc[i] |= static_cast<SectionCodecTIn>(vals[i]) << shift;
         }
     }
 
