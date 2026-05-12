@@ -2,6 +2,9 @@
 
 #include <algorithm>
 #include <cstdint>
+#ifdef __AVX2__
+#  include <immintrin.h>
+#endif
 #include <memory>
 #include <optional>
 #include <span>
@@ -228,47 +231,175 @@ public:
         }
     }
 
-    // Optimised fused overrides: decode into narrow vector<T> (e.g. 10 MB for uint8_t
-    // at N=10M) then stream directly into the wide acc buffer, avoiding the 80 MB
-    // SectionCodecTIn tmp buffer that decodeAllInto + a separate combine pass would need.
+    // Optimised fused overrides: use a persistent, zero-init-free scratch buffer to
+    // avoid a per-call heap allocation.  impl_->decodeAllInto() writes narrow T values
+    // directly into the scratch; the accumulate loop then widens and shifts into acc.
+    // Thread-safety: sectionScratch_ is accessed without synchronisation — safe while
+    // each SubIntSplitEncoder instance is used from a single thread.
     void decodeAllAndAccumulate(const EncodedBuffer<uint8_t>& enc,
                                 SectionCodecTIn* acc, size_t n,
                                 uint8_t shift, bool isFirst) override {
-        auto vals = impl_->decodeAll(enc);
-        if (vals.size() != n) [[unlikely]]
-            throw std::runtime_error("TypedSectionCodecAdapter::decodeAllAndAccumulate: size mismatch");
-        if (isFirst) {
-            for (size_t i = 0; i < n; ++i)
-                acc[i] = static_cast<SectionCodecTIn>(vals[i]) << shift;
-        } else {
-            for (size_t i = 0; i < n; ++i)
-                acc[i] |= static_cast<SectionCodecTIn>(vals[i]) << shift;
-        }
+        ensureScratch(n);
+        impl_->decodeAllInto(enc, sectionScratch_.get(), n);
+        accumulateScratch(acc, n, shift, isFirst);
     }
 
     void decodeRangeAndAccumulate(const EncodedBuffer<uint8_t>& enc,
                                   size_t start, size_t end,
                                   SectionCodecTIn* acc, size_t n,
                                   uint8_t shift, bool isFirst) override {
+        ensureScratch(n);
+        // Use the default decodeRange path (writes into a vector) then copy into
+        // scratch.  A future decodeRangeInto on Codec<T> would eliminate this copy.
         auto vals = impl_->decodeRange(enc, start, end);
         if (vals.size() != n) [[unlikely]]
             throw std::runtime_error("TypedSectionCodecAdapter::decodeRangeAndAccumulate: size mismatch");
-        if (isFirst) {
-            for (size_t i = 0; i < n; ++i)
-                acc[i] = static_cast<SectionCodecTIn>(vals[i]) << shift;
-        } else {
-            for (size_t i = 0; i < n; ++i)
-                acc[i] |= static_cast<SectionCodecTIn>(vals[i]) << shift;
-        }
+        std::copy(vals.begin(), vals.end(), sectionScratch_.get());
+        accumulateScratch(acc, n, shift, isFirst);
     }
 
     EncodingProperties properties() const override { return impl_->properties(); }
     std::string name() const override { return impl_->name(); }
 
 private:
+    void ensureScratch(size_t n) const {
+        if (scratchSize_ < n) {
+            sectionScratch_ = std::make_unique_for_overwrite<T[]>(n);
+            scratchSize_ = n;
+        }
+    }
+
+    void accumulateScratch(SectionCodecTIn* acc, size_t n, uint8_t shift, bool isFirst) const {
+        const T* src = sectionScratch_.get();
+#ifdef __AVX2__
+        // AVX2 widening paths: process 4 elements per iteration for all narrow T→64-bit
+        // and narrow T→32-bit combinations.  The scalar tail handles the remainder.
+        if constexpr (sizeof(SectionCodecTIn) == 8) {
+            // --- 64-bit output ---
+            const __m128i vshift = _mm_cvtsi64_si128(static_cast<int64_t>(shift));
+
+            if constexpr (sizeof(T) == 1) {
+                // uint8 → uint64: _mm256_cvtepu8_epi64 takes lowest 4 bytes of __m128i
+                size_t i = 0;
+                for (; i + 4 <= n; i += 4) {
+                    _mm_prefetch(reinterpret_cast<const char*>(src + i + 32), _MM_HINT_T1);
+                    _mm_prefetch(reinterpret_cast<const char*>(acc + i + 32), _MM_HINT_T1);
+                    int32_t tmp; std::memcpy(&tmp, src + i, 4);
+                    __m256i vs = _mm256_cvtepu8_epi64(_mm_cvtsi32_si128(tmp));
+                    if (shift) vs = _mm256_sll_epi64(vs, vshift);
+                    if (isFirst) {
+                        _mm256_storeu_si256(reinterpret_cast<__m256i*>(acc + i), vs);
+                    } else {
+                        __m256i vd = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(acc + i));
+                        _mm256_storeu_si256(reinterpret_cast<__m256i*>(acc + i), _mm256_or_si256(vd, vs));
+                    }
+                }
+                for (; i < n; ++i)
+                    isFirst ? (acc[i]  = static_cast<SectionCodecTIn>(src[i]) << shift)
+                            : (acc[i] |= static_cast<SectionCodecTIn>(src[i]) << shift);
+                return;
+            } else if constexpr (sizeof(T) == 2) {
+                // uint16 → uint64: _mm256_cvtepu16_epi64 takes lowest 8 bytes of __m128i
+                size_t i = 0;
+                for (; i + 4 <= n; i += 4) {
+                    _mm_prefetch(reinterpret_cast<const char*>(src + i + 32), _MM_HINT_T1);
+                    _mm_prefetch(reinterpret_cast<const char*>(acc + i + 32), _MM_HINT_T1);
+                    __m256i vs = _mm256_cvtepu16_epi64(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(src + i)));
+                    if (shift) vs = _mm256_sll_epi64(vs, vshift);
+                    if (isFirst) {
+                        _mm256_storeu_si256(reinterpret_cast<__m256i*>(acc + i), vs);
+                    } else {
+                        __m256i vd = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(acc + i));
+                        _mm256_storeu_si256(reinterpret_cast<__m256i*>(acc + i), _mm256_or_si256(vd, vs));
+                    }
+                }
+                for (; i < n; ++i)
+                    isFirst ? (acc[i]  = static_cast<SectionCodecTIn>(src[i]) << shift)
+                            : (acc[i] |= static_cast<SectionCodecTIn>(src[i]) << shift);
+                return;
+            } else if constexpr (sizeof(T) == 4) {
+                // uint32 → uint64: _mm256_cvtepu32_epi64 takes 128-bit register (4×32)
+                size_t i = 0;
+                for (; i + 4 <= n; i += 4) {
+                    _mm_prefetch(reinterpret_cast<const char*>(src + i + 32), _MM_HINT_T1);
+                    _mm_prefetch(reinterpret_cast<const char*>(acc + i + 32), _MM_HINT_T1);
+                    __m256i vs = _mm256_cvtepu32_epi64(_mm_loadu_si128(reinterpret_cast<const __m128i*>(src + i)));
+                    if (shift) vs = _mm256_sll_epi64(vs, vshift);
+                    if (isFirst) {
+                        _mm256_storeu_si256(reinterpret_cast<__m256i*>(acc + i), vs);
+                    } else {
+                        __m256i vd = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(acc + i));
+                        _mm256_storeu_si256(reinterpret_cast<__m256i*>(acc + i), _mm256_or_si256(vd, vs));
+                    }
+                }
+                for (; i < n; ++i)
+                    isFirst ? (acc[i]  = static_cast<SectionCodecTIn>(src[i]) << shift)
+                            : (acc[i] |= static_cast<SectionCodecTIn>(src[i]) << shift);
+                return;
+            }
+            // sizeof(T)==8: no widening, same-width path falls through to scalar below
+        } else if constexpr (sizeof(SectionCodecTIn) == 4) {
+            // --- 32-bit output ---
+            const __m128i vshift = _mm_cvtsi32_si128(static_cast<int32_t>(shift));
+
+            if constexpr (sizeof(T) == 1) {
+                // uint8 → uint32: _mm256_cvtepu8_epi32 takes lowest 8 bytes of __m128i
+                size_t i = 0;
+                for (; i + 8 <= n; i += 8) {
+                    _mm_prefetch(reinterpret_cast<const char*>(src + i + 64), _MM_HINT_T1);
+                    _mm_prefetch(reinterpret_cast<const char*>(acc + i + 64), _MM_HINT_T1);
+                    int64_t tmp; std::memcpy(&tmp, src + i, 8);
+                    __m256i vs = _mm256_cvtepu8_epi32(_mm_cvtsi64_si128(tmp));
+                    if (shift) vs = _mm256_sll_epi32(vs, vshift);
+                    if (isFirst) {
+                        _mm256_storeu_si256(reinterpret_cast<__m256i*>(acc + i), vs);
+                    } else {
+                        __m256i vd = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(acc + i));
+                        _mm256_storeu_si256(reinterpret_cast<__m256i*>(acc + i), _mm256_or_si256(vd, vs));
+                    }
+                }
+                for (; i < n; ++i)
+                    isFirst ? (acc[i]  = static_cast<SectionCodecTIn>(src[i]) << shift)
+                            : (acc[i] |= static_cast<SectionCodecTIn>(src[i]) << shift);
+                return;
+            } else if constexpr (sizeof(T) == 2) {
+                // uint16 → uint32: _mm256_cvtepu16_epi32 takes 128-bit register (8×16)
+                size_t i = 0;
+                for (; i + 8 <= n; i += 8) {
+                    _mm_prefetch(reinterpret_cast<const char*>(src + i + 64), _MM_HINT_T1);
+                    _mm_prefetch(reinterpret_cast<const char*>(acc + i + 64), _MM_HINT_T1);
+                    __m256i vs = _mm256_cvtepu16_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(src + i)));
+                    if (shift) vs = _mm256_sll_epi32(vs, vshift);
+                    if (isFirst) {
+                        _mm256_storeu_si256(reinterpret_cast<__m256i*>(acc + i), vs);
+                    } else {
+                        __m256i vd = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(acc + i));
+                        _mm256_storeu_si256(reinterpret_cast<__m256i*>(acc + i), _mm256_or_si256(vd, vs));
+                    }
+                }
+                for (; i < n; ++i)
+                    isFirst ? (acc[i]  = static_cast<SectionCodecTIn>(src[i]) << shift)
+                            : (acc[i] |= static_cast<SectionCodecTIn>(src[i]) << shift);
+                return;
+            }
+            // sizeof(T)==4: same-width, falls through to scalar
+        }
+#endif // __AVX2__
+        // Scalar fallback: same-width T==SectionCodecTIn, or non-AVX2 build.
+        if (isFirst) {
+            for (size_t i = 0; i < n; ++i)
+                acc[i] = static_cast<SectionCodecTIn>(src[i]) << shift;
+        } else {
+            for (size_t i = 0; i < n; ++i)
+                acc[i] |= static_cast<SectionCodecTIn>(src[i]) << shift;
+        }
+    }
+
     std::shared_ptr<Codec<T, uint8_t>> impl_;
     uint8_t bits_{};
     SectionCodecTIn mask_{};
+    mutable std::unique_ptr<T[]> sectionScratch_;
+    mutable size_t scratchSize_{0};
 };
 
 // Helper to choose underlying unsigned type based on bit width
