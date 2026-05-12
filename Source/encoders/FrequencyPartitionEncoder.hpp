@@ -941,9 +941,8 @@ private:
     // Decode helpers per index mode (split for profiler visibility)
     // ---------------------------------------------------------------------------
 
-    std::vector<T> decodeAllPerTierBitmaps(const EncodedBuffer<uint8_t>& enc, const ParsedHeader& h) const {
+    void decodeAllPerTierBitmapsInto(const EncodedBuffer<uint8_t>& enc, const ParsedHeader& h, T* out) const {
         const size_t N = static_cast<size_t>(h.numElements);
-        std::vector<T> out(N);
 
         for (const auto& td : h.tiers) {
             const uint8_t* keysBase = enc.data().data() + td.keysOffset;
@@ -976,12 +975,16 @@ private:
                 }
             }
         }
-        return out;
     }
 
-    std::vector<T> decodeAllTierTagArray(const EncodedBuffer<uint8_t>& enc, const ParsedHeader& h) const {
+    std::vector<T> decodeAllPerTierBitmaps(const EncodedBuffer<uint8_t>& enc, const ParsedHeader& h) const {
+        std::vector<T> result(h.numElements);
+        decodeAllPerTierBitmapsInto(enc, h, result.data());
+        return result;
+    }
+
+    void decodeAllTierTagArrayInto(const EncodedBuffer<uint8_t>& enc, const ParsedHeader& h, T* out) const {
         const size_t N = static_cast<size_t>(h.numElements);
-        std::vector<T> out(N);
         const uint8_t* tagBase = enc.data().data() + h.tagArrayOffset;
         const uint8_t  tagBits = h.tagBits;
 
@@ -1024,12 +1027,16 @@ private:
                 }
             }
         }
-        return out;
     }
 
-    std::vector<T> decodeAllEliasFano(const EncodedBuffer<uint8_t>& enc, const ParsedHeader& h) const {
+    std::vector<T> decodeAllTierTagArray(const EncodedBuffer<uint8_t>& enc, const ParsedHeader& h) const {
+        std::vector<T> result(h.numElements);
+        decodeAllTierTagArrayInto(enc, h, result.data());
+        return result;
+    }
+
+    void decodeAllEliasFanoInto(const EncodedBuffer<uint8_t>& enc, const ParsedHeader& h, T* out) const {
         const size_t N = static_cast<size_t>(h.numElements);
-        std::vector<T> out(N);
 
         for (const auto& td : h.tiers) {
             const uint8_t* keysBase = enc.data().data() + td.keysOffset;
@@ -1055,24 +1062,36 @@ private:
                 }
             }
         }
-        return out;
     }
 
-    std::vector<T> decodeAllNoIndex(const EncodedBuffer<uint8_t>& enc, const ParsedHeader& h) const {
-        std::vector<T> out;
-        out.reserve(static_cast<size_t>(h.numElements));
+    std::vector<T> decodeAllEliasFano(const EncodedBuffer<uint8_t>& enc, const ParsedHeader& h) const {
+        std::vector<T> result(h.numElements);
+        decodeAllEliasFanoInto(enc, h, result.data());
+        return result;
+    }
+
+    void decodeAllNoIndexInto(const EncodedBuffer<uint8_t>& enc, const ParsedHeader& h, T* out) const {
+        size_t pos = 0;
         for (const auto& td : h.tiers) {
             const uint8_t* keysBase = enc.data().data() + td.keysOffset;
             for (size_t rank = 0; rank < td.tierCount; ++rank) {
-                out.push_back(td.dict[unpackKey(keysBase, rank, td.keyBits)]);
+                out[pos++] = td.dict[unpackKey(keysBase, rank, td.keyBits)];
             }
         }
         const T* fp = reinterpret_cast<const T*>(enc.data().data() + h.fallbackOffset + 4);
         for (size_t i = 0; i < h.fallbackCount; ++i) {
             T v; std::memcpy(&v, fp + i, sizeof(T));
-            out.push_back(v);
+            out[pos++] = v;
         }
-        return out;
+    }
+
+    std::vector<T> decodeAllNoIndex(const EncodedBuffer<uint8_t>& enc, const ParsedHeader& h) const {
+        std::vector<T> result;
+        result.reserve(static_cast<size_t>(h.numElements));
+        // Use Into variant writing into result's storage after sizing it.
+        result.resize(h.numElements);
+        decodeAllNoIndexInto(enc, h, result.data());
+        return result;
     }
 
     std::optional<T> decodeAtPerTierBitmaps(const EncodedBuffer<uint8_t>& enc, const ParsedHeader& h, size_t i) const {
@@ -1289,6 +1308,21 @@ public:
     // ---------------------------------------------------------------------------
     // Decode all
     // ---------------------------------------------------------------------------
+
+    void decodeAllInto(const EncodedBuffer<uint8_t>& enc, T* dst, size_t n) override {
+        const ParsedHeader& h = getParsedHeader(enc);
+        if (h.numElements != n) [[unlikely]]
+            throw std::runtime_error("FrequencyPartitionEncoder::decodeAllInto: size mismatch");
+        if constexpr (IndexType == FreqPartIndexType::PerTierBitmaps) {
+            decodeAllPerTierBitmapsInto(enc, h, dst);
+        } else if constexpr (IndexType == FreqPartIndexType::TierTagArray) {
+            decodeAllTierTagArrayInto(enc, h, dst);
+        } else if constexpr (IndexType == FreqPartIndexType::EliasFano) {
+            decodeAllEliasFanoInto(enc, h, dst);
+        } else {
+            decodeAllNoIndexInto(enc, h, dst);
+        }
+    }
 
     std::vector<T> decodeAll(const EncodedBuffer<uint8_t>& enc) override {
         const ParsedHeader& h = getParsedHeader(enc);
