@@ -1160,48 +1160,69 @@ private:
         return v;
     }
 
-    std::vector<T> decodeRangePerTierBitmaps(const EncodedBuffer<uint8_t>& enc, const ParsedHeader& h, size_t start, size_t end) const {
-        const size_t rangeLen = end - start;
-        std::vector<T> out(rangeLen);
+    void decodeRangePerTierBitmapsInto(const EncodedBuffer<uint8_t>& enc, const ParsedHeader& h,
+                                       size_t start, size_t end, T* dst) const {
+        const size_t N      = static_cast<size_t>(h.numElements);
+        const size_t wStart = start / 64;
+        const size_t wEnd   = (end + 63) / 64;  // exclusive; shared by tier + fallback loops
+
+        // Word-based scan: iterate only over 64-bit words that have set bits,
+        // using __builtin_ctzll to find each set position.  This eliminates the
+        // per-element unpredictable branch that per-position testing would cause
+        // (particularly severe for uint16_t where tier coverage is ~50/50).
         for (const auto& td : h.tiers) {
             size_t rank = popcountPrefixFast(td, start);
             const uint8_t* keysBase = enc.data().data() + td.keysOffset;
-            for (size_t pos = start; pos < end; ++pos) {
-                if (td.bitmap[pos / 64] & (uint64_t{1} << (pos % 64))) {
-                    out[pos - start] = td.dict[unpackKey(keysBase, rank, td.keyBits)];
+            for (size_t w = wStart; w < wEnd; ++w) {
+                uint64_t word = td.bitmap[w];
+                if (w == wStart && (start & 63))  word &= ~((uint64_t{1} << (start & 63)) - 1);
+                if (w + 1 == wEnd && (end & 63))   word &=  (uint64_t{1} << (end   & 63)) - 1;
+                while (word) {
+                    const size_t bit = static_cast<size_t>(__builtin_ctzll(word));
+                    dst[w * 64 + bit - start] = td.dict[unpackKey(keysBase, rank, td.keyBits)];
                     ++rank;
+                    word &= word - 1;
                 }
             }
         }
         if (h.fallbackCount > 0) {
-            const size_t fallbackRankStart = fallbackRankAt(h, start);
+            size_t fi = fallbackRankAt(h, start);
             const T* fp = reinterpret_cast<const T*>(enc.data().data() + h.fallbackOffset + 4);
-            size_t fi = fallbackRankStart;
-            for (size_t pos = start; pos < end; ++pos) {
-                if (!(h.coveredBitmap[pos / 64] & (uint64_t{1} << (pos % 64)))) {
+            for (size_t w = wStart; w < wEnd; ++w) {
+                uint64_t uncov = ~h.coveredBitmap[w];
+                if (w == wStart && (start & 63))  uncov &= ~((uint64_t{1} << (start & 63)) - 1);
+                // Combine end-of-range mask and N-boundary mask for the last word:
+                const size_t endBit = (w + 1 == wEnd       && (end & 63)) ? (end & 63) : 64;
+                const size_t nBit   = (w + 1 == h.numWords && (N   & 63)) ? (N   & 63) : 64;
+                if (const size_t clamp = std::min(endBit, nBit); clamp < 64)
+                    uncov &= (uint64_t{1} << clamp) - 1;
+                while (uncov) {
+                    const size_t bit = static_cast<size_t>(__builtin_ctzll(uncov));
                     T v; std::memcpy(&v, fp + fi, sizeof(T));
-                    out[pos - start] = v;
+                    dst[w * 64 + bit - start] = v;
                     ++fi;
+                    uncov &= uncov - 1;
                 }
             }
         }
-        return out;
     }
 
-    std::vector<T> decodeRangeTierTagArray(const EncodedBuffer<uint8_t>& enc, const ParsedHeader& h, size_t start, size_t end) const {
-        const size_t rangeLen = end - start;
-        std::vector<T> out(rangeLen);
+    std::vector<T> decodeRangePerTierBitmaps(const EncodedBuffer<uint8_t>& enc, const ParsedHeader& h, size_t start, size_t end) const {
+        std::vector<T> result(end - start);
+        decodeRangePerTierBitmapsInto(enc, h, start, end, result.data());
+        return result;
+    }
+
+    void decodeRangeTierTagArrayInto(const EncodedBuffer<uint8_t>& enc, const ParsedHeader& h,
+                                     size_t start, size_t end, T* dst) const {
         const uint8_t* tagBase = enc.data().data() + h.tagArrayOffset;
         const uint8_t  tagBits = h.tagBits;
 
-        // tierBitPos[t] accumulates directly in bits so no rank*keyBits multiply
-        // is needed when entering the range decode below.
         std::vector<size_t> tierBitPos(h.numTiers, 0);
         size_t fallbackRankAtStart = 0;
 
         alignas(64) uint8_t scratch[kTagChunkSize];
 
-        // Prefix scan [0, start): accumulate per-tier key bit positions and fallback rank.
         {
             size_t bitCursor = 0;
             for (size_t j = 0; j < start; ) {
@@ -1223,7 +1244,6 @@ private:
         const T* fp = reinterpret_cast<const T*>(enc.data().data() + h.fallbackOffset + 4);
         size_t fi = fallbackRankAtStart;
 
-        // Range decode [start, end) with chunked tag unpack + incremental key bit cursors.
         size_t tagBitCursor = start * tagBits;
         size_t outIdx = 0;
         for (size_t pos = start; pos < end; ) {
@@ -1242,50 +1262,67 @@ private:
                     const uint32_t kMask = (kb == 32) ? ~0u : ((1u << kb) - 1u);
                     uint64_t kBuf = 0;
                     std::memcpy(&kBuf, tierKeysBase[tag] + kBy, (kBo + kb + 7) >> 3);
-                    out[outIdx] = td.dict[static_cast<uint32_t>((kBuf >> kBo) & kMask)];
+                    dst[outIdx] = td.dict[static_cast<uint32_t>((kBuf >> kBo) & kMask)];
                     tierBitPos[tag] += kb;
                 } else {
                     T v; std::memcpy(&v, fp + fi, sizeof(T));
-                    out[outIdx] = v;
+                    dst[outIdx] = v;
                     ++fi;
                 }
             }
         }
-        return out;
     }
 
-    std::vector<T> decodeRangeEliasFano(const EncodedBuffer<uint8_t>& enc, const ParsedHeader& h, size_t start, size_t end) const {
-        const size_t rangeLen = end - start;
-        std::vector<T> out(rangeLen);
+    std::vector<T> decodeRangeTierTagArray(const EncodedBuffer<uint8_t>& enc, const ParsedHeader& h, size_t start, size_t end) const {
+        std::vector<T> result(end - start);
+        decodeRangeTierTagArrayInto(enc, h, start, end, result.data());
+        return result;
+    }
+
+    void decodeRangeEliasFanoInto(const EncodedBuffer<uint8_t>& enc, const ParsedHeader& h,
+                                  size_t start, size_t end, T* dst) const {
         for (const auto& td : h.tiers) {
             auto it = std::lower_bound(td.positions.begin(), td.positions.end(), static_cast<uint32_t>(start));
             size_t rank = static_cast<size_t>(it - td.positions.begin());
             const uint8_t* keysBase = enc.data().data() + td.keysOffset;
             for (; it != td.positions.end() && *it < end; ++it, ++rank) {
-                out[*it - start] = td.dict[unpackKey(keysBase, rank, td.keyBits)];
+                dst[*it - start] = td.dict[unpackKey(keysBase, rank, td.keyBits)];
             }
         }
         if (h.fallbackCount > 0) {
-            const size_t fallbackRankStart = fallbackRankAt(h, start);
+            const size_t N      = static_cast<size_t>(h.numElements);
+            const size_t wStart = start / 64;
+            const size_t wEnd   = (end + 63) / 64;
+            size_t fi = fallbackRankAt(h, start);
             const T* fp = reinterpret_cast<const T*>(enc.data().data() + h.fallbackOffset + 4);
-            size_t fi = fallbackRankStart;
-            for (size_t pos = start; pos < end; ++pos) {
-                if (!(h.coveredBitmap[pos / 64] & (uint64_t{1} << (pos % 64)))) {
+            for (size_t w = wStart; w < wEnd; ++w) {
+                uint64_t uncov = ~h.coveredBitmap[w];
+                if (w == wStart && (start & 63))  uncov &= ~((uint64_t{1} << (start & 63)) - 1);
+                const size_t endBit = (w + 1 == wEnd       && (end & 63)) ? (end & 63) : 64;
+                const size_t nBit   = (w + 1 == h.numWords && (N   & 63)) ? (N   & 63) : 64;
+                if (const size_t clamp = std::min(endBit, nBit); clamp < 64)
+                    uncov &= (uint64_t{1} << clamp) - 1;
+                while (uncov) {
+                    const size_t bit = static_cast<size_t>(__builtin_ctzll(uncov));
                     T v; std::memcpy(&v, fp + fi, sizeof(T));
-                    out[pos - start] = v;
+                    dst[w * 64 + bit - start] = v;
                     ++fi;
+                    uncov &= uncov - 1;
                 }
             }
         }
-        return out;
     }
 
-    std::vector<T> decodeRangeNoIndex(const EncodedBuffer<uint8_t>& enc, const ParsedHeader& h, size_t start, size_t end) const {
-        const size_t rangeLen = end - start;
-        std::vector<T> out(rangeLen);
+    std::vector<T> decodeRangeEliasFano(const EncodedBuffer<uint8_t>& enc, const ParsedHeader& h, size_t start, size_t end) const {
+        std::vector<T> result(end - start);
+        decodeRangeEliasFanoInto(enc, h, start, end, result.data());
+        return result;
+    }
+
+    void decodeRangeNoIndexInto(const EncodedBuffer<uint8_t>& enc, const ParsedHeader& h,
+                                size_t start, size_t end, T* dst) const {
         const T* fp = reinterpret_cast<const T*>(enc.data().data() + h.fallbackOffset + 4);
 
-        // Locate the starting tier once, then advance across boundaries — O(numTiers) total.
         auto it = std::upper_bound(h.tierPrefix.begin(), h.tierPrefix.end(), start);
         size_t t = static_cast<size_t>(it - h.tierPrefix.begin() - 1);
 
@@ -1295,13 +1332,18 @@ private:
             if (idx < h.tierPrefix.back()) {
                 const auto& td = h.tiers[t];
                 const size_t rank = idx - h.tierPrefix[t];
-                out[outIdx] = td.dict[unpackKey(enc.data().data() + td.keysOffset, rank, td.keyBits)];
+                dst[outIdx] = td.dict[unpackKey(enc.data().data() + td.keysOffset, rank, td.keyBits)];
             } else {
                 T v; std::memcpy(&v, fp + (idx - h.tierPrefix.back()), sizeof(T));
-                out[outIdx] = v;
+                dst[outIdx] = v;
             }
         }
-        return out;
+    }
+
+    std::vector<T> decodeRangeNoIndex(const EncodedBuffer<uint8_t>& enc, const ParsedHeader& h, size_t start, size_t end) const {
+        std::vector<T> result(end - start);
+        decodeRangeNoIndexInto(enc, h, start, end, result.data());
+        return result;
     }
 
 public:
@@ -1358,6 +1400,25 @@ public:
     // ---------------------------------------------------------------------------
     // Decode range [start, end)
     // ---------------------------------------------------------------------------
+
+    void decodeRangeInto(const EncodedBuffer<uint8_t>& enc,
+                         size_t start, size_t end,
+                         T* dst, size_t n) override {
+        const ParsedHeader& h = getParsedHeader(enc);
+        const size_t N = static_cast<size_t>(h.numElements);
+        end = std::min(end, N);
+        if (start >= end || (end - start) != n) [[unlikely]]
+            throw std::runtime_error("FrequencyPartitionEncoder::decodeRangeInto: size mismatch");
+        if constexpr (IndexType == FreqPartIndexType::PerTierBitmaps) {
+            decodeRangePerTierBitmapsInto(enc, h, start, end, dst);
+        } else if constexpr (IndexType == FreqPartIndexType::TierTagArray) {
+            decodeRangeTierTagArrayInto(enc, h, start, end, dst);
+        } else if constexpr (IndexType == FreqPartIndexType::EliasFano) {
+            decodeRangeEliasFanoInto(enc, h, start, end, dst);
+        } else {
+            decodeRangeNoIndexInto(enc, h, start, end, dst);
+        }
+    }
 
     std::vector<T> decodeRange(const EncodedBuffer<uint8_t>& enc, size_t start, size_t end) override {
         const ParsedHeader& h = getParsedHeader(enc);
