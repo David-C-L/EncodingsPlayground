@@ -151,6 +151,27 @@ public:
     }
 
     /**
+     * @brief Decode a range of elements directly into a caller-supplied buffer.
+     *
+     * Default: calls decodeRange and copies.  Override in hot-path codecs to
+     * write directly into dst without any heap allocation.
+     *
+     * @param encoded  The encoded data
+     * @param start    Starting index (inclusive)
+     * @param end      Ending index (exclusive)
+     * @param dst      Pre-allocated output buffer of at least n elements
+     * @param n        Expected element count (must equal end-start after clamping)
+     */
+    virtual void decodeRangeInto(const EncodedBuffer<TOut>& encoded,
+                                  size_t start, size_t end,
+                                  TIn* dst, size_t n) {
+        auto vals = decodeRange(encoded, start, end);
+        if (vals.size() != n) [[unlikely]]
+            throw std::runtime_error("Codec::decodeRangeInto: decoded size mismatch");
+        std::copy(vals.begin(), vals.end(), dst);
+    }
+
+    /**
      * @brief Get the encoding type of this decoding scheme (should match encoder)
      */
     virtual EncodingType encodingType() const = 0;
