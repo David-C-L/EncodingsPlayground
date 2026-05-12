@@ -56,6 +56,8 @@ public:
     using SectionT = std::conditional_t<(sizeof(T) <= 4), uint32_t, uint64_t>;
     static constexpr uint8_t kTotalBits   = static_cast<uint8_t>(sizeof(T) * 8);
     static constexpr bool    kProfileSections = EnableProfiling;
+    static_assert(sizeof(T) == sizeof(SectionT),
+                  "T and SectionT must be same width for safe reinterpret_cast in decode paths");
 
     explicit SubIntSplitEncoder(SubIntSplitConfigIntegral<SectionT> cfg) : cfg_(std::move(cfg)) {
         cfg_.validate();
@@ -204,12 +206,12 @@ public:
 
         const size_t splits = h.bits.size();
 
-        // Fused decode-and-accumulate: each section is decoded and OR-shifted directly
-        // into acc without an intermediate wide tmp buffer.  For a uint8_t section at
-        // N=10M this eliminates an 80 MB write + 80 MB read of tmp per section,
-        // halving DRAM traffic vs the earlier two-buffer approach.
-        auto accRaw = std::make_unique_for_overwrite<SectionT[]>(h.N);
-        SectionT* acc = accRaw.get();
+        // Accumulate directly into the output vector to avoid a separate accRaw
+        // allocation and the 80 MB final memcpy.  T and SectionT are the same-width
+        // signed/unsigned pair, so treating out.data() as SectionT* is a safe
+        // same-representation reinterpret (guarded by the static_assert in the class).
+        std::vector<T> out(h.N);
+        SectionT* acc = reinterpret_cast<SectionT*>(out.data());
 
         if constexpr (kProfileSections)
             bulkDecodeTimeNs_.assign(splits, 0);
@@ -225,9 +227,6 @@ public:
             }
         }
 
-        // Bit-cast the unsigned accumulator to the signed output type (same width).
-        std::vector<T> out(h.N);
-        std::memcpy(out.data(), acc, h.N * sizeof(T));
         return out;
     }
 
@@ -264,8 +263,8 @@ public:
 
         const size_t splits = h.bits.size();
 
-        auto accRaw = std::make_unique_for_overwrite<SectionT[]>(count);
-        SectionT* acc = accRaw.get();
+        std::vector<T> out(count);
+        SectionT* acc = reinterpret_cast<SectionT*>(out.data());
 
         if constexpr (kProfileSections) {
             if (decodeRangeAccumNs_.size() != splits)
@@ -283,8 +282,6 @@ public:
             }
         }
 
-        std::vector<T> out(count);
-        std::memcpy(out.data(), acc, count * sizeof(T));
         return out;
     }
 
