@@ -131,7 +131,25 @@ public:
      * @return Vector containing decoded elements in the range
      */
     virtual std::vector<TIn> decodeRange(const EncodedBuffer<TOut>& encoded, size_t start, size_t end) = 0;
-    
+
+    /**
+     * @brief Decode all elements directly into a caller-supplied buffer.
+     *
+     * Avoids the heap allocation and zero-initialisation that decodeAll() would
+     * perform for its return vector.  The default implementation calls decodeAll()
+     * and copies; override in hot-path codecs to write directly into dst.
+     *
+     * @param encoded  The encoded data to decode
+     * @param dst      Pre-allocated output buffer of at least n elements
+     * @param n        Expected element count (must equal encoded element count)
+     */
+    virtual void decodeAllInto(const EncodedBuffer<TOut>& encoded, TIn* dst, size_t n) {
+        auto vals = decodeAll(encoded);
+        if (vals.size() != n) [[unlikely]]
+            throw std::runtime_error("Codec::decodeAllInto: decoded size mismatch");
+        std::copy(vals.begin(), vals.end(), dst);
+    }
+
     /**
      * @brief Get the encoding type of this decoding scheme (should match encoder)
      */
