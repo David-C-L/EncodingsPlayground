@@ -7,6 +7,9 @@
 #include <optional>
 #include <sstream>
 #include "core/DataType.hpp"
+#ifdef VTUNE_ENABLED
+#include <ittnotify.h>
+#endif
 
 namespace encodings::benchmark {
 
@@ -209,6 +212,20 @@ struct BenchmarkMetrics {
 };
 
 /**
+ * @brief Selects which benchmark phases VTune pause/resume brackets when
+ *        VTUNE_ENABLED is defined.  All phases default to true (instrument
+ *        everything); set individual flags to false to exclude a phase.
+ */
+struct VTuneConfig {
+    bool dataLoad{true};
+    bool encode{true};
+    bool decode{true};
+    bool randomAccess{true};
+    bool stridedAccess{true};
+    bool rangeAccess{true};
+};
+
+/**
  * @brief Configuration for benchmark runs
  */
 struct BenchmarkConfig {
@@ -256,6 +273,9 @@ struct BenchmarkConfig {
     /// Sampling interval (µs) for the background peak-heap tracker. Smaller
     /// values capture short-lived spikes but increase mallinfo2 lock contention.
     size_t memorySampleIntervalMicros{1000};
+
+    // VTune instrumentation (only active when built with -DVTUNE_ENABLED=ON)
+    VTuneConfig vtune{};
 };
 
 } // namespace encodings::benchmark

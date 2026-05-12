@@ -104,13 +104,16 @@ public:
      * @brief Run all benchmarks (all encoders × all datasets × all sizes)
      */
     BenchmarkResults<T> runAll() {
+#ifdef VTUNE_ENABLED
+        __itt_pause();  // suppress collection during setup; phases opt-in below
+#endif
         BenchmarkResults<T> results;
         results.config = config_;
         results.startTime = system_clock::now();
-        
+
         size_t totalBenchmarks = encoders_.size() * datasets_.size() * config_.dataSizes.size();
         size_t currentBenchmark = 0;
-        
+
         std::cout << "Running " << totalBenchmarks << " benchmark configurations...\n" << std::endl;
         
         for (const auto& [encoderName, encoder] : encoders_) {
@@ -163,7 +166,13 @@ public:
         
         // Generate data
         generator->reset();
+#ifdef VTUNE_ENABLED
+        if (config_.vtune.dataLoad) __itt_resume();
+#endif
         result.originalData = generator->generate(dataSize);
+#ifdef VTUNE_ENABLED
+        if (config_.vtune.dataLoad) __itt_pause();
+#endif
         
         // Warmup runs
         for (size_t i = 0; i < config_.warmupRuns; ++i) {
@@ -183,9 +192,15 @@ public:
                 std::cout << "  [" << encoderName << "/" << datasetName << "] encode..." << std::flush;
             }
             // Measure encoding
+#ifdef VTUNE_ENABLED
+            if (config_.vtune.encode) __itt_resume();
+#endif
             auto encodeStart = high_resolution_clock::now();
             encoded = encoder->encode(result.originalData);
             auto encodeEnd = high_resolution_clock::now();
+#ifdef VTUNE_ENABLED
+            if (config_.vtune.encode) __itt_pause();
+#endif
             encodeTimes.push_back(duration_cast<nanoseconds>(encodeEnd - encodeStart));
             if (config_.verboseOutput) {
                 std::cout << " done ("
@@ -218,9 +233,15 @@ public:
                 std::cout << "  [" << encoderName << "/" << datasetName << "] decode (bulk)..." << std::flush;
             }
             // Measure decoding
+#ifdef VTUNE_ENABLED
+            if (config_.vtune.decode) __itt_resume();
+#endif
             auto decodeStart = high_resolution_clock::now();
             auto decoded = encoder->decodeAll(encoded);
             auto decodeEnd = high_resolution_clock::now();
+#ifdef VTUNE_ENABLED
+            if (config_.vtune.decode) __itt_pause();
+#endif
             decodeTimes.push_back(duration_cast<nanoseconds>(decodeEnd - decodeStart));
 
             // Accumulate per-section bulk decode times
@@ -423,21 +444,27 @@ private:
         accessTimes.reserve(samplesToTest);
         
         bool accessCorrect = true;
-        
+
+#ifdef VTUNE_ENABLED
+        if (config_.vtune.randomAccess) __itt_resume();
+#endif
         for (size_t i = 0; i < samplesToTest; ++i) {
             size_t idx = indices[i];
-            
+
             auto start = high_resolution_clock::now();
             auto value = encoder->decodeAt(encoded, idx);
             auto end = high_resolution_clock::now();
-            
+
             accessTimes.push_back(duration_cast<nanoseconds>(end - start));
-            
+
             // Validate if enabled
             if (config_.validateRandomAccess && value && *value != original[idx]) {
                 accessCorrect = false;
             }
         }
+#ifdef VTUNE_ENABLED
+        if (config_.vtune.randomAccess) __itt_pause();
+#endif
         
     // Calculate statistics
     auto totalTime = std::accumulate(accessTimes.begin(), accessTimes.end(), nanoseconds{0});
@@ -463,7 +490,10 @@ private:
         
         std::vector<nanoseconds> accessTimes;
         size_t count = 0;
-        
+
+#ifdef VTUNE_ENABLED
+        if (config_.vtune.stridedAccess) __itt_resume();
+#endif
         if (!config_.stridedAccessIndices.empty()) {
             for (size_t idx : config_.stridedAccessIndices) {
                 if (idx >= original.size()) continue;
@@ -480,17 +510,20 @@ private:
                 auto start = high_resolution_clock::now();
                 auto value = encoder->decodeAt(encoded, idx);
                 auto end = high_resolution_clock::now();
-                
+
                 accessTimes.push_back(duration_cast<nanoseconds>(end - start));
                 count++;
-                
+
                 (void)value;  // Suppress unused warning
-                
+
                 if (count >= config_.stridedAccessSamples) {
                     break;
                 }
             }
         }
+#ifdef VTUNE_ENABLED
+        if (config_.vtune.stridedAccess) __itt_pause();
+#endif
 
         if (!accessTimes.empty()) {
             auto totalTime = std::accumulate(accessTimes.begin(), accessTimes.end(), nanoseconds{0});
@@ -683,7 +716,10 @@ private:
         std::vector<nanoseconds> accessTimes;
         size_t totalRangeSize = 0;
         size_t queryCount = 0;
-        
+
+#ifdef VTUNE_ENABLED
+        if (config_.vtune.rangeAccess) __itt_resume();
+#endif
         if (!config_.rangeAccesses.empty()) {
             for (const auto& [startRaw, endRaw] : config_.rangeAccesses) {
                 if (startRaw >= endRaw) continue;
@@ -722,6 +758,9 @@ private:
             }
         }
         
+#ifdef VTUNE_ENABLED
+        if (config_.vtune.rangeAccess) __itt_pause();
+#endif
         if (!accessTimes.empty()) {
             auto totalTime = std::accumulate(accessTimes.begin(), accessTimes.end(), nanoseconds{0});
             metrics.randomAccess.averageRangeAccessTime = totalTime / accessTimes.size();

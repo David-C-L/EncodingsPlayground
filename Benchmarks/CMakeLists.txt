@@ -100,6 +100,35 @@ target_include_directories(vector_benchmarks
         ${CMAKE_SOURCE_DIR}/Source
 )
 
+# Optional VTune ITT pause/resume instrumentation.
+# Build with -DVTUNE_ENABLED=ON to bracket selected benchmark phases with
+# __itt_pause()/__itt_resume() so VTune only collects samples inside those phases.
+option(VTUNE_ENABLED "Enable VTune ITT pause/resume instrumentation" OFF)
+
+if(VTUNE_ENABLED)
+    find_path(ITT_INCLUDE_DIR ittnotify.h
+        HINTS
+            $ENV{VTUNE_PROFILER_DIR}/sdk/include
+            /opt/intel/oneapi/vtune/latest/sdk/include
+            /opt/intel/vtune_amplifier/sdk/include)
+    find_library(ITT_LIBRARY ittnotify
+        HINTS
+            $ENV{VTUNE_PROFILER_DIR}/sdk/lib64
+            /opt/intel/oneapi/vtune/latest/sdk/lib64
+            /opt/intel/vtune_amplifier/sdk/lib64)
+    if(NOT ITT_INCLUDE_DIR OR NOT ITT_LIBRARY)
+        message(FATAL_ERROR
+            "VTUNE_ENABLED=ON but ittnotify.h / libittnotify not found. "
+            "Set VTUNE_PROFILER_DIR or install Intel VTune.")
+    endif()
+    foreach(_tgt run_benchmarks sweep_subint_samples map_benchmarks map_benchmarks_refactored vector_benchmarks)
+        target_include_directories(${_tgt} PRIVATE ${ITT_INCLUDE_DIR})
+        target_link_libraries(${_tgt} PRIVATE ${ITT_LIBRARY} dl)
+        target_compile_definitions(${_tgt} PRIVATE VTUNE_ENABLED)
+    endforeach()
+    message(STATUS "VTune ITT instrumentation enabled (${ITT_LIBRARY})")
+endif()
+
 # Create results directory
 file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/benchmark_results)
 
