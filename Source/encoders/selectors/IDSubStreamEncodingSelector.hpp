@@ -72,6 +72,7 @@ public:
 		std::optional<encodings::encoders::BitSplitOrder> orderHint{}; // optional downstream bit-order preference
 		bool useExhaustiveSearch{false}; // when true, enumerate all split combinations instead of DP
 		std::optional<std::string> costGridCsvPath{}; // optional: write per-encoding bits/elem grid
+		std::optional<int> forcedNumSegments{}; // if set, constrain search to exactly this many segments
 	};
 
 	IDSubStreamEncodingSelector() = default;
@@ -122,6 +123,22 @@ public:
 			std::cout << "[Selector] Evaluating segments (l..r)" << std::endl;
 		}
 		// Precompute cost per segment (min across encodings).
+		// Resolve forced segment count (0 = unconstrained)
+		const int effectiveK = [&]() -> int {
+			if (!config_.forcedNumSegments.has_value()) return 0;
+			const int K = *config_.forcedNumSegments;
+			const int maxSegments = kBits / config_.minSegmentWidth;
+			if (K < 1) throw std::invalid_argument(
+				"IDSubStreamEncodingSelector: forcedNumSegments must be >= 1");
+			if (K > maxSegments) {
+				if (config_.verboseLevel >= 1)
+					std::cout << "[Selector] WARNING: forcedNumSegments=" << K
+					          << " clamped to " << maxSegments << "\n";
+				return maxSegments;
+			}
+			return K;
+		}();
+
 		// Optional per-encoding cost grid (bits/elem) for heatmap
 		std::vector<std::vector<double>> perEncodingCostGrid;
 		if (config_.costGridCsvPath.has_value()) {
@@ -190,9 +207,13 @@ public:
 			if (config_.verboseLevel >= 1) {
 				std::cout << "[Selector] Running exhaustive search over split combinations" << std::endl;
 			}
-			result = runExhaustiveSearch<kBits>(bestCost);
+			result = (effectiveK > 0)
+				? runExhaustiveSearchFixed<kBits>(bestCost, effectiveK)
+				: runExhaustiveSearch<kBits>(bestCost);
 		} else {
-			result = runDynamicProgramming<kBits>(bestCost);
+			result = (effectiveK > 0)
+				? runDynamicProgrammingFixed<kBits>(bestCost, effectiveK)
+				: runDynamicProgramming<kBits>(bestCost);
 		}
 
 		// Emit optional cost grid CSV: columns = start,end,width,<encodings...>
@@ -223,8 +244,9 @@ public:
 			}
 		}
 
-		// Optional merge phase to escape local optima
-		if (config_.enableMergePhase && result.segments.size() > 1) {
+		// Optional merge phase to escape local optima (skipped when segment count is forced)
+		if (config_.enableMergePhase && !config_.forcedNumSegments.has_value()
+		    && result.segments.size() > 1) {
 			tryMergeAdjacentSegments(sample, encodings, effectiveCount, result);
 		}
 
@@ -403,6 +425,66 @@ private:
 	}
 
 	template <int kBits>
+	Result runDynamicProgrammingFixed(
+		const std::array<std::array<SegmentChoice, kBits>, kBits>& bestCost,
+		int K) const
+	{
+		std::array<std::array<double, kBits + 1>, kBits + 1> dp{};
+		std::array<std::array<int, kBits + 1>, kBits + 1> prev{};
+		std::array<std::array<encodings::EncodingType, kBits + 1>, kBits + 1> chosen{};
+
+		for (int i = 0; i <= kBits; ++i)
+			for (int k = 0; k <= kBits; ++k) {
+				dp[i][k]     = std::numeric_limits<double>::infinity();
+				prev[i][k]   = -1;
+				chosen[i][k] = encodings::EncodingType::RawEncoding;
+			}
+		dp[0][0] = 0.0;
+
+		for (int i = 1; i <= kBits; ++i)
+			for (int k = 1; k <= std::min(i, K); ++k)
+				for (int j = 0; j < i; ++j) {
+					const int width = i - j;
+					if (width < config_.minSegmentWidth) continue;
+					if (!std::isfinite(dp[j][k - 1]))   continue;
+					const auto& choice = bestCost[j][i - 1];
+					if (!std::isfinite(choice.cost))     continue;
+					const double cost = dp[j][k - 1] + choice.cost + (k > 1 ? config_.splitPenalty : 0.0);
+					if (cost < dp[i][k]) {
+						dp[i][k]     = cost;
+						prev[i][k]   = j;
+						chosen[i][k] = choice.encoding;
+					}
+				}
+
+		Result result;
+		result.total_cost = dp[kBits][K];
+		if (!std::isfinite(result.total_cost)) {
+			if (config_.verboseLevel >= 1)
+				std::cout << "[Selector] runDynamicProgrammingFixed: no feasible plan for K="
+				          << K << " segments\n";
+			return result;
+		}
+
+		int idx = kBits, k = K;
+		while (idx > 0 && k > 0) {
+			const int start = prev[idx][k];
+			if (start < 0) break;
+			SegmentPlan plan;
+			plan.bitStart = start;
+			plan.bitEnd   = idx - 1;
+			plan.encoding = chosen[idx][k];
+			plan.cost     = bestCost[start][idx - 1].cost;
+			result.segments.push_back(plan);
+			idx = start;
+			--k;
+		}
+
+		std::reverse(result.segments.begin(), result.segments.end());
+		return result;
+	}
+
+	template <int kBits>
 	Result runExhaustiveSearch(const std::array<std::array<SegmentChoice, kBits>, kBits>& bestCost) const {
 		struct CacheEntry {
 			bool valid{false};
@@ -455,6 +537,67 @@ private:
 		CacheEntry solution = dfs(0);
 		Result result;
 		result.total_cost = solution.cost;
+		result.segments = std::move(solution.segments);
+		return result;
+	}
+
+	template <int kBits>
+	Result runExhaustiveSearchFixed(
+		const std::array<std::array<SegmentChoice, kBits>, kBits>& bestCost,
+		int K) const
+	{
+		struct CacheEntry {
+			bool valid{false};
+			double cost{std::numeric_limits<double>::infinity()};
+			std::vector<SegmentPlan> segments;
+		};
+
+		std::vector<std::vector<CacheEntry>> memo(kBits + 1, std::vector<CacheEntry>(K + 1));
+
+		std::function<CacheEntry(int, int)> dfs = [&](int start, int remaining) -> CacheEntry {
+			if (memo[start][remaining].valid) return memo[start][remaining];
+			CacheEntry best;
+			best.valid = true;
+
+			if (start == kBits) {
+				best.cost = (remaining == 0) ? 0.0 : std::numeric_limits<double>::infinity();
+				return memo[start][remaining] = best;
+			}
+			if (remaining == 0) {
+				return memo[start][remaining] = best; // bits remain but no segment budget — infeasible
+			}
+
+			for (int end = start; end < kBits; ++end) {
+				const int width = end - start + 1;
+				if (width < config_.minSegmentWidth) continue;
+				const auto& choice = bestCost[start][end];
+				if (!std::isfinite(choice.cost)) continue;
+				const auto suffix = dfs(end + 1, remaining - 1);
+				if (!std::isfinite(suffix.cost)) continue;
+				const double penalty = (end + 1 < kBits) ? config_.splitPenalty : 0.0;
+				const double total = choice.cost + suffix.cost + penalty;
+				if (total < best.cost) {
+					best.cost = total;
+					best.segments.clear();
+					SegmentPlan seg;
+					seg.bitStart = start;
+					seg.bitEnd   = end;
+					seg.encoding = choice.encoding;
+					seg.cost     = choice.cost;
+					best.segments.push_back(seg);
+					best.segments.insert(best.segments.end(),
+					                     suffix.segments.begin(), suffix.segments.end());
+				}
+			}
+			return memo[start][remaining] = best;
+		};
+
+		CacheEntry solution = dfs(0, K);
+		Result result;
+		result.total_cost = solution.cost;
+		if (!std::isfinite(result.total_cost) && config_.verboseLevel >= 1)
+			std::cout << "[Selector] runExhaustiveSearchFixed: no feasible plan for K="
+			          << K << " segments\n";
 		result.segments = std::move(solution.segments);
 		return result;
 	}
