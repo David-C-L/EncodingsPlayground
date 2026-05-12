@@ -1179,7 +1179,8 @@ makeAutoSubIntSplitCostModelsFromTypes(const std::vector<encodings::EncodingType
 template <typename T>
 inline typename SubIntSplitAutoEncoder<T>::Config makeDefaultAutoSubIntSplitConfig(BitSplitOrder order = BitSplitOrder::LSB_TO_MSB,
                                                                          bool enableSelectionTiming = false,
-                                                                         std::vector<encodings::EncodingType> costModelTypes = {}) {
+                                                                         std::vector<encodings::EncodingType> costModelTypes = {},
+                                                                         int numSplits = -1) {
     typename SubIntSplitAutoEncoder<T>::Config cfg;
     cfg.selectorConfig = selectors::IDSubStreamEncodingSelector::Config{}; // defaults
     cfg.selectorConfig.verboseLevel = 1; // leave quiet by default; enable when debugging
@@ -1193,6 +1194,8 @@ inline typename SubIntSplitAutoEncoder<T>::Config makeDefaultAutoSubIntSplitConf
     cfg.debugLogging = false;                 // enable instrumentation by default for now
     cfg.enableSelectionTiming = enableSelectionTiming;
     cfg.orderHint = order;
+    if (numSplits > 0)
+        cfg.selectorConfig.forcedNumSegments = numSplits;
 
     if (costModelTypes.empty()) {
         costModelTypes = defaultAutoSubIntSplitCostModelTypes();
@@ -1206,8 +1209,9 @@ inline std::shared_ptr<SubIntSplitAutoEncoder<T>> makeDefaultAutoSubIntSplitEnco
                                                                                    bool exhaustiveSearch = false,
                                                                                    bool enablePrune = true,
                                                                                    bool enableSelectionTiming = false,
-                                                                                   std::vector<encodings::EncodingType> costModelTypes = {}) {
-    auto cfg = makeDefaultAutoSubIntSplitConfig<T>(order, enableSelectionTiming, std::move(costModelTypes));
+                                                                                   std::vector<encodings::EncodingType> costModelTypes = {},
+                                                                                   int numSplits = -1) {
+    auto cfg = makeDefaultAutoSubIntSplitConfig<T>(order, enableSelectionTiming, std::move(costModelTypes), numSplits);
     cfg.selectorConfig.orderHint = order;
     cfg.selectorConfig.useExhaustiveSearch = exhaustiveSearch;
     cfg.selectorConfig.enablePrune = enablePrune;
@@ -1239,9 +1243,10 @@ inline std::shared_ptr<SubIntSplitAutoEncoderProf<T>> makeDefaultAutoSubIntSplit
     bool exhaustiveSearch = false,
     bool enablePrune = true,
     bool enableSelectionTiming = false,
-    std::vector<encodings::EncodingType> costModelTypes = {}) {
+    std::vector<encodings::EncodingType> costModelTypes = {},
+    int numSplits = -1) {
     // Config type is identical to the non-profiling variant (EnableProfiling only affects runtime)
-    auto cfg = makeDefaultAutoSubIntSplitConfig<T>(order, enableSelectionTiming, std::move(costModelTypes));
+    auto cfg = makeDefaultAutoSubIntSplitConfig<T>(order, enableSelectionTiming, std::move(costModelTypes), numSplits);
     cfg.selectorConfig.orderHint          = order;
     cfg.selectorConfig.useExhaustiveSearch = exhaustiveSearch;
     cfg.selectorConfig.enablePrune         = enablePrune;
@@ -1260,9 +1265,10 @@ inline std::shared_ptr<SubIntSplitAutoEncoder64Prof> makeDefaultAutoSubIntSplitE
     bool exhaustiveSearch = false,
     bool enablePrune = true,
     bool enableSelectionTiming = false,
-    std::vector<encodings::EncodingType> costModelTypes = {}) {
+    std::vector<encodings::EncodingType> costModelTypes = {},
+    int numSplits = -1) {
     return makeDefaultAutoSubIntSplitEncoderProf<int64_t>(
-        order, exhaustiveSearch, enablePrune, enableSelectionTiming, std::move(costModelTypes));
+        order, exhaustiveSearch, enablePrune, enableSelectionTiming, std::move(costModelTypes), numSplits);
 }
 
 // ---------------------------------------------------------------------------
