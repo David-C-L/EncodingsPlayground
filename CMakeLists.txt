@@ -45,6 +45,7 @@ if(BUILD_TESTS)
     add_test(NAME test_subint_encoder COMMAND test_subint_encoder)
     add_test(NAME test_fse_encoder COMMAND test_fse_encoder)
     add_test(NAME test_frequency_partition_encoder COMMAND test_frequency_partition_encoder)
+    add_test(NAME test_subint_split_encoder COMMAND test_subint_split_encoder)
 endif()
 
 # Simple test for DeltaRunLengthEncoder
@@ -124,3 +125,8 @@ add_executable(test_frequency_partition_encoder test_frequency_partition_encoder
 target_include_directories(test_frequency_partition_encoder PRIVATE ${CMAKE_SOURCE_DIR}/Source)
 target_link_libraries(test_frequency_partition_encoder PRIVATE encodings_core encodings_encodings encodings_encoders encodings_generators)
 set_target_properties(test_frequency_partition_encoder PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+add_executable(test_subint_split_encoder test_subint_split_encoder.cpp)
+target_include_directories(test_subint_split_encoder PRIVATE ${CMAKE_SOURCE_DIR}/Source)
+target_link_libraries(test_subint_split_encoder PRIVATE encodings_core encodings_encodings encodings_encoders encodings_generators)
+set_target_properties(test_subint_split_encoder PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
