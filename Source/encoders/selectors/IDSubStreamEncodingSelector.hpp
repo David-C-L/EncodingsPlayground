@@ -145,75 +145,97 @@ public:
 			perEncodingCostGrid.assign(kBits * kBits, std::vector<double>(encodings.size(), std::numeric_limits<double>::infinity()));
 		}
 
-		for (int l = 0; l < kBits; ++l) {
-			builder.reset(l);
-			for (int r = l; r < kBits; ++r) {
-				builder.extend(r);
-				const auto& values = builder.values();
-				SegmentMetrics metrics = collector.compute(values, requiredFlags);
-				const size_t numValues = values.size();
-				const size_t bitWidth = static_cast<size_t>(r - l + 1);
+		// Fill bestCost[l][r] for all segments, optionally skipping high-entropy or
+		// full-range segments that offer no compression gain.  Extracted into a lambda
+		// so we can retry without pruning when pruning makes the problem infeasible.
+		auto fillBestCosts = [&](bool pruneEnabled) {
+			for (int l = 0; l < kBits; ++l)
+				for (int r = 0; r < kBits; ++r)
+					bestCost[l][r].cost = std::numeric_limits<double>::infinity();
 
-				if (config_.enablePrune) {
-					if (metrics.entropyEstimate > config_.entropyPruneThreshold) {
-						continue;
-					}
-					if (bitWidth < 64) {
-						if (metrics.range >= ((uint64_t{1} << bitWidth) - 1)) {
+			for (int l = 0; l < kBits; ++l) {
+				builder.reset(l);
+				for (int r = l; r < kBits; ++r) {
+					builder.extend(r);
+					const auto& values = builder.values();
+					SegmentMetrics metrics = collector.compute(values, requiredFlags);
+					const size_t numValues = values.size();
+					const size_t bitWidth = static_cast<size_t>(r - l + 1);
+
+					if (pruneEnabled) {
+						const bool isFullRange = (l == 0 && r == kBits - 1);
+						if (!isFullRange && metrics.entropyEstimate > config_.entropyPruneThreshold) {
 							continue;
 						}
+						if (bitWidth < 64) {
+							if (metrics.range >= ((uint64_t{1} << bitWidth) - 1)) {
+								continue;
+							}
+						}
 					}
-				}
 
-				double bestEncodingCost = std::numeric_limits<double>::infinity();
-				encodings::EncodingType bestEncoding = encodings::EncodingType::RawEncoding;
-				if (config_.verboseLevel >= 2) {
-					std::cout << "  Segment [" << l << ".." << r << "] width=" << bitWidth << " bits" << std::endl;
-				}
-				for (size_t encIdx = 0; encIdx < encodings.size(); ++encIdx) {
-					const auto& encoding = encodings[encIdx];
-					const double perSampleCost = encoding->computeCost(metrics, numValues, bitWidth);
-					const double totalCost = perSampleCost * static_cast<double>(effectiveCount) / static_cast<double>(numValues);
-					const double bitsPerElem = totalCost / static_cast<double>(effectiveCount);
+					double bestEncodingCost = std::numeric_limits<double>::infinity();
+					encodings::EncodingType bestEncoding = encodings::EncodingType::RawEncoding;
 					if (config_.verboseLevel >= 2) {
-						std::cout << "    - " << encodingNames[encIdx]
-								  << " cost=" << std::fixed << std::setprecision(2) << totalCost
-								  << " bits/elem=" << std::fixed << std::setprecision(4) << bitsPerElem
+						std::cout << "  Segment [" << l << ".." << r << "] width=" << bitWidth << " bits" << std::endl;
+					}
+					for (size_t encIdx = 0; encIdx < encodings.size(); ++encIdx) {
+						const auto& encoding = encodings[encIdx];
+						const double perSampleCost = encoding->computeCost(metrics, numValues, bitWidth);
+						const double totalCost = perSampleCost * static_cast<double>(effectiveCount) / static_cast<double>(numValues);
+						const double bitsPerElem = totalCost / static_cast<double>(effectiveCount);
+						if (config_.verboseLevel >= 2) {
+							std::cout << "    - " << encodingNames[encIdx]
+									  << " cost=" << std::fixed << std::setprecision(2) << totalCost
+									  << " bits/elem=" << std::fixed << std::setprecision(4) << bitsPerElem
+									  << std::endl;
+						}
+						if (config_.costGridCsvPath.has_value()) {
+							perEncodingCostGrid[l * kBits + r][encIdx] = bitsPerElem;
+						}
+						if (totalCost < bestEncodingCost) {
+							bestEncodingCost = totalCost;
+							bestEncoding = encoding->encodingType();
+						}
+					}
+					if (bestEncodingCost < bestCost[l][r].cost) {
+						bestCost[l][r].cost = bestEncodingCost;
+						bestCost[l][r].encoding = bestEncoding;
+					}
+					if (config_.verboseLevel >= 2 && std::isfinite(bestCost[l][r].cost)) {
+						std::cout << "    -> best=" << encodings::encodingTypeToString(bestCost[l][r].encoding)
+								  << " cost=" << std::fixed << std::setprecision(2) << bestCost[l][r].cost
 								  << std::endl;
 					}
-					if (config_.costGridCsvPath.has_value()) {
-						perEncodingCostGrid[l * kBits + r][encIdx] = bitsPerElem;
-					}
-					if (totalCost < bestEncodingCost) {
-						bestEncodingCost = totalCost;
-						bestEncoding = encoding->encodingType();
-					}
-				}
-				if (bestEncodingCost < bestCost[l][r].cost) {
-					bestCost[l][r].cost = bestEncodingCost;
-					bestCost[l][r].encoding = bestEncoding;
-				}
-				if (config_.verboseLevel >= 2 && std::isfinite(bestCost[l][r].cost)) {
-					std::cout << "    -> best=" << encodings::encodingTypeToString(bestCost[l][r].encoding)
-							  << " cost=" << std::fixed << std::setprecision(2) << bestCost[l][r].cost
-							  << std::endl;
 				}
 			}
-		}
+		};
+		fillBestCosts(config_.enablePrune);
 
-		Result result;
-
-		if (config_.useExhaustiveSearch) {
-			if (config_.verboseLevel >= 1) {
-				std::cout << "[Selector] Running exhaustive search over split combinations" << std::endl;
+		auto runSearch = [&]() -> Result {
+			if (config_.useExhaustiveSearch) {
+				if (config_.verboseLevel >= 1)
+					std::cout << "[Selector] Running exhaustive search over split combinations" << std::endl;
+				return (effectiveK > 0)
+					? runExhaustiveSearchFixed<kBits>(bestCost, effectiveK)
+					: runExhaustiveSearch<kBits>(bestCost);
+			} else {
+				return (effectiveK > 0)
+					? runDynamicProgrammingFixed<kBits>(bestCost, effectiveK)
+					: runDynamicProgramming<kBits>(bestCost);
 			}
-			result = (effectiveK > 0)
-				? runExhaustiveSearchFixed<kBits>(bestCost, effectiveK)
-				: runExhaustiveSearch<kBits>(bestCost);
-		} else {
-			result = (effectiveK > 0)
-				? runDynamicProgrammingFixed<kBits>(bestCost, effectiveK)
-				: runDynamicProgramming<kBits>(bestCost);
+		};
+
+		Result result = runSearch();
+
+		// Pruning can make a K-segment partition infeasible even when one exists without
+		// pruning (e.g. high-entropy fields that must still be encoded).  Fall back to a
+		// full re-evaluation without any pruning so we always return a valid plan.
+		if (!std::isfinite(result.total_cost) && config_.enablePrune) {
+			if (config_.verboseLevel >= 1)
+				std::cout << "[Selector] Pruning yielded no feasible plan; retrying without pruning\n";
+			fillBestCosts(false);
+			result = runSearch();
 		}
 
 		// Emit optional cost grid CSV: columns = start,end,width,<encodings...>

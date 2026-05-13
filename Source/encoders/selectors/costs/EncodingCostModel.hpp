@@ -600,11 +600,11 @@ public:
 
         const size_t storageTypeBits = storageWidthBits(static_cast<uint8_t>(bitWidth));
         // TEMP DEBUG
-        if (bitWidth >= 33 && bitWidth <= 64) {
-            std::cout << "[FreqPartCost] bw=" << bitWidth << " N=" << numValues
-                      << " unique=" << metrics.uniqueCount << " capped=" << metrics.uniqueCountCapped
-                      << " entropy=" << metrics.entropyEstimate << std::endl;
-        }
+        // if (bitWidth >= 33 && bitWidth <= 64) {
+        //     std::cout << "[FreqPartCost] bw=" << bitWidth << " N=" << numValues
+        //               << " unique=" << metrics.uniqueCount << " capped=" << metrics.uniqueCountCapped
+        //               << " entropy=" << metrics.entropyEstimate << std::endl;
+        // }
         const size_t maxKeyBits      = storageTypeBits / 2;
 
         // Tiers use key widths 1..maxKeyBits (non-power-of-2).
