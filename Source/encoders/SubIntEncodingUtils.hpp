@@ -508,8 +508,17 @@ inline std::shared_ptr<ISectionCodecIntegral<SectionCodecTIn>> makeOpenZLSection
 
 template <typename SectionCodecTIn = uint64_t>
 inline std::shared_ptr<ISectionCodecIntegral<SectionCodecTIn>> makeAdaptiveFORSection(uint8_t bits) {
-    // Residual width is chosen internally; bits only gates the narrowing adapter.
-    return makeSectionCodecForBits<SectionCodecTIn>(std::make_shared<AdaptiveFOREncoder<int64_t>>(), bits);
+    // Use the narrowest signed type that fits the section's value range so that
+    // AdaptiveFOR's ref storage (sizeof(TIn) per frame) matches the cost model's
+    // storageWidthBits(bits)/8 estimate.  Using int64_t unconditionally causes a
+    // 4× ref-size mismatch for small bit widths, corrupting adjacent heap allocations.
+    const uint8_t w = chooseSignedWidthForBits(bits);
+    switch (w) {
+        case 8:  return makeSectionCodecForBits<SectionCodecTIn>(std::make_shared<AdaptiveFOREncoder<int8_t>>(),  bits);
+        case 16: return makeSectionCodecForBits<SectionCodecTIn>(std::make_shared<AdaptiveFOREncoder<int16_t>>(), bits);
+        case 32: return makeSectionCodecForBits<SectionCodecTIn>(std::make_shared<AdaptiveFOREncoder<int32_t>>(), bits);
+        default: return makeSectionCodecForBits<SectionCodecTIn>(std::make_shared<AdaptiveFOREncoder<int64_t>>(), bits);
+    }
 }
 
 template <typename SectionCodecTIn = uint64_t>
