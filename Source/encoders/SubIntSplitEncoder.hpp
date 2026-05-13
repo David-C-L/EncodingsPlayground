@@ -405,10 +405,17 @@ private:
     const ParsedHeader& getCachedHeader(const EncodedBuffer<uint8_t>& encoded) const {
         const uint8_t* basePtr = encoded.data().data();
         const size_t totalSize = encoded.data().size();
-        if (cachedOuterPtr_ != basePtr || cachedOuterSize_ != totalSize) {
+        // Include the first 8 bytes (the N field) in the cache key.  Without this,
+        // two encodes that produce the same byte count (e.g. constant data for N=500
+        // and N=20000) can map to the same (address, size) pair after the allocator
+        // reuses a freed buffer, returning a stale header with the wrong N.
+        const uint64_t firstBytes = (totalSize >= 8) ? readU64(basePtr) : 0;
+        if (cachedOuterPtr_ != basePtr || cachedOuterSize_ != totalSize
+                || cachedFirstBytes_ != firstBytes) {
             cachedHeader_ = parseHeader(encoded);
             cachedOuterPtr_ = basePtr;
             cachedOuterSize_ = totalSize;
+            cachedFirstBytes_ = firstBytes;
         }
         return cachedHeader_;
     }
@@ -664,8 +671,9 @@ public:
 private:
     SubIntSplitConfigIntegral<SectionT> cfg_;
     mutable const uint8_t* cachedOuterPtr_{nullptr};
-    mutable size_t cachedOuterSize_{0};
-    mutable ParsedHeader cachedHeader_{};
+    mutable size_t         cachedOuterSize_{0};
+    mutable uint64_t       cachedFirstBytes_{0};
+    mutable ParsedHeader   cachedHeader_{};
 
     // Per-section decode timing state — zero-size when EnableProfiling=false.
     struct NoDecodeState {};
@@ -756,8 +764,11 @@ inline std::shared_ptr<SubIntSplitEncoder<T>> makeSubIntSplitEncoderManual(
             case encodings::EncodingType::FSEEncoding:
                 cfg.codecs.push_back(detail_trisplit::makeFSESection<SectionT>(width));
                 break;
+            case encodings::EncodingType::FrequencyPartitionEncoding:
+                cfg.codecs.push_back(detail_trisplit::makeFrequencyPartitionSection<SectionT>(width));
+                break;
             default:
-                throw std::invalid_argument("makeSubIntSplitEncoderManual: unsupported encoding type");
+                throw std::invalid_argument("makeSubIntSplitEncoderManual: unsupported encoding type: " + std::to_string(static_cast<int>(encodings[i])));
         }
     }
 
@@ -853,6 +864,8 @@ inline std::shared_ptr<SubIntSplitEncoderProf<T>> makeSubIntSplitEncoderManualPr
                 cfg.codecs.push_back(detail_trisplit::makeLZ4Section<SectionT>(width)); break;
             case encodings::EncodingType::FSEEncoding:
                 cfg.codecs.push_back(detail_trisplit::makeFSESection<SectionT>(width)); break;
+            case encodings::EncodingType::FrequencyPartitionEncoding:
+                cfg.codecs.push_back(detail_trisplit::makeFrequencyPartitionSection<SectionT>(width)); break;
             default:
                 throw std::invalid_argument("makeSubIntSplitEncoderManualProf: unsupported encoding type");
         }
