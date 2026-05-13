@@ -960,7 +960,7 @@ private:
         }
 
         if (h.fallbackCount > 0) {
-            const T* fp = reinterpret_cast<const T*>(enc.data().data() + h.fallbackOffset + 4);
+            const uint8_t* fpBytes = enc.data().data() + h.fallbackOffset + 4;
             size_t fi = 0;
             for (size_t w = 0; w < h.numWords; ++w) {
                 uint64_t uncov = ~h.coveredBitmap[w];
@@ -968,7 +968,7 @@ private:
                 while (uncov) {
                     const size_t bit = static_cast<size_t>(__builtin_ctzll(uncov));
                     const size_t pos = w * 64 + bit;
-                    T v; std::memcpy(&v, fp + fi, sizeof(T));
+                    T v; std::memcpy(&v, fpBytes + fi * sizeof(T), sizeof(T));
                     out[pos] = v;
                     ++fi;
                     uncov &= uncov - 1;
@@ -993,7 +993,7 @@ private:
         for (size_t t = 0; t < h.numTiers; ++t)
             tierKeysBase[t] = enc.data().data() + h.tiers[t].keysOffset;
 
-        const T* fp = reinterpret_cast<const T*>(enc.data().data() + h.fallbackOffset + 4);
+        const uint8_t* fpBytes = enc.data().data() + h.fallbackOffset + 4;
         size_t fi = 0;
         size_t tagBitCursor = 0;
 
@@ -1021,7 +1021,7 @@ private:
                     out[pos] = td.dict[static_cast<uint32_t>((kBuf >> kBo) & kMask)];
                     tierBitPos[tag] += kb;
                 } else {
-                    T v; std::memcpy(&v, fp + fi, sizeof(T));
+                    T v; std::memcpy(&v, fpBytes + fi * sizeof(T), sizeof(T));
                     out[pos] = v;
                     ++fi;
                 }
@@ -1047,7 +1047,7 @@ private:
         }
 
         if (h.fallbackCount > 0) {
-            const T* fp = reinterpret_cast<const T*>(enc.data().data() + h.fallbackOffset + 4);
+            const uint8_t* fpBytes = enc.data().data() + h.fallbackOffset + 4;
             size_t fi = 0;
             for (size_t w = 0; w < h.numWords; ++w) {
                 uint64_t uncov = ~h.coveredBitmap[w];
@@ -1055,7 +1055,7 @@ private:
                 while (uncov) {
                     const size_t bit = static_cast<size_t>(__builtin_ctzll(uncov));
                     const size_t pos = w * 64 + bit;
-                    T v; std::memcpy(&v, fp + fi, sizeof(T));
+                    T v; std::memcpy(&v, fpBytes + fi * sizeof(T), sizeof(T));
                     out[pos] = v;
                     ++fi;
                     uncov &= uncov - 1;
@@ -1078,9 +1078,9 @@ private:
                 out[pos++] = td.dict[unpackKey(keysBase, rank, td.keyBits)];
             }
         }
-        const T* fp = reinterpret_cast<const T*>(enc.data().data() + h.fallbackOffset + 4);
+        const uint8_t* fpBytes = enc.data().data() + h.fallbackOffset + 4;
         for (size_t i = 0; i < h.fallbackCount; ++i) {
-            T v; std::memcpy(&v, fp + i, sizeof(T));
+            T v; std::memcpy(&v, fpBytes + i * sizeof(T), sizeof(T));
             out[pos++] = v;
         }
     }
@@ -1102,8 +1102,8 @@ private:
             }
         }
         const size_t fallbackRank = fallbackRankAt(h, i);
-        const T* fp = reinterpret_cast<const T*>(enc.data().data() + h.fallbackOffset + 4);
-        T v; std::memcpy(&v, fp + fallbackRank, sizeof(T));
+        const uint8_t* fpBytes = enc.data().data() + h.fallbackOffset + 4;
+        T v; std::memcpy(&v, fpBytes + fallbackRank * sizeof(T), sizeof(T));
         return v;
     }
 
@@ -1127,8 +1127,8 @@ private:
             const auto& td = h.tiers[tag];
             return td.dict[unpackKey(enc.data().data() + td.keysOffset, rank, td.keyBits)];
         }
-        const T* fp = reinterpret_cast<const T*>(enc.data().data() + h.fallbackOffset + 4);
-        T v; std::memcpy(&v, fp + rank, sizeof(T));
+        const uint8_t* fpBytes = enc.data().data() + h.fallbackOffset + 4;
+        T v; std::memcpy(&v, fpBytes + rank * sizeof(T), sizeof(T));
         return v;
     }
 
@@ -1141,8 +1141,8 @@ private:
             }
         }
         const size_t fallbackRank = fallbackRankAt(h, i);
-        const T* fp = reinterpret_cast<const T*>(enc.data().data() + h.fallbackOffset + 4);
-        T v; std::memcpy(&v, fp + fallbackRank, sizeof(T));
+        const uint8_t* fpBytes = enc.data().data() + h.fallbackOffset + 4;
+        T v; std::memcpy(&v, fpBytes + fallbackRank * sizeof(T), sizeof(T));
         return v;
     }
 
@@ -1155,8 +1155,8 @@ private:
             return td.dict[unpackKey(enc.data().data() + td.keysOffset, rank, td.keyBits)];
         }
         const size_t fi = i - h.tierPrefix.back();
-        const T* fp = reinterpret_cast<const T*>(enc.data().data() + h.fallbackOffset + 4);
-        T v; std::memcpy(&v, fp + fi, sizeof(T));
+        const uint8_t* fpBytes = enc.data().data() + h.fallbackOffset + 4;
+        T v; std::memcpy(&v, fpBytes + fi * sizeof(T), sizeof(T));
         return v;
     }
 
@@ -1187,7 +1187,7 @@ private:
         }
         if (h.fallbackCount > 0) {
             size_t fi = fallbackRankAt(h, start);
-            const T* fp = reinterpret_cast<const T*>(enc.data().data() + h.fallbackOffset + 4);
+            const uint8_t* fpBytes = enc.data().data() + h.fallbackOffset + 4;
             for (size_t w = wStart; w < wEnd; ++w) {
                 uint64_t uncov = ~h.coveredBitmap[w];
                 if (w == wStart && (start & 63))  uncov &= ~((uint64_t{1} << (start & 63)) - 1);
@@ -1198,7 +1198,7 @@ private:
                     uncov &= (uint64_t{1} << clamp) - 1;
                 while (uncov) {
                     const size_t bit = static_cast<size_t>(__builtin_ctzll(uncov));
-                    T v; std::memcpy(&v, fp + fi, sizeof(T));
+                    T v; std::memcpy(&v, fpBytes + fi * sizeof(T), sizeof(T));
                     dst[w * 64 + bit - start] = v;
                     ++fi;
                     uncov &= uncov - 1;
@@ -1241,7 +1241,7 @@ private:
         std::vector<const uint8_t*> tierKeysBase(h.numTiers, nullptr);
         for (size_t t = 0; t < h.numTiers; ++t)
             tierKeysBase[t] = enc.data().data() + h.tiers[t].keysOffset;
-        const T* fp = reinterpret_cast<const T*>(enc.data().data() + h.fallbackOffset + 4);
+        const uint8_t* fpBytes = enc.data().data() + h.fallbackOffset + 4;
         size_t fi = fallbackRankAtStart;
 
         size_t tagBitCursor = start * tagBits;
@@ -1265,7 +1265,7 @@ private:
                     dst[outIdx] = td.dict[static_cast<uint32_t>((kBuf >> kBo) & kMask)];
                     tierBitPos[tag] += kb;
                 } else {
-                    T v; std::memcpy(&v, fp + fi, sizeof(T));
+                    T v; std::memcpy(&v, fpBytes + fi * sizeof(T), sizeof(T));
                     dst[outIdx] = v;
                     ++fi;
                 }
@@ -1294,7 +1294,7 @@ private:
             const size_t wStart = start / 64;
             const size_t wEnd   = (end + 63) / 64;
             size_t fi = fallbackRankAt(h, start);
-            const T* fp = reinterpret_cast<const T*>(enc.data().data() + h.fallbackOffset + 4);
+            const uint8_t* fpBytes = enc.data().data() + h.fallbackOffset + 4;
             for (size_t w = wStart; w < wEnd; ++w) {
                 uint64_t uncov = ~h.coveredBitmap[w];
                 if (w == wStart && (start & 63))  uncov &= ~((uint64_t{1} << (start & 63)) - 1);
@@ -1304,7 +1304,7 @@ private:
                     uncov &= (uint64_t{1} << clamp) - 1;
                 while (uncov) {
                     const size_t bit = static_cast<size_t>(__builtin_ctzll(uncov));
-                    T v; std::memcpy(&v, fp + fi, sizeof(T));
+                    T v; std::memcpy(&v, fpBytes + fi * sizeof(T), sizeof(T));
                     dst[w * 64 + bit - start] = v;
                     ++fi;
                     uncov &= uncov - 1;
@@ -1321,7 +1321,7 @@ private:
 
     void decodeRangeNoIndexInto(const EncodedBuffer<uint8_t>& enc, const ParsedHeader& h,
                                 size_t start, size_t end, T* dst) const {
-        const T* fp = reinterpret_cast<const T*>(enc.data().data() + h.fallbackOffset + 4);
+        const uint8_t* fpBytes = enc.data().data() + h.fallbackOffset + 4;
 
         auto it = std::upper_bound(h.tierPrefix.begin(), h.tierPrefix.end(), start);
         size_t t = static_cast<size_t>(it - h.tierPrefix.begin() - 1);
@@ -1334,7 +1334,7 @@ private:
                 const size_t rank = idx - h.tierPrefix[t];
                 dst[outIdx] = td.dict[unpackKey(enc.data().data() + td.keysOffset, rank, td.keyBits)];
             } else {
-                T v; std::memcpy(&v, fp + (idx - h.tierPrefix.back()), sizeof(T));
+                T v; std::memcpy(&v, fpBytes + (idx - h.tierPrefix.back()) * sizeof(T), sizeof(T));
                 dst[outIdx] = v;
             }
         }

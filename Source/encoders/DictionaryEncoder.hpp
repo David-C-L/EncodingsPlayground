@@ -116,19 +116,20 @@ public:
             return decodeRawKeys<uint32_t>(dictionary, readPtr, numElements);
         }
 
-        return decodeBitPacked(dictionary, readPtr, numElements, dictKeysSize, keyBitWidth);
+        return decodeBitPacked(readPtr, numElements, dictKeysSize, keyBitWidth,
+                       reinterpret_cast<const uint8_t*>(dictionary.data()));
     }
 
     std::optional<T> decodeAt(const EncodedData& encoded, size_t index) override {
         const View v = getView(encoded);
-        if (v.dict == nullptr || index >= v.numElements) [[unlikely]] {
+        if (v.dictBytes == nullptr || index >= v.numElements) [[unlikely]] {
             return std::nullopt;
         }
 
         if (v.keyBitWidth == 32) {
             uint32_t k;
             std::memcpy(&k, v.keysData + index * sizeof(uint32_t), sizeof(uint32_t));
-            return k < v.dictSize ? std::optional<T>(v.dict[k]) : std::nullopt;
+            return k < v.dictSize ? std::optional<T>(loadDictValue(v.dictBytes, k)) : std::nullopt;
         }
 
         const size_t bitOffset = index * v.keyBitWidth;
@@ -146,12 +147,12 @@ public:
                                                       : ((uint64_t{1} << v.keyBitWidth) - 1u);
         key &= mask;
         if (key >= v.dictSize) [[unlikely]] return std::nullopt;
-        return v.dict[key];
+        return loadDictValue(v.dictBytes, static_cast<size_t>(key));
     }
 
     std::vector<T> decodeRange(const EncodedData& encoded, size_t start, size_t end) override {
         const View v = getView(encoded);
-        if (v.dict == nullptr || start >= v.numElements) return {};
+        if (v.dictBytes == nullptr || start >= v.numElements) return {};
         end = std::min(end, v.numElements);
 
         const size_t count = end - start;
@@ -163,13 +164,13 @@ public:
             for (size_t i = 0; i < count; ++i) {
                 uint32_t key;
                 std::memcpy(&key, rangePtr + i * sizeof(uint32_t), sizeof(uint32_t));
-                dst[i] = v.dict[key];
+                dst[i] = loadDictValue(v.dictBytes, key);
             }
             return result;
         }
 
         std::vector<T> result(count);
-        decodeGeneral(v.keysData, v.dict, result.data(), count,
+        decodeGeneral(v.keysData, v.dictBytes, result.data(), count,
                       v.keyBitWidth, start * v.keyBitWidth);
         return result;
     }
@@ -206,20 +207,22 @@ private:
     // ---------------------------------------------------------------------------
     // Zero-copy view into the encoded buffer.
     //
-    // For trivially-copyable T (all integral types used in SubIntSplit), `dict`
-    // points directly into EncodedData::data() — no allocation, no copy.
+    // For trivially-copyable T (all integral types used in SubIntSplit), the
+    // dictionary bytes point directly into EncodedData::data() — no allocation,
+    // no copy. Callers must load entries with memcpy because the buffer is only
+    // byte-aligned.
     // The hot path for decodeAt is:
     //   1. getView()         → pointer comparison, cache hit → no work
     //   2. index key array   → single memcpy or BitReader.seekToBit + read
-    //   3. dict[key]         → single array access
+    //   3. dict entry load    → single memcpy from byte-aligned storage
     // ---------------------------------------------------------------------------
     struct View {
         size_t         numElements{0};
         size_t         dictSize{0};
         uint32_t       keyBitWidth{0};
         size_t         keysSize{0};      // dictKeysSize from header (bytes)
-        const T*       dict{nullptr};    // direct pointer into encoded buffer
-        const uint8_t* keysData{nullptr};// direct pointer into encoded buffer
+        const uint8_t* dictBytes{nullptr}; // direct pointer into encoded buffer
+        const uint8_t* keysData{nullptr};   // direct pointer into encoded buffer
     };
 
     // ---------------------------------------------------------------------------
@@ -271,7 +274,7 @@ private:
         v.dictSize     = dictSize;
         v.keyBitWidth  = keyBitWidth;
         v.keysSize     = keysSize;
-        v.dict         = reinterpret_cast<const T*>(base + kHeaderSize);
+        v.dictBytes    = base + kHeaderSize;
         v.keysData     = base + kHeaderSize + dictSize * sizeof(T);
 
         cache_.base = base;
@@ -401,21 +404,20 @@ private:
         return result;
     }
 
-    std::vector<T> decodeBitPacked(const std::vector<T>& dictionary,
-                                    const uint8_t* keysPtr,
+    std::vector<T> decodeBitPacked(const uint8_t* keysPtr,
                                     size_t numElements,
                                     size_t /*keysBytesSize*/,
-                                    uint32_t keyBitWidth) {
+                                    uint32_t keyBitWidth,
+                                    const uint8_t* dictBytes) {
         std::vector<T> result(numElements);
         T* dst = result.data();
-        const T* dict = dictionary.data();
         switch (keyBitWidth) {
-            case  1: decodeBatch< 1>(keysPtr, dict, dst, numElements); break;
-            case  2: decodeBatch< 2>(keysPtr, dict, dst, numElements); break;
-            case  4: decodeBatch< 4>(keysPtr, dict, dst, numElements); break;
-            case  8: decodeBatch< 8>(keysPtr, dict, dst, numElements); break;
-            case 16: decodeBatch<16>(keysPtr, dict, dst, numElements); break;
-            default: decodeGeneral(keysPtr, dict, dst, numElements, keyBitWidth, 0); break;
+            case  1: decodeBatch< 1>(keysPtr, dictBytes, dst, numElements); break;
+            case  2: decodeBatch< 2>(keysPtr, dictBytes, dst, numElements); break;
+            case  4: decodeBatch< 4>(keysPtr, dictBytes, dst, numElements); break;
+            case  8: decodeBatch< 8>(keysPtr, dictBytes, dst, numElements); break;
+            case 16: decodeBatch<16>(keysPtr, dictBytes, dst, numElements); break;
+            default: decodeGeneral(keysPtr, dictBytes, dst, numElements, keyBitWidth, 0); break;
         }
         return result;
     }
@@ -465,7 +467,7 @@ private:
     // beyond the logical key data (guaranteed by encodeBitPacked).
     // -----------------------------------------------------------------------
     static void decodeGeneral(const uint8_t* __restrict__ keys,
-                               const T*       __restrict__ dict,
+                               const uint8_t* __restrict__ dictBytes,
                                T*             __restrict__ dst,
                                size_t n,
                                uint32_t keyBitWidth,
@@ -485,8 +487,14 @@ private:
                 std::memcpy(&next, keys + (wordIdx + 1) * sizeof(uint64_t), sizeof(uint64_t));
                 key |= next << (64u - offset);
             }
-            dst[i] = dict[key & mask];
+            dst[i] = loadDictValue(dictBytes, static_cast<size_t>(key & mask));
         }
+    }
+
+    static inline T loadDictValue(const uint8_t* dictBytes, size_t index) {
+        T value;
+        std::memcpy(&value, dictBytes + index * sizeof(T), sizeof(T));
+        return value;
     }
 
     // -----------------------------------------------------------------------
@@ -502,7 +510,7 @@ private:
     // -----------------------------------------------------------------------
     template <uint32_t W>
     static void decodeBatch(const uint8_t* __restrict__ keys,
-                             const T*       __restrict__ dict,
+                             const uint8_t* __restrict__ dictBytes,
                              T*             __restrict__ dst,
                              size_t n) {
         static_assert(64u % W == 0, "W must divide 64");
@@ -517,7 +525,7 @@ private:
             size_t i = 0;
             if (n >= 32) {
                 const __m128i dict_xmm = _mm_loadu_si128(
-                    reinterpret_cast<const __m128i*>(dict));
+                    reinterpret_cast<const __m128i*>(dictBytes));
                 const __m256i dict_ymm = _mm256_broadcastsi128_si256(dict_xmm);
                 for (; i + 32 <= n; i += 32) {
                     // 16 input bytes → low nibbles [lo0..lo15] and high nibbles [hi0..hi15]
@@ -541,7 +549,7 @@ private:
                 const size_t wordIdx = bitPos >> 6;
                 uint64_t word;
                 std::memcpy(&word, keys + wordIdx * sizeof(uint64_t), sizeof(uint64_t));
-                dst[i] = dict[(word >> (bitPos & 63u)) & kMask];
+                dst[i] = loadDictValue(dictBytes, static_cast<size_t>((word >> (bitPos & 63u)) & kMask));
             }
             return;
         }
@@ -554,7 +562,7 @@ private:
             std::memcpy(&word, keys + w * sizeof(uint64_t), sizeof(uint64_t));
             T* dw = dst + w * kPerWord;
             for (uint32_t j = 0; j < kPerWord; ++j, word >>= W) {
-                dw[j] = dict[word & kMask];
+                dw[j] = loadDictValue(dictBytes, static_cast<size_t>(word & kMask));
             }
         }
         // Remainder (< kPerWord elements in the last partial word)
@@ -564,7 +572,7 @@ private:
             std::memcpy(&word, keys + fullWords * sizeof(uint64_t), sizeof(uint64_t));
             T* dw = dst + fullWords * kPerWord;
             for (size_t j = 0; j < rem; ++j, word >>= W) {
-                dw[j] = dict[word & kMask];
+                dw[j] = loadDictValue(dictBytes, static_cast<size_t>(word & kMask));
             }
         }
     }
