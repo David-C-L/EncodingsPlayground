@@ -208,13 +208,11 @@ public:
                           << " ms)\n";
             }
 
-            auto selectionIt = encoded.metadata().customMetadata.find("selectionTime_ns");
-            if (selectionIt != encoded.metadata().customMetadata.end()) {
+            // Propagate all numeric customMetadata entries into customMetrics.
+            for (const auto& [key, strVal] : encoded.metadata().customMetadata) {
                 try {
-                    result.metrics.customMetrics["selectionTime_ns"] = std::stod(selectionIt->second);
-                } catch (const std::exception&) {
-                    // ignore parse errors
-                }
+                    result.metrics.customMetrics[key] = std::stod(strVal);
+                } catch (...) {}
             }
 
             // Accumulate per-section encode metrics (only populated by profiling variants)
@@ -278,9 +276,10 @@ public:
         result.metrics.memory.originalSize = dataSize * sizeof(T);
         result.metrics.memory.encodedSize = encoded.size();
 
-        // Random access benchmarks — reset decodeAt accumulator first so we capture
-        // only the access-pattern phase (not the warmup/timing iterations above).
+        // Random access benchmarks — reset per-section and reordering accumulators first
+        // so we capture only the access-pattern phase (not the warmup/timing iterations).
         encoder->resetSubStreamDecodeAtAccum();
+        encoder->resetReorderingProfilingAccum();
         if (config_.testRandomAccess) {
             if (config_.verboseOutput) {
                 std::cout << "  [" << encoderName << "/" << datasetName << "] random access..." << std::flush;
@@ -324,6 +323,16 @@ public:
         // Store final sub-stream breakdown
         if (!substreamAccum.empty())
             result.metrics.subStreamMetrics = std::move(substreamAccum);
+
+        // Reordering-layer profiling hooks (non-negative when ReorderingCodec<T,true>)
+        if (auto ns = encoder->reorderEncodeTimeNs(); ns >= 0)
+            result.metrics.customMetrics["reorder_encode_time_ns"] = static_cast<double>(ns);
+        if (auto ns = encoder->unreorderDecodeAllTimeNs(); ns >= 0)
+            result.metrics.customMetrics["unreorder_decode_all_time_ns"] = static_cast<double>(ns);
+        if (auto ns = encoder->permLookupDecodeAtAccumNs(); ns >= 0)
+            result.metrics.customMetrics["perm_lookup_decode_at_ns"] = static_cast<double>(ns);
+        if (auto ns = encoder->permLookupDecodeRangeAccumNs(); ns >= 0)
+            result.metrics.customMetrics["perm_lookup_decode_range_ns"] = static_cast<double>(ns);
 
         // ── Memory measurement pass ──────────────────────────────────────
         // Run each workload a second time, measuring heap usage with a background
