@@ -25,6 +25,7 @@ add_subdirectory(Source/core)
 add_subdirectory(Source/encodings)
 add_subdirectory(Source/generators)
 add_subdirectory(Source/encoders)
+add_subdirectory(Source/reorderers)
 add_subdirectory(Source/benchmark)
 
 if(BUILD_BENCHMARKS)

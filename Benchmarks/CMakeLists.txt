@@ -129,11 +129,32 @@ if(VTUNE_ENABLED)
     message(STATUS "VTune ITT instrumentation enabled (${ITT_LIBRARY})")
 endif()
 
+# Reordering benchmarks
+add_executable(reordering_benchmarks
+    reordering_benchmarks.cpp
+    allocation_hooks.cpp
+)
+
+target_link_libraries(reordering_benchmarks
+    PRIVATE
+        encodings_core
+        encodings_encodings
+        encodings_generators
+        encodings_encoders
+        encodings_reorderers
+        encodings_benchmark
+)
+
+target_include_directories(reordering_benchmarks
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/Source
+)
+
 # Create results directory
 file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/benchmark_results)
 
 # Set output directory for the executables
-set_target_properties(run_benchmarks sweep_subint_samples map_benchmarks map_benchmarks_refactored vector_benchmarks PROPERTIES
+set_target_properties(run_benchmarks sweep_subint_samples map_benchmarks map_benchmarks_refactored vector_benchmarks reordering_benchmarks PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 
