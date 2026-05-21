@@ -252,6 +252,24 @@ public:
     /// Zero the decodeRange accumulator — call before each range-access benchmark loop.
     virtual void resetSubStreamDecodeRangeAccum() {}
 
+    // Reordering-layer profiling — overridden by ReorderingCodec<T, true> only.
+    // Default: return -1 (unavailable) / no-op, so all non-reordering codecs are unaffected.
+
+    /// Nanoseconds spent in Reorderer::reorder() during the most recent encode() call.
+    virtual int64_t reorderEncodeTimeNs()            const { return -1; }
+
+    /// Nanoseconds spent in Reorderer::unreorder() during the most recent decodeAll() call.
+    virtual int64_t unreorderDecodeAllTimeNs()        const { return -1; }
+
+    /// Accumulated ns for permutation-lookup steps across all decodeAt() calls since last reset.
+    virtual int64_t permLookupDecodeAtAccumNs()       const { return -1; }
+
+    /// Accumulated ns for permutation-lookup steps across all decodeRange() calls since last reset.
+    virtual int64_t permLookupDecodeRangeAccumNs()    const { return -1; }
+
+    /// Zero the reordering-layer accumulators before each benchmark loop.
+    virtual void    resetReorderingProfilingAccum()   {}
+
     // Single encodingType() implementation for both interfaces
     EncodingType encodingType() const override = 0;
 
