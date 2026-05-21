@@ -31,7 +31,8 @@ namespace encodings {
         HuffmanEncoding,  // Canonical Huffman entropy coding (sequential decode only)
         LZ4,              // LZ4 block compression (fast mode)
         FSEEncoding,      // Finite State Entropy (tANS) entropy coding (sequential decode only)
-        FrequencyPartitionEncoding // Frequency-partitioned fixed-width keys with per-tier bitmaps
+        FrequencyPartitionEncoding, // Frequency-partitioned fixed-width keys with per-tier bitmaps
+        ReorderingEncoding          // Reordering pre-pass wrapping any inner codec; sub-classified by ReorderingType
     };
 
     /** Convert EncodingType enum to human-readable string */
@@ -57,6 +58,7 @@ namespace encodings {
             case EncodingType::LZ4:                      return "LZ4";
             case EncodingType::FSEEncoding:              return "FSEEncoding";
             case EncodingType::FrequencyPartitionEncoding: return "FrequencyPartitionEncoding";
+            case EncodingType::ReorderingEncoding:         return "ReorderingEncoding";
         }
         return "Unknown";
     }
