@@ -64,6 +64,9 @@ enum class EncodingProperty : uint32_t {
     
     // Cascadable
     Composable         = 1 << 23, // Can be chained with other encodings
+
+    // Reordering-specific
+    ValueTransform     = 1 << 24, // Bijection on values only; positions unchanged (e.g. GrayCode)
 };
 
 /**
