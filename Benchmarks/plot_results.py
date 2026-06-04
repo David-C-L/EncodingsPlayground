@@ -41,6 +41,7 @@ class GroupRule:
 
 
 def _default_group_rules() -> List[GroupRule]:
+    autosubintsplit_re = re.compile(r'^AutoSubIntSplit(?P<num>\d+)$')
     openzl_re = re.compile(r'^OpenZL(?P<num>\d+)?$')
     subint_re = re.compile(r'^(?P<prefix>.*)SubInt(?P<num>\d+)?$')
     varint_re = re.compile(r'.*VarInt$')
@@ -58,6 +59,12 @@ def _default_group_rules() -> List[GroupRule]:
 
     def varint_key(name: str) -> tuple:
         return (0 if name == 'VarInt' else 1, name)
+
+    def autosubintsplit_key(name: str) -> tuple:
+        match = autosubintsplit_re.match(name)
+        num = int(match.group('num')) if match else -1
+        exact_first = 0 if match else 1
+        return (num, exact_first, name)
 
     def subint_key(name: str) -> tuple:
         match = subint_re.match(name)
@@ -85,7 +92,7 @@ def _default_group_rules() -> List[GroupRule]:
         GroupRule(
             name='AutoSubIntSplit',
             predicate=lambda n: n.startswith('AutoSubIntSplit'),
-            sort_key=lambda n: (n,)
+            sort_key=autosubintsplit_key
         ),
         GroupRule(
             name='Raw',
@@ -226,6 +233,145 @@ def _has_custom_metric(results, key: str) -> bool:
         if key in custom:
             return True
     return False
+
+
+_AUTOSUBINTSPLIT_FORCED_RE = re.compile(r'^AutoSubIntSplit(?P<splits>\d+)$')
+
+
+def _autosubintsplit_forced_split_count(encoder_name: str):
+    match = _AUTOSUBINTSPLIT_FORCED_RE.match(encoder_name or '')
+    if not match:
+        return None
+    return int(match.group('splits'))
+
+
+def _autosubintsplit_forced_split_rows(results, dataset):
+    size = _pick_size_for_dataset(results, dataset)
+    rows = []
+    for r in results['results']:
+        if r.get('datasetName') != dataset or r.get('dataSize') != size:
+            continue
+        splits = _autosubintsplit_forced_split_count(r.get('encoderName', ''))
+        if splits is None:
+            continue
+        rows.append((splits, r))
+    rows.sort(key=lambda item: (item[0], item[1].get('encoderName', '')))
+    return size, rows
+
+
+def _has_autosubintsplit_forced_data(results) -> bool:
+    return any(
+        _autosubintsplit_forced_split_count(r.get('encoderName', '')) is not None
+        for r in results['results']
+    )
+
+
+def _plot_split_sweep_panel(ax, split_counts, values, title, ylabel, *, log_y=False, unit='', fmt='.3g'):
+    ax.plot(split_counts, values, marker='o', color='tab:blue', linewidth=1.5, markersize=5)
+    ax.set_title(title)
+    ax.set_xlabel('Forced split count')
+    ax.set_ylabel(ylabel)
+    ax.grid(True, alpha=0.3)
+    if split_counts:
+        ax.set_xticks(split_counts)
+        ax.set_xticklabels([str(split) for split in split_counts])
+    if log_y and all(v > 0 for v in values):
+        ax.set_yscale('log')
+        min_positive = min(v for v in values if v > 0)
+        max_positive = max(v for v in values if v > 0)
+        ax.set_ylim([min(min_positive * 0.5, 1), max_positive * 2])
+
+    for x, y in zip(split_counts, values):
+        if y and y > 0:
+            label = f'{y:{fmt}} {unit}'.strip()
+            ax.annotate(label, (x, y), textcoords='offset points', xytext=(0, 6),
+                        ha='center', fontsize=7)
+        else:
+            ax.annotate('N/A', (x, 0.02), textcoords='offset points', xytext=(0, 0),
+                        ha='center', fontsize=7, color='grey')
+
+
+def plot_autosubintsplit_forced_split_sweep(results, output_dir, colours, source_label, group_encoders=False):
+    """Plot AutoSubIntSplit variants that end in a numeric split count.
+
+    The numeric suffix is interpreted as the forced number of splits used by the
+    encoder, and each dataset gets a 5-panel summary across those split counts.
+    """
+    datasets = sorted(set(r['datasetName'] for r in results['results']))
+
+    for dataset in datasets:
+        size, rows = _autosubintsplit_forced_split_rows(results, dataset)
+        if not rows:
+            continue
+
+        split_counts = [splits for splits, _ in rows]
+        encode_ms = [row['metrics']['timing'].get('encodeTime_ns', 0) / 1e6 for _, row in rows]
+        bulk_decode_ms = [row['metrics']['timing'].get('decodeBulkTime_ns', 0) / 1e6 for _, row in rows]
+        random_decode_ns = [row['metrics']['randomAccess'].get('averageRandomAccessTime_ns', 0) for _, row in rows]
+        ranged_decode_ms = [row['metrics']['randomAccess'].get('averageRangeAccessTime_ns', 0) / 1e6 for _, row in rows]
+        compression_x = []
+        for _, row in rows:
+            ratio = row['metrics']['memory'].get('compressionRatio', 0)
+            compression_x.append(1.0 / ratio if ratio and ratio > 0 else 0)
+
+        fig, axes = plt.subplots(3, 2, figsize=(13, 12))
+        fig.suptitle(
+            f'AutoSubIntSplit forced-split sweep — {dataset}  (n={size:,})',
+            fontsize=13, y=0.98)
+        _annotate_source(fig, source_label)
+
+        _plot_split_sweep_panel(
+            axes[0, 0], split_counts, encode_ms,
+            title='Encode time',
+            ylabel='Time (ms)',
+            log_y=True,
+            unit='ms',
+            fmt='.2f',
+        )
+        _plot_split_sweep_panel(
+            axes[0, 1], split_counts, bulk_decode_ms,
+            title='Bulk decode time',
+            ylabel='Time (ms)',
+            log_y=True,
+            unit='ms',
+            fmt='.2f',
+        )
+        _plot_split_sweep_panel(
+            axes[1, 0], split_counts, random_decode_ns,
+            title='Random access time',
+            ylabel='Time (ns)',
+            log_y=True,
+            unit='ns',
+            fmt='.0f',
+        )
+        _plot_split_sweep_panel(
+            axes[1, 1], split_counts, ranged_decode_ms,
+            title='Ranged access time',
+            ylabel='Time (ms)',
+            log_y=True,
+            unit='ms',
+            fmt='.2f',
+        )
+        _plot_split_sweep_panel(
+            axes[2, 0], split_counts, compression_x,
+            title='Compression ratio',
+            ylabel='Compression (× smaller than raw)',
+            log_y=False,
+            unit='×',
+            fmt='.3f',
+        )
+        axes[2, 1].axis('off')
+        axes[2, 1].text(
+            0.5, 0.6,
+            'Numeric suffix on AutoSubIntSplitN\nmeans N forced splits',
+            ha='center', va='center', fontsize=10, transform=axes[2, 1].transAxes)
+        axes[2, 1].grid(False)
+
+        plt.tight_layout(rect=[0, 0, 1, 0.95])
+        fname = output_dir / f'autosubintsplit_forced_split_sweep_{dataset.replace(" ", "_")}.png'
+        plt.savefig(fname, dpi=150, bbox_inches='tight')
+        print(f"Saved: {fname}")
+        plt.close(fig)
 
 
 def _safe_log_scale(ax, axis='x'):
@@ -1760,6 +1906,14 @@ def main():
     plot_throughput_summary(results, args.output, colours, source_label, group_encoders=args.group_encoders)
     plot_compression_vs_random_access(results, args.output, colours, source_label, group_encoders=args.group_encoders)
     # selection time (if present) is shown inside the encode plot
+
+    # ── AutoSubIntSplit forced-split sweep ──────────────────────────────
+    if _has_autosubintsplit_forced_data(results):
+        print("\nAutoSubIntSplitN variants detected — generating forced-split sweep plots...")
+        plot_autosubintsplit_forced_split_sweep(
+            results, args.output, colours, source_label, group_encoders=args.group_encoders)
+    else:
+        print("\nNo numbered AutoSubIntSplit variants found — skipping forced-split sweep plots.")
 
     # ── Sub-stream stacked variants (skipped if no profiling variants present) ──
     if _has_substream_data(results):
