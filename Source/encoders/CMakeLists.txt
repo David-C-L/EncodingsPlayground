@@ -116,6 +116,8 @@ target_sources(encodings_encoders INTERFACE
         OpenZLEncoder.hpp
         LZ4Encoder.hpp
         FSEEncoder.hpp
+        BWTSectionEncoder.hpp
+        selectors/SubStreamReordererType.hpp
 )
 
 target_include_directories(encodings_encoders INTERFACE
