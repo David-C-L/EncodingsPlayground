@@ -22,7 +22,7 @@
 #include "encodings/EncodingType.hpp"
 
 namespace encodings::encoders {
-
+// TODO: Generalise to allow any ReorderingCodec as the inner reordering layer, not just BWT.
 // ---------------------------------------------------------------------------
 // BWTSectionEncoder<T, W>
 //

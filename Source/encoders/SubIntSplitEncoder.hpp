@@ -942,6 +942,7 @@ struct SubIntSplitAutoEncoderConfig {
     selectors::IDSubStreamEncodingSelector::Config selectorConfig{};
     generators::samplers::StreamSampler<T>::Config samplerConfig{};
     std::vector<std::unique_ptr<selectors::costs::EncodingCostModel>> costModels;
+    std::vector<std::unique_ptr<selectors::costs::ISubStreamReordererCostModel>> reordererModels;
     std::optional<BitSplitOrder> orderHint{}; // allow forcing MSB/LSB ordering
     bool debugLogging{true};
     bool enableSelectionTiming{false};
@@ -959,7 +960,8 @@ public:
         if (cfg.costModels.empty()) {
             throw std::invalid_argument("SubIntSplitAutoEncoder: costModels must not be empty");
         }
-        costModels_ = std::move(cfg.costModels);
+        costModels_     = std::move(cfg.costModels);
+        reordererModels_ = std::move(cfg.reordererModels);
     }
 
     EncodedBuffer<uint8_t> encode(std::span<const T> data) override {
@@ -1066,7 +1068,7 @@ private:
         const auto& selectorInput = (orderHint_.has_value() && *orderHint_ == BitSplitOrder::MSB_TO_LSB)
                                         ? transformedSample
                                         : sample;
-        lastSelection_ = selector_.select(selectorInput, costModels_, data.size());
+        lastSelection_ = selector_.select(selectorInput, costModels_, reordererModels_, data.size());
         if (lastSelection_.segments.empty()) {
             throw std::runtime_error("SubIntSplitAutoEncoder: selector returned no segments");
         }
@@ -1112,6 +1114,7 @@ private:
     generators::samplers::StreamSampler<T>::Config samplerCfg_{};
     std::optional<BitSplitOrder> orderHint_{};
     std::vector<std::unique_ptr<selectors::costs::EncodingCostModel>> costModels_;
+    std::vector<std::unique_ptr<selectors::costs::ISubStreamReordererCostModel>> reordererModels_;
     std::shared_ptr<SubIntSplitEncoder<T, EnableProfiling>> impl_{};
     bool debugLogging_{true};
     bool selectionTimingEnabled_{false};
@@ -1287,6 +1290,8 @@ inline typename SubIntSplitAutoEncoder<T>::Config makeDefaultAutoSubIntSplitConf
         costModelTypes = defaultAutoSubIntSplitCostModelTypes();
     }
     cfg.costModels = makeAutoSubIntSplitCostModelsFromTypes(costModelTypes);
+    // Register windowed BWT as a reorderer candidate (composable with all base encodings)
+    cfg.reordererModels.push_back(std::make_unique<selectors::costs::BWTReordererCostModel>());
     return cfg;
 }
 

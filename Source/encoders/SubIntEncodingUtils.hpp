@@ -28,6 +28,8 @@
 #include "encoders/AdaptiveFramedBitPrefixEncoder.hpp"
 #include "encoders/RunLengthEncoder.hpp"
 #include "encoders/HuffmanEncoder.hpp"
+#include "encoders/BWTSectionEncoder.hpp"
+#include "encoders/selectors/SubStreamReordererType.hpp"
 #include "encoders/FrequencyPartitionEncoder.hpp"
 #include "encoders/FOREncoder.hpp"
 #include "encoders/BitSplitOrder.hpp"
@@ -621,6 +623,40 @@ inline std::shared_ptr<ISectionCodecIntegral<SectionCodecTIn>> makeFORSection(ui
 } // namespace detail_trisplit
 
 // ---------------------------------------------------------------------------
+// Helper: build a typed Codec<T, uint8_t> from an EncodingType tag.
+// Used by the BWT wrapping path in fromSegments() to create an inner codec
+// that the BWTSectionEncoder can delegate to.
+// FOR/AdaptiveFOR are excluded (they require signed types and are not beneficial
+// in combination with BWT, which already handles structured data well).
+// ---------------------------------------------------------------------------
+namespace detail_trisplit {
+
+template <typename T>
+    requires std::is_unsigned_v<T>
+inline std::shared_ptr<encodings::Codec<T, uint8_t>>
+makeTypedSectionCodec(encodings::EncodingType enc) {
+    switch (enc) {
+        case encodings::EncodingType::DictionaryEncoding:
+            return std::make_shared<DictionaryEncoder<T>>();
+        case encodings::EncodingType::BitPacking:
+            return std::make_shared<RawBitPackedEncoder<T>>();
+        case encodings::EncodingType::RunLengthEncoding:
+            return std::make_shared<RunLengthEncoder<T>>();
+        case encodings::EncodingType::HuffmanEncoding:
+            return std::make_shared<HuffmanEncoder<T>>();
+        case encodings::EncodingType::LZ4:
+            return std::make_shared<LZ4Encoder<T>>();
+        case encodings::EncodingType::FSEEncoding:
+            return std::make_shared<FSEEncoder<T>>();
+        case encodings::EncodingType::RawEncoding:
+        default:
+            return std::make_shared<RawEncoder<T>>();
+    }
+}
+
+} // namespace detail_trisplit
+
+// ---------------------------------------------------------------------------
 // SubIntSplitConfigIntegral factories from SegmentPlan
 // ---------------------------------------------------------------------------
 namespace SubIntSplitConfigIntegralFactory {
@@ -704,6 +740,33 @@ inline SubIntSplitConfigIntegral<TIn> SubIntSplitConfigIntegral<TIn>::fromSegmen
 
         const uint8_t width = static_cast<uint8_t>(seg.bitEnd - seg.bitStart + 1);
         cfg.bits.push_back(width);
+
+        // BWT wrapping: build BWTSectionEncoder(innerCodec) before the section adapter.
+        if (seg.reorderer == encodings::encoders::selectors::SubStreamReordererType::BWT512) {
+            const uint8_t w = chooseTypeBits(width);  // chooseTypeBits is in encodings::encoders
+            // makeSectionCodecForBits is in encodings::encoders (not detail_trisplit)
+            if (w <= 8) {
+                auto inner = detail_trisplit::makeTypedSectionCodec<uint8_t>(seg.encoding);
+                cfg.codecs.push_back(makeSectionCodecForBits<TIn>(
+                    std::make_shared<BWTSectionEncoder<uint8_t, 512>>(inner), width));
+            } else if (w <= 16) {
+                auto inner = detail_trisplit::makeTypedSectionCodec<uint16_t>(seg.encoding);
+                cfg.codecs.push_back(makeSectionCodecForBits<TIn>(
+                    std::make_shared<BWTSectionEncoder<uint16_t, 512>>(inner), width));
+            } else if (w <= 32) {
+                auto inner = detail_trisplit::makeTypedSectionCodec<uint32_t>(seg.encoding);
+                cfg.codecs.push_back(makeSectionCodecForBits<TIn>(
+                    std::make_shared<BWTSectionEncoder<uint32_t, 512>>(inner), width));
+            } else {
+                auto inner = detail_trisplit::makeTypedSectionCodec<uint64_t>(seg.encoding);
+                cfg.codecs.push_back(makeSectionCodecForBits<TIn>(
+                    std::make_shared<BWTSectionEncoder<uint64_t, 512>>(inner), width));
+            }
+            boundary = (orderHint == BitSplitOrder::LSB_TO_MSB)
+                           ? (seg.bitEnd + 1)
+                           : (seg.bitStart - 1);
+            continue;
+        }
 
         // Map EncodingType to concrete section codec.
         switch (seg.encoding) {
