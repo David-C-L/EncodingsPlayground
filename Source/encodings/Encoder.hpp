@@ -252,6 +252,10 @@ public:
     /// Zero the decodeRange accumulator — call before each range-access benchmark loop.
     virtual void resetSubStreamDecodeRangeAccum() {}
 
+    /// Reset any cached encoder-selection state so the next encode() re-runs
+    /// selection on fresh data.  Called by BenchmarkRunner between datasets.
+    virtual void reset() {}
+
     // Reordering-layer profiling — overridden by ReorderingCodec<T, true> only.
     // Default: return -1 (unavailable) / no-op, so all non-reordering codecs are unaffected.
 

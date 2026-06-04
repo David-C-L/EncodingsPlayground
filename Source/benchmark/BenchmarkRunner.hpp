@@ -166,6 +166,7 @@ public:
         
         // Generate data
         generator->reset();
+        encoder->reset();   // re-run encoder selection for this dataset
 #ifdef VTUNE_ENABLED
         if (config_.vtune.dataLoad) __itt_resume();
 #endif

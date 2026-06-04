@@ -231,6 +231,8 @@ public:
         if constexpr (EnableProfiling) return profiling_.permLookupDecodeRangeAccum_ns;
         return -1;
     }
+    void reset() override { inner_->reset(); }
+
     void resetReorderingProfilingAccum() override {
         if constexpr (EnableProfiling) {
             profiling_.permLookupDecodeAtAccum_ns    = 0;

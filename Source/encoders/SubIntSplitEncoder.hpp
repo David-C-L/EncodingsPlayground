@@ -1020,6 +1020,11 @@ public:
     }
     void resetSubStreamDecodeAtAccum() override    { if (impl_) impl_->resetSubStreamDecodeAtAccum(); }
     void resetSubStreamDecodeRangeAccum() override { if (impl_) impl_->resetSubStreamDecodeRangeAccum(); }
+    void reset() override {
+        impl_.reset();
+        lastSelection_       = selectors::IDSubStreamEncodingSelector::Result{};
+        lastSelectionTimeNs_.reset();
+    }
 
 private:
     using UnsignedT = std::make_unsigned_t<T>;
@@ -1269,7 +1274,8 @@ template <typename T>
 inline typename SubIntSplitAutoEncoder<T>::Config makeDefaultAutoSubIntSplitConfig(BitSplitOrder order = BitSplitOrder::LSB_TO_MSB,
                                                                          bool enableSelectionTiming = false,
                                                                          std::vector<encodings::EncodingType> costModelTypes = {},
-                                                                         int numSplits = -1) {
+                                                                         int numSplits = -1,
+                                                                         bool allowReorderers = true) {
     typename SubIntSplitAutoEncoder<T>::Config cfg;
     cfg.selectorConfig = selectors::IDSubStreamEncodingSelector::Config{}; // defaults
     cfg.selectorConfig.verboseLevel = 1; // leave quiet by default; enable when debugging
@@ -1290,8 +1296,8 @@ inline typename SubIntSplitAutoEncoder<T>::Config makeDefaultAutoSubIntSplitConf
         costModelTypes = defaultAutoSubIntSplitCostModelTypes();
     }
     cfg.costModels = makeAutoSubIntSplitCostModelsFromTypes(costModelTypes);
-    // Register windowed BWT as a reorderer candidate (composable with all base encodings)
-    cfg.reordererModels.push_back(std::make_unique<selectors::costs::BWTReordererCostModel>());
+    if (allowReorderers)
+        cfg.reordererModels.push_back(std::make_unique<selectors::costs::BWTReordererCostModel>());
     return cfg;
 }
 
@@ -1301,8 +1307,9 @@ inline std::shared_ptr<SubIntSplitAutoEncoder<T>> makeDefaultAutoSubIntSplitEnco
                                                                                    bool enablePrune = true,
                                                                                    bool enableSelectionTiming = false,
                                                                                    std::vector<encodings::EncodingType> costModelTypes = {},
-                                                                                   int numSplits = -1) {
-    auto cfg = makeDefaultAutoSubIntSplitConfig<T>(order, enableSelectionTiming, std::move(costModelTypes), numSplits);
+                                                                                   int numSplits = -1,
+                                                                                   bool allowReorderers = true) {
+    auto cfg = makeDefaultAutoSubIntSplitConfig<T>(order, enableSelectionTiming, std::move(costModelTypes), numSplits, allowReorderers);
     cfg.selectorConfig.orderHint = order;
     cfg.selectorConfig.useExhaustiveSearch = exhaustiveSearch;
     cfg.selectorConfig.enablePrune = enablePrune;
