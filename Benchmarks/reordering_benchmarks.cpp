@@ -93,8 +93,9 @@ std::shared_ptr<Codec64> makeSort(std::shared_ptr<Codec64> inner,
 // reordering-layer timing hooks are active and appear in the JSON results.
 template <size_t W, bool P = true>
 std::shared_ptr<Codec64> makeWindowedSort(std::shared_ptr<Codec64> inner,
+                                          PermFormat permFmt = PermFormat::ChunkRelative,
                                           std::string name = "") {
-    auto r = std::make_shared<WindowedSortReorderer<int64_t, W>>();
+    auto r = std::make_shared<WindowedSortReorderer<int64_t, W>>(permFmt);
     return makeReorderingCodec<int64_t, P>(r, inner, ReorderingType::WindowedSort,
                                            name.empty() ? "WSort|" + inner->name() : name);
 }
@@ -134,6 +135,42 @@ template <size_t... Ws, typename AddFn>
 void sweepBWT(AddFn&& add) {
     ((add("BWT" + std::to_string(Ws) + "|AutoSubIntSplit",
           makeBWT<Ws, /*EnableProfiling=*/true>(makeAutoSubIntSplit()))), ...);
+}
+
+// ---------------------------------------------------------------------------
+// Permutation format sweeps (fixed reorderer type, vary PermFormat)
+// ---------------------------------------------------------------------------
+
+// Sort with each permutation format — compares space efficiency and decode overhead.
+template <typename AddFn>
+void sweepSortPermFormats(AddFn&& add) {
+    auto makeS = [](PermFormat fmt) {
+        auto r = std::make_shared<SortReorderer<int64_t>>(fmt);
+        return makeReorderingCodec<int64_t, /*EnableProfiling=*/true>(
+            r, makeAutoSubIntSplit(), ReorderingType::Sort,
+            std::string("Sort[") + PermutationStore::formatName(fmt) + "]|AutoSubIntSplit");
+    };
+    add("Sort[FlatBitPacked]|AutoSubIntSplit",    makeS(PermFormat::FlatBitPacked));
+    add("Sort[DeltaBitPacked]|AutoSubIntSplit",   makeS(PermFormat::DeltaBitPacked));
+    add("Sort[DeltaZstd]|AutoSubIntSplit",        makeS(PermFormat::DeltaZstd));
+    add("Sort[DeltaLZ4]|AutoSubIntSplit",         makeS(PermFormat::DeltaLZ4));
+    add("Sort[ValueGrouped]|AutoSubIntSplit",     makeS(PermFormat::ValueGrouped));
+    add("Sort[InverseEliasFano]|AutoSubIntSplit", makeS(PermFormat::InverseEliasFano));
+}
+
+// WindowedSort<W=256> with each chunk permutation format.
+template <typename AddFn>
+void sweepWSort256PermFormats(AddFn&& add) {
+    constexpr size_t W = 256;
+    auto makeW = [](PermFormat fmt) {
+        auto r = std::make_shared<WindowedSortReorderer<int64_t, W>>(fmt);
+        return makeReorderingCodec<int64_t, /*EnableProfiling=*/true>(
+            r, makeAutoSubIntSplit(), ReorderingType::WindowedSort,
+            std::string("WSort256[") + PermutationStore::formatName(fmt) + "]|AutoSubIntSplit");
+    };
+    add("WSort256[ChunkRelative]|AutoSubIntSplit",     makeW(PermFormat::ChunkRelative));
+    add("WSort256[ChunkRelativeZstd]|AutoSubIntSplit", makeW(PermFormat::ChunkRelativeZstd));
+    add("WSort256[ChunkRelativeLZ4]|AutoSubIntSplit",  makeW(PermFormat::ChunkRelativeLZ4));
 }
 
 } // namespace
@@ -211,6 +248,10 @@ int main() {
     // BWT sweep: W = 16, 32, 64, 128, 256, 512
     // Larger W is impractical (O(W² log W) per window).
     sweepBWT<32, 128, 512, 4096, 16384>(add);
+
+    // Permutation format sweeps (fixed reorderer, vary PermFormat)
+    sweepSortPermFormats(add);
+    sweepWSort256PermFormats(add);
 
     // ------------------------------------------------------------------
     // Run benchmark
