@@ -18,9 +18,9 @@ namespace encodings::reorderers {
 // → optimal for RLE, tightens the value range for FOR/BitPacking, and reduces
 // per-section entropy for SubIntSplit.
 //
-// Forward permutation: fwd[i] = sorted position of original element i.
-// Stored with the chosen PermFormat (default FlatBitPacked, O(1) random access).
-// DeltaBitPacked is smaller but sequential-only.
+// permFmt controls how the permutation is stored.  Formats that exploit
+// value-group structure (ValueGrouped, InverseEliasFano) require the sorted
+// values to identify group boundaries; reorder() handles this automatically.
 // ---------------------------------------------------------------------------
 
 template <ReorderableType T>
@@ -53,7 +53,15 @@ public:
         for (size_t j = 0; j < N; ++j)
             reordered[j] = data[sortedIndices[j]];
 
-        auto permData = PermutationStore::pack(fwdPerm, permFmt_);
+        // Pack permutation — group-based formats need value group sizes
+        std::vector<uint8_t> permData;
+        if (needsGroupSizes(permFmt_)) {
+            auto groupSizes = computeGroupSizes(std::span<const T>(reordered));
+            permData = PermutationStore::packWithGroups(fwdPerm, groupSizes, permFmt_);
+        } else {
+            permData = PermutationStore::pack(fwdPerm, permFmt_);
+        }
+
         return {std::move(reordered), std::move(permData)};
     }
 
@@ -81,8 +89,6 @@ public:
         return PermutationStore::forwardAt(permData, origIdx);
     }
 
-    // Override bulk mapping to use PermutationStore::forwardBulk (sequential
-    // scan for DeltaBitPacked; O(1) each for FlatBitPacked).
     std::optional<std::vector<size_t>> originalToReorderedIndices(
         std::span<const size_t>  origIndices,
         std::span<const uint8_t> permData) const override {
@@ -98,10 +104,32 @@ public:
     }
 
     std::string name() const override {
-        return permFmt_ == PermFormat::DeltaBitPacked ? "Sort(delta)" : "Sort";
+        return std::string("Sort[") + PermutationStore::formatName(permFmt_) + "]";
     }
 
 private:
+    // Returns true when packWithGroups (rather than pack) is needed.
+    static bool needsGroupSizes(PermFormat fmt) noexcept {
+        return fmt == PermFormat::ValueGrouped || fmt == PermFormat::InverseEliasFano;
+    }
+
+    // Count consecutive equal values in the sorted sequence.
+    static std::vector<size_t> computeGroupSizes(std::span<const T> sorted) {
+        std::vector<size_t> sizes;
+        if (sorted.empty()) return sizes;
+        size_t count = 1;
+        for (size_t i = 1; i < sorted.size(); ++i) {
+            if (sorted[i] == sorted[i - 1]) {
+                ++count;
+            } else {
+                sizes.push_back(count);
+                count = 1;
+            }
+        }
+        sizes.push_back(count);
+        return sizes;
+    }
+
     PermFormat permFmt_;
 };
 

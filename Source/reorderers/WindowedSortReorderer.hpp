@@ -31,6 +31,10 @@ template <ReorderableType T, size_t W = 256>
 class WindowedSortReorderer : public Reorderer<T> {
     static_assert(W >= 2, "Window size must be at least 2");
 public:
+    // permFmt must be ChunkRelative (O(1) RA), ChunkRelativeZstd, or ChunkRelativeLZ4.
+    explicit WindowedSortReorderer(PermFormat permFmt = PermFormat::ChunkRelative)
+        : permFmt_(permFmt) {}
+
     // -----------------------------------------------------------------------
     // Forward: sort within each window of size W
     // -----------------------------------------------------------------------
@@ -64,7 +68,12 @@ public:
             }
         }
 
-        auto permData = PermutationStore::packChunkRelative(fwdPerm, W);
+        std::vector<uint8_t> permData;
+        if (permFmt_ == PermFormat::ChunkRelativeZstd || permFmt_ == PermFormat::ChunkRelativeLZ4) {
+            permData = PermutationStore::packChunkCompressed(fwdPerm, W, permFmt_);
+        } else {
+            permData = PermutationStore::packChunkRelative(fwdPerm, W);
+        }
         return {std::move(reordered), std::move(permData)};
     }
 
@@ -103,12 +112,16 @@ public:
     // -----------------------------------------------------------------------
 
     size_t estimatePermutationSize(size_t N) const override {
-        return PermutationStore::estimatePackedSize(N, PermFormat::ChunkRelative, W);
+        return PermutationStore::estimatePackedSize(N, permFmt_, W);
     }
 
     std::string name() const override {
-        return "WindowedSort<" + std::to_string(W) + ">";
+        return std::string("WindowedSort<") + std::to_string(W) + ">[" +
+               PermutationStore::formatName(permFmt_) + "]";
     }
+
+private:
+    PermFormat permFmt_;
 };
 
 } // namespace encodings::reorderers
