@@ -1,6 +1,7 @@
 #pragma once
 
 #include "encoders/selectors/MetricCollector.hpp"
+#include "encoders/selectors/SubStreamReordererType.hpp"
 #include "encodings/EncodingType.hpp"
 
 #include <bit>
@@ -672,6 +673,77 @@ public:
 
     encodings::EncodingType encodingType() const override {
         return encodings::EncodingType::FrequencyPartitionEncoding;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Reorderer cost model interface and implementations
+// ---------------------------------------------------------------------------
+
+// Interface for sub-stream reorderer cost models.
+// The selector evaluates (reorderer × base-encoding) combinations by applying
+// a multiplicative cost discount + fixed overhead on top of each base cost.
+class ISubStreamReordererCostModel {
+public:
+    virtual ~ISubStreamReordererCostModel() = default;
+
+    virtual encodings::encoders::selectors::SubStreamReordererType reordererType() const = 0;
+
+    // Fixed overhead in bits added by the reorderer (e.g. BWT primary indices).
+    virtual double overheadBits(size_t numValues) const = 0;
+
+    // Multiplicative discount applied to the base encoding cost after reordering.
+    // < 1.0 = the reorderer improves compression; depends on data characteristics
+    // and the base encoding chosen.
+    virtual double costMultiplier(const SegmentMetrics& metrics,
+                                  const EncodingCostModel& base,
+                                  uint8_t bitWidth) const = 0;
+
+    // Which SegmentMetrics fields this reorderer cost model reads.
+    virtual MetricFlags requiredMetrics() const = 0;
+};
+
+// BWTReordererCostModel: estimates the benefit of windowed BWT (W=512) as a
+// pre-processing layer before any base encoding.
+class BWTReordererCostModel : public ISubStreamReordererCostModel {
+    static constexpr size_t W = 512;
+public:
+    encodings::encoders::selectors::SubStreamReordererType reordererType() const override {
+        return encodings::encoders::selectors::SubStreamReordererType::BWT512;
+    }
+
+    // BWT permutation overhead: one uint64_t primaryIndex per window.
+    double overheadBits(size_t numValues) const override {
+        return static_cast<double>((numValues / W + 1) * 64);
+    }
+
+    // BWT discount:
+    //   - normalizedCardinality: 0 = all values are the same, 1 = all unique
+    //   - Multiplier approaches 0.5 for very low cardinality (BWT creates long runs
+    //     → significant compression gain over raw entropy coding).
+    //   - Approaches 1.0 for fully random data (BWT provides no benefit).
+    //   - Extra discount for RLE and Dictionary which exploit run structure post-BWT.
+    double costMultiplier(const SegmentMetrics& metrics,
+                          const EncodingCostModel& base,
+                          uint8_t bitWidth) const override {
+        const double maxCard = static_cast<double>(
+            uint64_t{1} << std::min(bitWidth, static_cast<uint8_t>(62)));
+        const double normCard =
+            std::min(metrics.hllEstimatedCardinality, maxCard) / maxCard;
+        // Base multiplier: 0.5 (low card) → 1.0 (high card)
+        double mult = 0.5 + 0.5 * normCard;
+        // Extra discount for encodings whose performance is most amplified by BWT's
+        // context-grouping effect (RLE and Dictionary see longer runs and denser dictionaries)
+        const auto enc = base.encodingType();
+        if (enc == encodings::EncodingType::RunLengthEncoding ||
+            enc == encodings::EncodingType::DictionaryEncoding) {
+            mult *= 0.85;
+        }
+        return mult;
+    }
+
+    MetricFlags requiredMetrics() const override {
+        return static_cast<MetricFlags>(MetricFlag::FreqStats);
     }
 };
 
