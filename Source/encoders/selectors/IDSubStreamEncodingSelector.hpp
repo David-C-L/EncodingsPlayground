@@ -21,6 +21,7 @@
 #include "encoders/selectors/BitRangeSegmentBuilder.hpp"
 #include "encoders/selectors/MetricCollector.hpp"
 #include "encoders/selectors/costs/EncodingCostModel.hpp"
+#include "encoders/selectors/SubStreamReordererType.hpp"
 #include "encoders/BitSplitOrder.hpp" // for BitSplitOrder
 #include "encodings/EncodingType.hpp"
 
@@ -31,12 +32,14 @@ struct SegmentPlan {
 	int bitEnd{0};
 	encodings::EncodingType encoding{encodings::EncodingType::RawEncoding};
 	double cost{0.0};
-
+    SubStreamReordererType reorderer{SubStreamReordererType::None};
 
     std::string toString() const {
         std::ostringstream oss;
-        oss << "[" << bitStart << ".." << bitEnd << "] "
-            << encodings::encodingTypeToString(encoding)
+        oss << "[" << bitStart << ".." << bitEnd << "] ";
+        if (reorderer != SubStreamReordererType::None)
+            oss << subStreamReordererTypeToString(reorderer) << "+";
+        oss << encodings::encodingTypeToString(encoding)
             << " cost=" << std::fixed << std::setprecision(2) << cost;
         return oss.str();
     }
@@ -78,11 +81,24 @@ public:
 	IDSubStreamEncodingSelector() = default;
 	explicit IDSubStreamEncodingSelector(const Config& config) : config_(config) {}
 
+	// Backward-compatible overload (no reorderer models)
 	template <typename SampleT>
 		requires std::is_integral_v<SampleT>
 	Result select(
 		const std::vector<SampleT>& sample,
 		const std::vector<std::unique_ptr<encoders::selectors::costs::EncodingCostModel>>& encodings,
+		std::optional<size_t> fullCount = std::nullopt
+	) const {
+		const std::vector<std::unique_ptr<encoders::selectors::costs::ISubStreamReordererCostModel>> noReorderers;
+		return select(sample, encodings, noReorderers, fullCount);
+	}
+
+	template <typename SampleT>
+		requires std::is_integral_v<SampleT>
+	Result select(
+		const std::vector<SampleT>& sample,
+		const std::vector<std::unique_ptr<encoders::selectors::costs::EncodingCostModel>>& encodings,
+		const std::vector<std::unique_ptr<encoders::selectors::costs::ISubStreamReordererCostModel>>& reordererModels,
 		std::optional<size_t> fullCount = std::nullopt
 	) const {
 		if (sample.empty()) {
@@ -99,6 +115,9 @@ public:
 		MetricFlags requiredFlags = static_cast<MetricFlags>(MetricFlag::None);
 		for (const auto& enc : encodings) {
 			requiredFlags |= enc->requiredMetrics();
+		}
+		for (const auto& rmodel : reordererModels) {
+			requiredFlags |= rmodel->requiredMetrics();
 		}
 
 		BitRangeSegmentBuilder<SampleT, uint64_t> builder(sample);
@@ -176,6 +195,7 @@ public:
 
 					double bestEncodingCost = std::numeric_limits<double>::infinity();
 					encodings::EncodingType bestEncoding = encodings::EncodingType::RawEncoding;
+					SubStreamReordererType bestReorderer = SubStreamReordererType::None;
 					if (config_.verboseLevel >= 2) {
 						std::cout << "  Segment [" << l << ".." << r << "] width=" << bitWidth << " bits" << std::endl;
 					}
@@ -196,11 +216,33 @@ public:
 						if (totalCost < bestEncodingCost) {
 							bestEncodingCost = totalCost;
 							bestEncoding = encoding->encodingType();
+							bestReorderer = SubStreamReordererType::None;
+						}
+						// Evaluate (reorderer × base encoding) combinations
+						for (const auto& rmodel : reordererModels) {
+							const double overhead = rmodel->overheadBits(effectiveCount);
+							const double mult = rmodel->costMultiplier(metrics, *encoding, static_cast<uint8_t>(bitWidth));
+							const double composedCost = perSampleCost * mult
+							                          * static_cast<double>(effectiveCount)
+							                          / static_cast<double>(numValues)
+							                          + overhead;
+							if (config_.verboseLevel >= 2) {
+								std::cout << "    - " << subStreamReordererTypeToString(rmodel->reordererType())
+								          << "+" << encodingNames[encIdx]
+								          << " cost=" << std::fixed << std::setprecision(2) << composedCost
+								          << std::endl;
+							}
+							if (composedCost < bestEncodingCost) {
+								bestEncodingCost = composedCost;
+								bestEncoding = encoding->encodingType();
+								bestReorderer = rmodel->reordererType();
+							}
 						}
 					}
 					if (bestEncodingCost < bestCost[l][r].cost) {
 						bestCost[l][r].cost = bestEncodingCost;
 						bestCost[l][r].encoding = bestEncoding;
+						bestCost[l][r].reorderer = bestReorderer;
 					}
 					if (config_.verboseLevel >= 2 && std::isfinite(bestCost[l][r].cost)) {
 						std::cout << "    -> best=" << encodings::encodingTypeToString(bestCost[l][r].encoding)
@@ -364,6 +406,7 @@ private:
 	struct SegmentChoice {
 		double cost{std::numeric_limits<double>::infinity()};
 		encodings::EncodingType encoding{encodings::EncodingType::RawEncoding};
+		SubStreamReordererType reorderer{SubStreamReordererType::None};
 	};
 
 	// Standard DP reconstruction helper
@@ -437,6 +480,7 @@ private:
 			plan.bitStart = start;
 			plan.bitEnd = idx - 1;
 			plan.encoding = chosen[idx];
+			plan.reorderer = bestCost[start][idx - 1].reorderer;
 			plan.cost = bestCost[start][idx - 1].cost;
 			result.segments.push_back(plan);
 			idx = start;
@@ -496,6 +540,7 @@ private:
 			plan.bitStart = start;
 			plan.bitEnd   = idx - 1;
 			plan.encoding = chosen[idx][k];
+			plan.reorderer = bestCost[start][idx - 1].reorderer;
 			plan.cost     = bestCost[start][idx - 1].cost;
 			result.segments.push_back(plan);
 			idx = start;
@@ -547,6 +592,7 @@ private:
 					seg.bitStart = start;
 					seg.bitEnd = end;
 					seg.encoding = choice.encoding;
+					seg.reorderer = choice.reorderer;
 					seg.cost = choice.cost;
 					best.segments.push_back(seg);
 					best.segments.insert(best.segments.end(), suffix.segments.begin(), suffix.segments.end());
@@ -602,10 +648,11 @@ private:
 					best.cost = total;
 					best.segments.clear();
 					SegmentPlan seg;
-					seg.bitStart = start;
-					seg.bitEnd   = end;
-					seg.encoding = choice.encoding;
-					seg.cost     = choice.cost;
+					seg.bitStart  = start;
+					seg.bitEnd    = end;
+					seg.encoding  = choice.encoding;
+					seg.reorderer = choice.reorderer;
+					seg.cost      = choice.cost;
 					best.segments.push_back(seg);
 					best.segments.insert(best.segments.end(),
 					                     suffix.segments.begin(), suffix.segments.end());
