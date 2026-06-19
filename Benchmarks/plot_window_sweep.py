@@ -92,15 +92,24 @@ AUX_FIELDS = [
 # Reorderer prefixes recognised for the windowed sweep
 WINDOWED_REORDERERS = ["WSort", "BWT"]
 
-# Baselines plotted as horizontal reference lines; key = exact encoderName
-BASELINES = {
-    "AutoSubIntSplit":      "AutoSubIntSplit (no reorder)",
-    "Sort|AutoSubIntSplit": "Sort (full) | AutoSubIntSplit",
+# Baselines plotted as horizontal reference lines.
+# Maps a canonical display label to the set of encoderName strings (across
+# benchmark binary versions) that should be treated as that baseline.
+BASELINE_ALIASES = {
+    "AutoSubIntSplit (no reorder)": (
+        "AutoSubIntSplit", "AutoSubIntSplit (no reorders)"),
+    "Sort (full) | AutoSubIntSplit": (
+        "Sort|AutoSubIntSplit", "Sort|AutoSubIntSplit (no reorders)"),
+}
+_BASELINE_NAME_TO_LABEL = {
+    name: label
+    for label, names in BASELINE_ALIASES.items()
+    for name in names
 }
 
 _COLOURS = plt.rcParams["axes.prop_cycle"].by_key()["color"]
 REORDERER_COLOURS = {r: _COLOURS[i % len(_COLOURS)] for i, r in enumerate(WINDOWED_REORDERERS)}
-BASELINE_COLOURS  = {k: _COLOURS[len(WINDOWED_REORDERERS) + i] for i, k in enumerate(BASELINES)}
+BASELINE_COLOURS  = {k: _COLOURS[len(WINDOWED_REORDERERS) + i] for i, k in enumerate(BASELINE_ALIASES)}
 BASELINE_STYLES   = ["--", "-."]
 
 
@@ -384,15 +393,16 @@ def main():
                     datasets[dataset][prefix][W][mpath] = raw * scale
             continue
 
-        if enc_name in BASELINES:
+        label = _BASELINE_NAME_TO_LABEL.get(enc_name)
+        if label is not None:
             for mpath, _, _, _, scale in METRICS:
                 raw = nested_get(rec, mpath)
                 if isinstance(raw, (int, float)):
-                    baselines[dataset][enc_name][mpath] = raw * scale
+                    baselines[dataset][label][mpath] = raw * scale
             for mpath, scale in AUX_FIELDS:
                 raw = nested_get(rec, mpath)
                 if isinstance(raw, (int, float)):
-                    baselines[dataset][enc_name][mpath] = raw * scale
+                    baselines[dataset][label][mpath] = raw * scale
 
     if not datasets:
         print("No windowed-sweep records found. "
@@ -444,21 +454,21 @@ def main():
                         ax.fill_between(xs, ys_inner_plot, ys,
                                         alpha=0.12, color=colour)
 
-            for bi, (benc, blabel) in enumerate(BASELINES.items()):
-                bdata = baselines.get(dataset, {}).get(benc, {})
+            for bi, label in enumerate(BASELINE_ALIASES):
+                bdata = baselines.get(dataset, {}).get(label, {})
                 bval  = bdata.get(mpath)
                 if bval is not None:
                     ax.axhline(bval, linestyle=BASELINE_STYLES[bi],
-                               color=BASELINE_COLOURS[benc], linewidth=1.5,
-                               label=blabel, alpha=0.8)
+                               color=BASELINE_COLOURS[label], linewidth=1.5,
+                               label=label, alpha=0.8)
                     if decompfn:
                         bval_inner = decompfn(bdata)
                         if bval_inner is not None:
                             ax.axhline(bval_inner, linestyle=BASELINE_STYLES[bi],
-                                       color=BASELINE_COLOURS[benc], linewidth=1.0,
-                                       alpha=0.45, label=f"{blabel} (inner)")
+                                       color=BASELINE_COLOURS[label], linewidth=1.0,
+                                       alpha=0.45, label=f"{label} (inner)")
                             ax.axhspan(bval_inner, bval, alpha=0.06,
-                                       color=BASELINE_COLOURS[benc])
+                                       color=BASELINE_COLOURS[label])
 
             ax.set_xlabel("Window size W", fontsize=9)
             ax.set_ylabel(munits, fontsize=8)
