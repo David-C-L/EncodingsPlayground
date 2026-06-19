@@ -5,7 +5,9 @@
 #include "benchmark/BenchmarkRunner.hpp"
 #include "benchmark/BenchmarkOutput.hpp"
 #include "generators/CommonGenerators.hpp"
+#include "generators/GeneratorUtils.hpp"
 #include "generators/ParquetColumnGenerator.hpp"
+#include "generators/ShuffledGenerator.hpp"
 #include "encoders/RawEncoder.hpp"
 #include "encoders/RawBitPackedEncoder.hpp"
 #include "encoders/RunLengthEncoder.hpp"
@@ -51,7 +53,7 @@ BenchmarkConfig makeConfig(const std::string& tag) {
     cfg.stridedAccessSamples = 10;
     cfg.stride              = 128;
     cfg.rangeQueryCount     = 10;
-    cfg.rangeSizes          = {65536};
+    cfg.rangeSizes          = {8192};
     cfg.validateCorrectness = true;
     cfg.validateRandomAccess = true;
     cfg.verboseOutput       = true;
@@ -66,11 +68,15 @@ BenchmarkConfig makeConfig(const std::string& tag) {
 
 using Codec64 = encodings::Codec<int64_t, uint8_t>;
 
-std::shared_ptr<Codec64> makeAutoSubIntSplit() {
+std::shared_ptr<Codec64> makeAutoSubIntSplit(bool allowReorderers = true) {
     return makeDefaultAutoSubIntSplitEncoder<int64_t>(encoders::BitSplitOrder::LSB_TO_MSB,
                                                        /*extended=*/false,
                                                        /*exclusive=*/false,
-                                                       /*logging=*/false);
+                                                       /*logging=*/false,
+                                                       /*costModelTypes=*/{},
+                                                       /*numSplits=*/-1,
+                                                       /*allowReorderers=*/allowReorderers
+                                                    );
 }
 
 // Reordering codecs: Sort | innerCodec (profiling always on for research)
@@ -126,7 +132,7 @@ std::shared_ptr<Codec64> makeBWT(std::shared_ptr<Codec64> inner,
 template <size_t... Ws, typename AddFn>
 void sweepWindowedSort(AddFn&& add) {
     ((add("WSort" + std::to_string(Ws) + "|AutoSubIntSplit",
-          makeWindowedSort<Ws, /*EnableProfiling=*/true>(makeAutoSubIntSplit()))), ...);
+          makeWindowedSort<Ws, /*EnableProfiling=*/true>(makeAutoSubIntSplit(false)))), ...);
 }
 
 // Registers BWT<W>|AutoSubIntSplit for each W in the pack, with profiling on.
@@ -134,7 +140,7 @@ void sweepWindowedSort(AddFn&& add) {
 template <size_t... Ws, typename AddFn>
 void sweepBWT(AddFn&& add) {
     ((add("BWT" + std::to_string(Ws) + "|AutoSubIntSplit",
-          makeBWT<Ws, /*EnableProfiling=*/true>(makeAutoSubIntSplit()))), ...);
+          makeBWT<Ws, /*EnableProfiling=*/true>(makeAutoSubIntSplit(false)))), ...);
 }
 
 // ---------------------------------------------------------------------------
@@ -142,36 +148,36 @@ void sweepBWT(AddFn&& add) {
 // ---------------------------------------------------------------------------
 
 // Sort with each permutation format — compares space efficiency and decode overhead.
-template <typename AddFn>
-void sweepSortPermFormats(AddFn&& add) {
-    auto makeS = [](PermFormat fmt) {
-        auto r = std::make_shared<SortReorderer<int64_t>>(fmt);
-        return makeReorderingCodec<int64_t, /*EnableProfiling=*/true>(
-            r, makeAutoSubIntSplit(), ReorderingType::Sort,
-            std::string("Sort[") + PermutationStore::formatName(fmt) + "]|AutoSubIntSplit");
-    };
-    add("Sort[FlatBitPacked]|AutoSubIntSplit",    makeS(PermFormat::FlatBitPacked));
-    add("Sort[DeltaBitPacked]|AutoSubIntSplit",   makeS(PermFormat::DeltaBitPacked));
-    add("Sort[DeltaZstd]|AutoSubIntSplit",        makeS(PermFormat::DeltaZstd));
-    add("Sort[DeltaLZ4]|AutoSubIntSplit",         makeS(PermFormat::DeltaLZ4));
-    add("Sort[ValueGrouped]|AutoSubIntSplit",     makeS(PermFormat::ValueGrouped));
-    add("Sort[InverseEliasFano]|AutoSubIntSplit", makeS(PermFormat::InverseEliasFano));
-}
+// template <typename AddFn>
+// void sweepSortPermFormats(AddFn&& add) {
+//     auto makeS = [](PermFormat fmt) {
+//         auto r = std::make_shared<SortReorderer<int64_t>>(fmt);
+//         return makeReorderingCodec<int64_t, /*EnableProfiling=*/true>(
+//             r, makeAutoSubIntSplit(), ReorderingType::Sort,
+//             std::string("Sort[") + PermutationStore::formatName(fmt) + "]|AutoSubIntSplit");
+//     };
+//     add("Sort[FlatBitPacked]|AutoSubIntSplit",    makeS(PermFormat::FlatBitPacked));
+//     add("Sort[DeltaBitPacked]|AutoSubIntSplit",   makeS(PermFormat::DeltaBitPacked));
+//     add("Sort[DeltaZstd]|AutoSubIntSplit",        makeS(PermFormat::DeltaZstd));
+//     add("Sort[DeltaLZ4]|AutoSubIntSplit",         makeS(PermFormat::DeltaLZ4));
+//     add("Sort[ValueGrouped]|AutoSubIntSplit",     makeS(PermFormat::ValueGrouped));
+//     add("Sort[InverseEliasFano]|AutoSubIntSplit", makeS(PermFormat::InverseEliasFano));
+// }
 
-// WindowedSort<W=256> with each chunk permutation format.
-template <typename AddFn>
-void sweepWSort256PermFormats(AddFn&& add) {
-    constexpr size_t W = 256;
-    auto makeW = [](PermFormat fmt) {
-        auto r = std::make_shared<WindowedSortReorderer<int64_t, W>>(fmt);
-        return makeReorderingCodec<int64_t, /*EnableProfiling=*/true>(
-            r, makeAutoSubIntSplit(), ReorderingType::WindowedSort,
-            std::string("WSort256[") + PermutationStore::formatName(fmt) + "]|AutoSubIntSplit");
-    };
-    add("WSort256[ChunkRelative]|AutoSubIntSplit",     makeW(PermFormat::ChunkRelative));
-    add("WSort256[ChunkRelativeZstd]|AutoSubIntSplit", makeW(PermFormat::ChunkRelativeZstd));
-    add("WSort256[ChunkRelativeLZ4]|AutoSubIntSplit",  makeW(PermFormat::ChunkRelativeLZ4));
-}
+// // WindowedSort<W=256> with each chunk permutation format.
+// template <typename AddFn>
+// void sweepWSort256PermFormats(AddFn&& add) {
+//     constexpr size_t W = 256;
+//     auto makeW = [](PermFormat fmt) {
+//         auto r = std::make_shared<WindowedSortReorderer<int64_t, W>>(fmt);
+//         return makeReorderingCodec<int64_t, /*EnableProfiling=*/true>(
+//             r, makeAutoSubIntSplit(), ReorderingType::WindowedSort,
+//             std::string("WSort256[") + PermutationStore::formatName(fmt) + "]|AutoSubIntSplit");
+//     };
+//     add("WSort256[ChunkRelative]|AutoSubIntSplit",     makeW(PermFormat::ChunkRelative));
+//     add("WSort256[ChunkRelativeZstd]|AutoSubIntSplit", makeW(PermFormat::ChunkRelativeZstd));
+//     add("WSort256[ChunkRelativeLZ4]|AutoSubIntSplit",  makeW(PermFormat::ChunkRelativeLZ4));
+// }
 
 } // namespace
 
@@ -187,10 +193,20 @@ int main() {
     // ------------------------------------------------------------------
 
     std::vector<std::pair<std::string, std::shared_ptr<encodings::datagen::DataGenerator<int64_t>>>> datasets;
-    std::string columnNameTweets = "tweet_id";
-    std::filesystem::path dataDirTweets = "/home/david/Documents/PhD/symbol-store/EncodingsPlayground/Datasets/TwitterSnowflake/tweet_ids.parquet";
-    datasets.emplace_back("Twitter Snowflake IDs",
-        std::make_shared<ParquetColumnGenerator<int64_t>>(dataDirTweets, columnNameTweets));
+    // std::string columnNameTweets = "tweet_id";
+    // std::filesystem::path dataDirTweets = "/home/david/Documents/PhD/symbol-store/EncodingsPlayground/Datasets/TwitterSnowflake/tweet_ids.parquet";
+    // datasets.emplace_back("Twitter Snowflake IDs",
+    //     std::make_shared<ParquetColumnGenerator<int64_t>>(dataDirTweets, columnNameTweets));
+    // datasets.emplace_back("Twitter Snowflake IDs (shuffled)",
+    //     std::make_shared<ShuffledGenerator<int64_t>>(
+    //         std::make_shared<ParquetColumnGenerator<int64_t>>(dataDirTweets, columnNameTweets)));
+    std::string columnNameActions = "actions";
+    std::filesystem::path dataDirActions = "/home/david/Documents/PhD/symbol-store/MetaNimbleProject/EncodingsPlayground/Datasets/replay_data/pong_actions.parquet";
+    datasets.emplace_back("Actions IDs",
+        std::make_shared<ParquetColumnGenerator<int64_t>>(dataDirActions, columnNameActions));
+    datasets.emplace_back("Actions IDs (shuffled)",
+        std::make_shared<ShuffledGenerator<int64_t>>(
+            std::make_shared<ParquetColumnGenerator<int64_t>>(dataDirActions, columnNameActions)));
     // datasets.emplace_back("Uniform",
     //     std::make_shared<UniformRandomGenerator<int64_t>>(0, 1'000'000));
     // datasets.emplace_back("Zipfian1k",
@@ -200,6 +216,58 @@ int main() {
     // datasets.emplace_back("NearlySorted",
     //     std::make_shared<NearlySortedGenerator<int64_t>>(0, 1, 0.05));
 
+    BenchmarkConfig cfg = makeConfig("all_with_shuffle_actions");
+    std::filesystem::create_directories(cfg.outputPath);
+
+    // ------------------------------------------------------------------
+    // Sortedness metrics (computed once per dataset, independent of encoder)
+    // ------------------------------------------------------------------
+
+    std::cout << "Computing sortedness metrics for " << datasets.size() << " dataset(s)...\n";
+
+    std::vector<std::pair<std::string, SortednessMetrics>> sortednessMetrics;
+    constexpr size_t kSortednessSampleSize = 2'000'000;
+    for (const auto& [name, gen] : datasets) {
+        gen->reset();
+        auto sample = gen->generate(std::min(kSortednessSampleSize, cfg.dataSizes.front()));
+        sortednessMetrics.emplace_back(name, computeSortednessMetrics(sample, name));
+        gen->reset();
+    }
+
+    const std::string sortednessJsonPath = cfg.outputPath + "/sortedness_metrics.json";
+    writeSortednessMetricsJSON(sortednessMetrics, sortednessJsonPath);
+    std::cout << "Sortedness metrics saved: " << sortednessJsonPath << "\n\n";
+
+    std::cout << "--- Sortedness metrics ---\n";
+    std::cout << std::left
+              << std::setw(28) << "Dataset"
+              << std::setw(10) << "Lag1AC"
+              << std::setw(10) << "S_RLE"
+              << std::setw(10) << "InvNorm"
+              << std::setw(10) << "ApEn"
+              << std::setw(12) << "Cardinality"
+              << std::setw(10) << "Skew"
+              << std::setw(10) << "MI"
+              << std::setw(10) << "ZstdDelta"
+              << '\n'
+              << std::string(110, '-') << '\n';
+    for (const auto& [name, m] : sortednessMetrics) {
+        std::cout << std::left
+                  << std::setw(28) << name.substr(0, 27)
+                  << std::setw(10) << std::fixed << std::setprecision(3) << m.lag1Autocorrelation
+                  << std::setw(10) << m.runLengthEntropyNormalized
+                  << std::setw(10) << m.normalizedInversions
+                  << std::setw(10) << m.approximateEntropy
+                  << std::setw(12) << m.cardinality
+                  << std::setw(10) << m.skewness
+                  << std::setw(10) << m.mutualInformationAdjacent
+                  << std::setw(10);
+        if (m.compressionAvailable) std::cout << m.compressionRatioDelta;
+        else std::cout << "n/a";
+        std::cout << '\n';
+    }
+    std::cout << '\n';
+
     // ------------------------------------------------------------------
     // Inner codecs (used both standalone and as the inner layer of reorderers)
     // ------------------------------------------------------------------
@@ -207,7 +275,8 @@ int main() {
     auto raw = std::make_shared<RawEncoder<int64_t>>();
     auto rawBitPacked  = std::make_shared<RawBitPackedEncoder<int64_t>>();
     auto rle           = std::make_shared<RunLengthEncoder<int64_t>>();
-    auto autoSubInt    = makeAutoSubIntSplit();
+    // auto autoSubInt    = makeAutoSubIntSplit();
+    auto autoSubIntNoReorders    = makeAutoSubIntSplit(false);
     // auto lz4           = std::make_shared<LZ4Encoder<int64_t>>();
     // auto zstd          = std::make_shared<ZstdEncoder<int64_t>>();
     auto bitShuffle    = std::make_shared<BitShuffleCodec<int64_t>>(nullptr);
@@ -226,7 +295,8 @@ int main() {
     add("Raw",                     raw);
     add("RawBitPacked",            rawBitPacked);
     // add("RLE",                     rle);
-    add("AutoSubIntSplit",         autoSubInt);
+    // add("AutoSubIntSplit",         autoSubInt);
+    add("AutoSubIntSplit (no reorders)", autoSubIntNoReorders);
     // add("LZ4",                     lz4);
     // add("Zstd",                    zstd);
     add("BitShuffle",              bitShuffle);
@@ -234,7 +304,8 @@ int main() {
     // Sort + inner codec
     // add("Sort|RawBitPacked",       makeSort(rawBitPacked));
     // add("Sort|RLE",                makeSort(rle));
-    add("Sort|AutoSubIntSplit",    makeSort(makeAutoSubIntSplit()));
+    // add("Sort|AutoSubIntSplit",    makeSort(makeAutoSubIntSplit()));
+    add("Sort|AutoSubIntSplit (no reorders)",    makeSort(makeAutoSubIntSplit(false)));
     // add("Sort|LZ4",                makeSort(lz4));
 
     // GrayCode + inner codec
@@ -250,15 +321,12 @@ int main() {
     sweepBWT<32, 128, 512, 4096, 16384>(add);
 
     // Permutation format sweeps (fixed reorderer, vary PermFormat)
-    sweepSortPermFormats(add);
-    sweepWSort256PermFormats(add);
+    // sweepSortPermFormats(add);
+    // sweepWSort256PermFormats(add);
 
     // ------------------------------------------------------------------
     // Run benchmark
     // ------------------------------------------------------------------
-
-    BenchmarkConfig cfg = makeConfig("all");
-    std::filesystem::create_directories(cfg.outputPath);
 
     BenchmarkRunner<int64_t> runner(cfg);
     for (const auto& [name, enc] : encoders)
