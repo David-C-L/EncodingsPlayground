@@ -27,6 +27,8 @@
 #include "encoders/SubIntEncodingUtils.hpp"
 #include "encoders/selectors/IDSubStreamEncodingSelector.hpp"
 #include "encoders/selectors/costs/EncodingCostModel.hpp"
+#include "encoders/selectors/costs/SpeedCostModel.hpp"
+#include "encoders/selectors/costs/CostModelSet.hpp"
 #include "generators/samplers/StreamSampling.hpp"
 
 using encodings::encoders::selectors::costs::RawCostModel;
@@ -40,6 +42,13 @@ using encodings::encoders::selectors::costs::HuffmanCostModel;
 using encodings::encoders::selectors::costs::LZ4CostModel;
 using encodings::encoders::selectors::costs::FSECostModel;
 using encodings::encoders::selectors::costs::FrequencyPartitionCostModel;
+using encodings::encoders::selectors::costs::EncodeSpeedCostModel;
+using encodings::encoders::selectors::costs::DecodeAllSpeedCostModel;
+using encodings::encoders::selectors::costs::DecodeAtSpeedCostModel;
+using encodings::encoders::selectors::costs::DecodeRangeSpeedCostModel;
+using encodings::encoders::selectors::costs::WeightedCompositeEncodingCostModel;
+using encodings::encoders::selectors::costs::CostModelSet;
+using encodings::encoders::selectors::costs::CostModelDimension;
 
 namespace encodings::encoders {
 
@@ -1301,6 +1310,42 @@ inline typename SubIntSplitAutoEncoder<T>::Config makeDefaultAutoSubIntSplitConf
     return cfg;
 }
 
+// CostModelSet overload: accepts a fully configured CostModelSet instead of
+// a bare list of encoding types.  Allows callers to compose cost dimensions:
+//
+//   auto cfg = makeDefaultAutoSubIntSplitConfig<int64_t>(
+//       BitSplitOrder::LSB_TO_MSB,
+//       CostModelSet{}.add(CostModelDimension::Compression)
+//                     .add(CostModelDimension::DecodeAtSpeed, 2.0));
+template <typename T>
+inline typename SubIntSplitAutoEncoder<T>::Config makeDefaultAutoSubIntSplitConfig(
+    BitSplitOrder order,
+    selectors::costs::CostModelSet costModelSet,
+    int numSplits = -1,
+    bool allowReorderers = true,
+    bool enableSelectionTiming = false)
+{
+    typename SubIntSplitAutoEncoder<T>::Config cfg;
+    cfg.selectorConfig = selectors::IDSubStreamEncodingSelector::Config{};
+    cfg.selectorConfig.verboseLevel = 1;
+    cfg.selectorConfig.minSegmentWidth = 1;
+    cfg.selectorConfig.splitPenalty = 10.0;
+    cfg.selectorConfig.enableMergePhase = false;
+    cfg.samplerConfig.maxSamples = 10'000;
+    cfg.samplerConfig.stride = 0;
+    cfg.samplerConfig.blockSize = 128;
+    cfg.samplerConfig.maxPercentage = 0;
+    cfg.debugLogging = false;
+    cfg.enableSelectionTiming = enableSelectionTiming;
+    cfg.orderHint = order;
+    if (numSplits > 0)
+        cfg.selectorConfig.forcedNumSegments = numSplits;
+    cfg.costModels = costModelSet.build();
+    if (allowReorderers)
+        cfg.reordererModels.push_back(std::make_unique<selectors::costs::BWTReordererCostModel>());
+    return cfg;
+}
+
 template <typename T>
 inline std::shared_ptr<SubIntSplitAutoEncoder<T>> makeDefaultAutoSubIntSplitEncoder(BitSplitOrder order = BitSplitOrder::LSB_TO_MSB,
                                                                                    bool exhaustiveSearch = false,
@@ -1314,6 +1359,23 @@ inline std::shared_ptr<SubIntSplitAutoEncoder<T>> makeDefaultAutoSubIntSplitEnco
     cfg.selectorConfig.useExhaustiveSearch = exhaustiveSearch;
     cfg.selectorConfig.enablePrune = enablePrune;
     cfg.selectorConfig.costGridCsvPath = "../Source/encoders/auto_subintsplit_cost_grid_twitter_snowflake_64.csv"; // for debugging/analysis; selector will log evaluated candidates and their costs
+    return makeAutoSubIntSplitEncoder<T>(std::move(cfg));
+}
+
+template <typename T>
+inline std::shared_ptr<SubIntSplitAutoEncoder<T>> makeDefaultAutoSubIntSplitEncoder(
+    BitSplitOrder order,
+    selectors::costs::CostModelSet costModelSet,
+    bool exhaustiveSearch = false,
+    bool enablePrune = true,
+    int numSplits = -1,
+    bool allowReorderers = true,
+    bool enableSelectionTiming = false) {
+    auto cfg = makeDefaultAutoSubIntSplitConfig<T>(order, std::move(costModelSet), numSplits, allowReorderers, enableSelectionTiming);
+    cfg.selectorConfig.orderHint          = order;
+    cfg.selectorConfig.useExhaustiveSearch = exhaustiveSearch;
+    cfg.selectorConfig.enablePrune         = enablePrune;
+    cfg.selectorConfig.costGridCsvPath     = "../Source/encoders/auto_subintsplit_cost_grid_twitter_snowflake_64.csv";
     return makeAutoSubIntSplitEncoder<T>(std::move(cfg));
 }
 
@@ -1352,6 +1414,23 @@ inline std::shared_ptr<SubIntSplitAutoEncoderProf<T>> makeDefaultAutoSubIntSplit
     return makeAutoSubIntSplitEncoderProf<T>(std::move(cfg));
 }
 
+template <typename T>
+inline std::shared_ptr<SubIntSplitAutoEncoderProf<T>> makeDefaultAutoSubIntSplitEncoderProf(
+    BitSplitOrder order,
+    selectors::costs::CostModelSet costModelSet,
+    bool exhaustiveSearch = false,
+    bool enablePrune = true,
+    int numSplits = -1,
+    bool allowReorderers = true,
+    bool enableSelectionTiming = false) {
+    auto cfg = makeDefaultAutoSubIntSplitConfig<T>(order, std::move(costModelSet), numSplits, allowReorderers, enableSelectionTiming);
+    cfg.selectorConfig.orderHint          = order;
+    cfg.selectorConfig.useExhaustiveSearch = exhaustiveSearch;
+    cfg.selectorConfig.enablePrune         = enablePrune;
+    cfg.selectorConfig.costGridCsvPath     = "../Source/encoders/auto_subintsplit_cost_grid_twitter_snowflake_64.csv";
+    return makeAutoSubIntSplitEncoderProf<T>(std::move(cfg));
+}
+
 // int64_t convenience overloads
 inline std::shared_ptr<SubIntSplitAutoEncoder64Prof> makeAutoSubIntSplitEncoderProf(
     SubIntSplitAutoEncoder64Prof::Config cfg) {
@@ -1369,6 +1448,18 @@ inline std::shared_ptr<SubIntSplitAutoEncoder64Prof> makeDefaultAutoSubIntSplitE
         order, exhaustiveSearch, enablePrune, enableSelectionTiming, std::move(costModelTypes), numSplits);
 }
 
+inline std::shared_ptr<SubIntSplitAutoEncoder64Prof> makeDefaultAutoSubIntSplitEncoderProf(
+    BitSplitOrder order,
+    selectors::costs::CostModelSet costModelSet,
+    bool exhaustiveSearch = false,
+    bool enablePrune = true,
+    int numSplits = -1,
+    bool allowReorderers = true,
+    bool enableSelectionTiming = false) {
+    return makeDefaultAutoSubIntSplitEncoderProf<int64_t>(
+        order, std::move(costModelSet), exhaustiveSearch, enablePrune, numSplits, allowReorderers, enableSelectionTiming);
+}
+
 // ---------------------------------------------------------------------------
 // Non-profiling int64_t convenience overloads (unchanged)
 // ---------------------------------------------------------------------------
@@ -1383,12 +1474,33 @@ inline SubIntSplitAutoEncoder64::Config makeDefaultAutoSubIntSplitConfig(BitSpli
     return makeDefaultAutoSubIntSplitConfig<int64_t>(order, enableSelectionTiming, std::move(costModelTypes));
 }
 
+inline SubIntSplitAutoEncoder64::Config makeDefaultAutoSubIntSplitConfig(
+    BitSplitOrder order,
+    selectors::costs::CostModelSet costModelSet,
+    int numSplits = -1,
+    bool allowReorderers = true,
+    bool enableSelectionTiming = false) {
+    return makeDefaultAutoSubIntSplitConfig<int64_t>(order, std::move(costModelSet), numSplits, allowReorderers, enableSelectionTiming);
+}
+
 inline std::shared_ptr<SubIntSplitAutoEncoder64> makeDefaultAutoSubIntSplitEncoder(BitSplitOrder order = BitSplitOrder::LSB_TO_MSB,
                                                                                    bool exhaustiveSearch = false,
                                                                                    bool enablePrune = true,
                                                                                    bool enableSelectionTiming = false,
                                                                                    std::vector<encodings::EncodingType> costModelTypes = {}) {
     return makeDefaultAutoSubIntSplitEncoder<int64_t>(order, exhaustiveSearch, enablePrune, enableSelectionTiming, std::move(costModelTypes));
+}
+
+inline std::shared_ptr<SubIntSplitAutoEncoder64> makeDefaultAutoSubIntSplitEncoder(
+    BitSplitOrder order,
+    selectors::costs::CostModelSet costModelSet,
+    bool exhaustiveSearch = false,
+    bool enablePrune = true,
+    int numSplits = -1,
+    bool allowReorderers = true,
+    bool enableSelectionTiming = false) {
+    return makeDefaultAutoSubIntSplitEncoder<int64_t>(
+        order, std::move(costModelSet), exhaustiveSearch, enablePrune, numSplits, allowReorderers, enableSelectionTiming);
 }
 
 } // namespace encodings::encoders
