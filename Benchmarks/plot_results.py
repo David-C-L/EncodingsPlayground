@@ -42,6 +42,7 @@ class GroupRule:
 
 def _default_group_rules() -> List[GroupRule]:
     autosubintsplit_re = re.compile(r'^AutoSubIntSplit(?P<num>\d+)$')
+    autosis_re = re.compile(r'^AutoSIS(?P<num>\d+)?$')
     openzl_re = re.compile(r'^OpenZL(?P<num>\d+)?$')
     subint_re = re.compile(r'^(?P<prefix>.*)SubInt(?P<num>\d+)?$')
     varint_re = re.compile(r'.*VarInt$')
@@ -59,12 +60,20 @@ def _default_group_rules() -> List[GroupRule]:
 
     def varint_key(name: str) -> tuple:
         return (0 if name == 'VarInt' else 1, name)
-
+    
     def autosubintsplit_key(name: str) -> tuple:
-        match = autosubintsplit_re.match(name)
-        num = int(match.group('num')) if match else -1
-        exact_first = 0 if match else 1
-        return (num, exact_first, name)
+        # AutoSIS entries sort after AutoSubIntSplit entries (group_order=1 vs 0)
+        asis_match = autosis_re.match(name)
+        asplit_match = autosubintsplit_re.match(name)
+
+        if asplit_match:
+            num = int(asplit_match.group('num')) if asplit_match.group('num') else -1
+            return (0, num, name)
+        elif asis_match:
+            num = int(asis_match.group('num')) if asis_match.group('num') else -1
+            return (1, num, name)
+        else:
+            return (2, -1, name)
 
     def subint_key(name: str) -> tuple:
         match = subint_re.match(name)
@@ -91,7 +100,7 @@ def _default_group_rules() -> List[GroupRule]:
     return [
         GroupRule(
             name='AutoSubIntSplit',
-            predicate=lambda n: n.startswith('AutoSubIntSplit'),
+            predicate=lambda n: n.startswith('AutoSubIntSplit') or n.startswith('AutoSIS'),
             sort_key=autosubintsplit_key
         ),
         GroupRule(
@@ -101,7 +110,7 @@ def _default_group_rules() -> List[GroupRule]:
         ),
         GroupRule(
             name='SubInt',
-            predicate=lambda n: ('SubInt' in n) and (not n.startswith('AutoSubIntSplit')),
+            predicate=lambda n: ('SubInt' in n) and (not n.startswith('AutoSubIntSplit')) and (not n.startswith('AutoSIS')),
             sort_key=subint_key
         ),
         GroupRule(
