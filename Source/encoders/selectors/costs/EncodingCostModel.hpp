@@ -11,6 +11,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <memory>
 
 namespace encodings::encoders::selectors::costs {
 
@@ -32,6 +33,14 @@ inline constexpr uint8_t storageWidthBits(uint8_t bitWidth) {
 using encodings::encoders::selectors::MetricFlag;
 using encodings::encoders::selectors::MetricFlags;
 
+enum class CostModelDimension {
+    Compression,      // bits (compressed size)
+    EncodeSpeed,      // ns (total encode time)
+    DecodeAllSpeed,   // ns (total sequential decode time)
+    DecodeAtSpeed,    // ns (total cost for N uniform random accesses)
+    DecodeRangeSpeed, // ns (total cost for N-element range decode with seek)
+};
+
 class EncodingCostModel {
 public:
 	EncodingCostModel() = default;
@@ -46,6 +55,11 @@ public:
 	// IDSubStreamEncodingSelector unions these across all registered models and
 	// passes the result to MetricCollector::compute() to skip unused work.
 	virtual MetricFlags requiredMetrics() const = 0;
+
+    // Which cost dimension this model measures (default: Compression).
+    virtual CostModelDimension costModelDimension() const {
+        return CostModelDimension::Compression;
+    }
 };
 
 namespace detail {
@@ -746,5 +760,40 @@ public:
         return static_cast<MetricFlags>(MetricFlag::FreqStats);
     }
 };
+
+// ---------------------------------------------------------------------------
+// Single-encoding compression model factory
+// ---------------------------------------------------------------------------
+// Creates the appropriate compression cost model for a given encoding type.
+// Returns nullptr for unsupported types so callers can skip them gracefully.
+inline std::unique_ptr<EncodingCostModel>
+makeCompressionCostModel(encodings::EncodingType type) {
+    switch (type) {
+        case encodings::EncodingType::RawEncoding:
+            return std::make_unique<RawCostModel>();
+        case encodings::EncodingType::BitPacking:
+            return std::make_unique<RawBitPackedCostModel>();
+        case encodings::EncodingType::RunLengthEncoding:
+            return std::make_unique<RLECostModel>();
+        case encodings::EncodingType::FrameOfReference:
+            return std::make_unique<FORCostModel>();
+        case encodings::EncodingType::AdaptiveFrameOfReference:
+            return std::make_unique<AdaptiveFORCostModel>();
+        case encodings::EncodingType::AdaptiveFramedBitPrefix:
+            return std::make_unique<AdaptiveFramedBitPrefixCostModel>();
+        case encodings::EncodingType::DictionaryEncoding:
+            return std::make_unique<DictionaryCostModel>();
+        case encodings::EncodingType::HuffmanEncoding:
+            return std::make_unique<HuffmanCostModel>();
+        case encodings::EncodingType::LZ4:
+            return std::make_unique<LZ4CostModel>();
+        case encodings::EncodingType::FSEEncoding:
+            return std::make_unique<FSECostModel>();
+        case encodings::EncodingType::FrequencyPartitionEncoding:
+            return std::make_unique<FrequencyPartitionCostModel>();
+        default:
+            return nullptr;
+    }
+}
 
 } // namespace encodings::encoders::selectors::costs
