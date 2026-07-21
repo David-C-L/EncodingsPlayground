@@ -1,0 +1,146 @@
+# Unit test executables
+
+# Add tests to CTest
+add_test(NAME test_delta_rle COMMAND test_delta_rle)
+add_test(NAME test_varint_encoder COMMAND test_varint_encoder)
+add_test(NAME test_delta_varint_encoder COMMAND test_delta_varint_encoder)
+add_test(NAME test_adaptive_framed_bit_prefix_encoder COMMAND test_adaptive_framed_bit_prefix_encoder)
+add_test(NAME test_mainly_constant_encoder COMMAND test_mainly_constant_encoder)
+add_test(NAME test_bit_parentheses COMMAND test_bit_parentheses)
+add_test(NAME test_tpch_partkey COMMAND test_tpch_partkey)
+add_test(NAME test_spherical_encoder COMMAND test_spherical_encoder)
+add_test(NAME test_vector_generators COMMAND test_vector_generators)
+add_test(NAME test_bitset COMMAND test_bitset)
+add_test(NAME test_subint_encoder COMMAND test_subint_encoder)
+add_test(NAME test_fse_encoder COMMAND test_fse_encoder)
+add_test(NAME test_frequency_partition_encoder COMMAND test_frequency_partition_encoder)
+add_test(NAME test_subint_split_encoder COMMAND test_subint_split_encoder)
+add_test(NAME test_range_pack_encoder COMMAND test_range_pack_encoder)
+add_test(NAME test_delta_prepass_encoder COMMAND test_delta_prepass_encoder)
+add_test(NAME test_cascading_for_encoder COMMAND test_cascading_for_encoder)
+add_test(NAME test_run_length_encoder COMMAND test_run_length_encoder)
+add_test(NAME test_prev_reference_policy COMMAND test_prev_reference_policy)
+
+# Simple test for DeltaRunLengthEncoder
+add_executable(test_delta_rle test_delta_rle.cpp)
+target_include_directories(test_delta_rle PRIVATE ${CMAKE_SOURCE_DIR}/Source)
+target_link_libraries(test_delta_rle PRIVATE encodings_core encodings_encodings encodings_encoders encodings_benchmark)
+set_target_properties(test_delta_rle PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+# Test for VarIntEncoder (incl. decodeGatherInto)
+add_executable(test_varint_encoder test_varint_encoder.cpp)
+target_include_directories(test_varint_encoder PRIVATE ${CMAKE_SOURCE_DIR}/Source)
+target_link_libraries(test_varint_encoder PRIVATE encodings_core encodings_encodings encodings_encoders encodings_benchmark)
+set_target_properties(test_varint_encoder PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+# Test for DeltaVarIntEncoder (incl. decodeGatherInto)
+add_executable(test_delta_varint_encoder test_delta_varint_encoder.cpp)
+target_include_directories(test_delta_varint_encoder PRIVATE ${CMAKE_SOURCE_DIR}/Source)
+target_link_libraries(test_delta_varint_encoder PRIVATE encodings_core encodings_encodings encodings_encoders encodings_benchmark)
+set_target_properties(test_delta_varint_encoder PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+# Test for AdaptiveFramedBitPrefixEncoder (incl. decodeGatherInto)
+add_executable(test_adaptive_framed_bit_prefix_encoder test_adaptive_framed_bit_prefix_encoder.cpp)
+target_include_directories(test_adaptive_framed_bit_prefix_encoder PRIVATE ${CMAKE_SOURCE_DIR}/Source)
+target_link_libraries(test_adaptive_framed_bit_prefix_encoder PRIVATE encodings_core encodings_encodings encodings_encoders encodings_benchmark)
+set_target_properties(test_adaptive_framed_bit_prefix_encoder PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+# Test for MainlyConstantEncoder (incl. decodeGatherInto, raw + recursive)
+add_executable(test_mainly_constant_encoder test_mainly_constant_encoder.cpp)
+target_include_directories(test_mainly_constant_encoder PRIVATE ${CMAKE_SOURCE_DIR}/Source)
+target_link_libraries(test_mainly_constant_encoder PRIVATE encodings_core encodings_encodings encodings_encoders encodings_benchmark)
+set_target_properties(test_mainly_constant_encoder PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+# Test for BitParenthesesEncoder
+add_executable(test_bit_parentheses test_bit_parentheses.cpp)
+target_include_directories(test_bit_parentheses PRIVATE ${CMAKE_SOURCE_DIR}/Source)
+target_link_libraries(test_bit_parentheses PRIVATE encodings_core encodings_encodings encodings_encoders)
+set_target_properties(test_bit_parentheses PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+# Test for TPC-H Lineitem PartKey Generator
+add_executable(test_tpch_partkey test_tpch_partkey.cpp)
+target_include_directories(test_tpch_partkey PRIVATE ${CMAKE_SOURCE_DIR}/Source)
+target_link_libraries(test_tpch_partkey PRIVATE encodings_core encodings_generators)
+set_target_properties(test_tpch_partkey PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+# Test for SphericalEncoder
+add_executable(test_spherical_encoder test_spherical_encoder.cpp)
+target_include_directories(test_spherical_encoder PRIVATE ${CMAKE_SOURCE_DIR}/Source)
+target_link_libraries(test_spherical_encoder PRIVATE encodings_core encodings_encodings encodings_encoders)
+set_target_properties(test_spherical_encoder PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+# Test for Vector Generators
+add_executable(test_vector_generators test_vector_generators.cpp)
+target_include_directories(test_vector_generators PRIVATE ${CMAKE_SOURCE_DIR}/Source)
+target_link_libraries(test_vector_generators PRIVATE encodings_core encodings_encodings encodings_encoders encodings_generators)
+set_target_properties(test_vector_generators PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+# Test for FastBitset
+add_executable(test_bitset test_bitset.cpp)
+target_include_directories(test_bitset PRIVATE ${CMAKE_SOURCE_DIR}/Source)
+target_link_libraries(test_bitset PRIVATE encodings_core encodings_encodings encodings_encoders)
+set_target_properties(test_bitset PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+# Tests for SubIntEncoder (int32 + int64)
+add_executable(test_subint_encoder test_subint_encoder.cpp)
+target_include_directories(test_subint_encoder PRIVATE ${CMAKE_SOURCE_DIR}/Source)
+target_link_libraries(test_subint_encoder PRIVATE encodings_core encodings_encodings encodings_encoders encodings_generators)
+set_target_properties(test_subint_encoder PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+# Debug build variant with SUBINT_DEBUG=1
+add_executable(test_subint_encoder_dbg test_subint_encoder.cpp)
+target_compile_definitions(test_subint_encoder_dbg PRIVATE SUBINT_DEBUG=1)
+target_include_directories(test_subint_encoder_dbg PRIVATE ${CMAKE_SOURCE_DIR}/Source)
+target_link_libraries(test_subint_encoder_dbg PRIVATE encodings_core encodings_encodings encodings_encoders encodings_generators)
+set_target_properties(test_subint_encoder_dbg PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+# Tests for FSEEncoder and SubIntSplit FSE integration
+add_executable(test_fse_encoder test_fse_encoder.cpp)
+target_include_directories(test_fse_encoder PRIVATE ${CMAKE_SOURCE_DIR}/Source)
+target_link_libraries(test_fse_encoder PRIVATE encodings_core encodings_encodings encodings_encoders encodings_generators)
+set_target_properties(test_fse_encoder PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+# Tests for FrequencyPartitionEncoder (bitmap/tag index modes)
+add_executable(test_frequency_partition_encoder test_frequency_partition_encoder.cpp)
+target_include_directories(test_frequency_partition_encoder PRIVATE ${CMAKE_SOURCE_DIR}/Source)
+target_link_libraries(test_frequency_partition_encoder PRIVATE encodings_core encodings_encodings encodings_encoders encodings_generators)
+set_target_properties(test_frequency_partition_encoder PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+add_executable(test_subint_split_encoder test_subint_split_encoder.cpp)
+target_include_directories(test_subint_split_encoder PRIVATE ${CMAKE_SOURCE_DIR}/Source)
+target_link_libraries(test_subint_split_encoder PRIVATE encodings_core encodings_encodings encodings_encoders encodings_generators)
+set_target_properties(test_subint_split_encoder PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+add_executable(test_block_for_fpe_encoder test_block_for_fpe_encoder.cpp)
+target_include_directories(test_block_for_fpe_encoder PRIVATE ${CMAKE_SOURCE_DIR}/Source)
+target_link_libraries(test_block_for_fpe_encoder PRIVATE encodings_core encodings_encodings encodings_encoders)
+set_target_properties(test_block_for_fpe_encoder PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+add_executable(test_range_pack_encoder test_range_pack_encoder.cpp)
+target_include_directories(test_range_pack_encoder PRIVATE ${CMAKE_SOURCE_DIR}/Source)
+target_link_libraries(test_range_pack_encoder PRIVATE encodings_core encodings_encodings encodings_encoders)
+set_target_properties(test_range_pack_encoder PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+add_executable(test_cascading_for_encoder test_cascading_for_encoder.cpp)
+target_include_directories(test_cascading_for_encoder PRIVATE ${CMAKE_SOURCE_DIR}/Source)
+target_link_libraries(test_cascading_for_encoder PRIVATE encodings_core encodings_encodings encodings_encoders)
+set_target_properties(test_cascading_for_encoder PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+add_executable(test_prev_reference_policy test_prev_reference_policy.cpp)
+target_include_directories(test_prev_reference_policy PRIVATE ${CMAKE_SOURCE_DIR}/Source)
+target_link_libraries(test_prev_reference_policy PRIVATE encodings_core encodings_encodings encodings_encoders)
+set_target_properties(test_prev_reference_policy PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+add_executable(test_run_length_encoder test_run_length_encoder.cpp)
+target_include_directories(test_run_length_encoder PRIVATE ${CMAKE_SOURCE_DIR}/Source)
+target_link_libraries(test_run_length_encoder PRIVATE encodings_core encodings_encodings encodings_encoders)
+set_target_properties(test_run_length_encoder PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+add_executable(test_block_frequency_partition_encoder test_block_frequency_partition_encoder.cpp)
+target_include_directories(test_block_frequency_partition_encoder PRIVATE ${CMAKE_SOURCE_DIR}/Source)
+target_link_libraries(test_block_frequency_partition_encoder PRIVATE encodings_core encodings_encodings encodings_encoders)
+set_target_properties(test_block_frequency_partition_encoder PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+add_executable(test_delta_prepass_encoder test_delta_prepass_encoder.cpp)
+target_include_directories(test_delta_prepass_encoder PRIVATE ${CMAKE_SOURCE_DIR}/Source)
+target_link_libraries(test_delta_prepass_encoder PRIVATE encodings_core encodings_encodings encodings_encoders encodings_reorderers)
+set_target_properties(test_delta_prepass_encoder PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
