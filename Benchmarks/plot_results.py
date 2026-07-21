@@ -9,6 +9,7 @@ to a linear scale with a warning.
 """
 
 import json
+import math
 import colorsys
 import re
 from dataclasses import dataclass
@@ -19,6 +20,7 @@ import matplotlib.ticker as ticker
 import matplotlib.cm as cm
 import matplotlib.lines as mlines
 import matplotlib.patches as mpatches
+import matplotlib.colors as mcolors
 import numpy as np
 from pathlib import Path
 import argparse
@@ -378,8 +380,7 @@ def plot_autosubintsplit_forced_split_sweep(results, output_dir, colours, source
 
         plt.tight_layout(rect=[0, 0, 1, 0.95])
         fname = output_dir / f'autosubintsplit_forced_split_sweep_{dataset.replace(" ", "_")}.png'
-        plt.savefig(fname, dpi=150, bbox_inches='tight')
-        print(f"Saved: {fname}")
+        _save_fig(fname, dpi=150, bbox_inches='tight')
         plt.close(fig)
 
 
@@ -476,22 +477,21 @@ def _hbar(ax, encoders, values, colours, unit='', fmt='.3g', log=True):
 
 
 def _lighten_color(color, amount=0.35):
-    r, g, b = color
+    r, g, b = mcolors.to_rgb(color)
     h, l, s = colorsys.rgb_to_hls(r, g, b)
     l = min(1.0, l + (1.0 - l) * amount)
     return colorsys.hls_to_rgb(h, l, s)
 
 
 def _darken_color(color, amount=0.25):
-    r, g, b = color
+    r, g, b = mcolors.to_rgb(color)
     h, l, s = colorsys.rgb_to_hls(r, g, b)
     l = max(0.0, l * (1.0 - amount))
     return colorsys.hls_to_rgb(h, l, s)
 
 
 def _is_light_color(color) -> bool:
-    r, g, b = color
-    # Relative luminance
+    r, g, b = mcolors.to_rgb(color)
     luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b
     return luminance > 0.6
 
@@ -499,6 +499,15 @@ def _is_light_color(color) -> bool:
 # ---------------------------------------------------------------------------
 # Individual plot functions
 # ---------------------------------------------------------------------------
+
+def _save_fig(fname: Path, dpi: int = 150, **kwargs):
+    """Save the current figure as both PNG and PDF, then print confirmation."""
+    plt.savefig(fname, dpi=dpi, **kwargs)
+    print(f"Saved: {fname}")
+    pdf_fname = fname.with_suffix('.pdf')
+    plt.savefig(pdf_fname, **kwargs)
+    print(f"Saved: {pdf_fname}")
+
 
 def _annotate_source(fig, source_label: str):
     """Place the source JSON filename at the top-left of the figure."""
@@ -552,8 +561,7 @@ def plot_compression(results, output_dir, colours, source_label, group_encoders=
 
         plt.tight_layout()
         fname = output_dir / f'compression_{dataset.replace(" ", "_")}.png'
-        plt.savefig(fname, dpi=150)
-        print(f"Saved: {fname}")
+        _save_fig(fname, dpi=150)
         plt.close()
 
 
@@ -592,8 +600,7 @@ def plot_compression_overhead(results, output_dir, colours, source_label, group_
 
         plt.tight_layout()
         fname = output_dir / f'compression_overhead_{dataset.replace(" ", "_")}.png'
-        plt.savefig(fname, dpi=150)
-        print(f"Saved: {fname}")
+        _save_fig(fname, dpi=150)
         plt.close()
 
 
@@ -705,8 +712,7 @@ def plot_encode_decode_time(results, output_dir, colours, source_label, group_en
 
         plt.tight_layout()
         fname = output_dir / f'encode_decode_time_{dataset.replace(" ", "_")}.png'
-        plt.savefig(fname, dpi=150)
-        print(f"Saved: {fname}")
+        _save_fig(fname, dpi=150)
         plt.close()
 
 
@@ -782,8 +788,7 @@ def plot_random_access(results, output_dir, colours, source_label, group_encoder
 
         plt.tight_layout()
         fname = output_dir / f'random_access_{dataset.replace(" ", "_")}.png'
-        plt.savefig(fname, dpi=150)
-        print(f"Saved: {fname}")
+        _save_fig(fname, dpi=150)
         plt.close()
 
 
@@ -832,8 +837,7 @@ def plot_range_access(results, output_dir, colours, source_label, group_encoders
 
         plt.tight_layout()
         fname = output_dir / f'range_access_{dataset.replace(" ", "_")}.png'
-        plt.savefig(fname, dpi=150)
-        print(f"Saved: {fname}")
+        _save_fig(fname, dpi=150)
         plt.close()
 
 
@@ -888,12 +892,11 @@ def plot_throughput_summary(results, output_dir, colours, source_label, group_en
 
         plt.tight_layout()
         fname = output_dir / f'throughput_summary_{dataset.replace(" ", "_")}.png'
-        plt.savefig(fname, dpi=150)
-        print(f"Saved: {fname}")
+        _save_fig(fname, dpi=150)
         plt.close()
 
 
-def plot_compression_vs_random_access(results, output_dir, colours, source_label, group_encoders=False):
+def plot_compression_vs_random_access(results, output_dir, colours, source_label, group_encoders=False, label_all_points=False):
     """Scatter of compression ratio vs random access time, with Pareto frontier.
 
     Axes orientation
@@ -983,17 +986,18 @@ def plot_compression_vs_random_access(results, output_dir, colours, source_label
                                         ec="none", alpha=0.7))
             texts.append(txt)
 
-        fig.canvas.draw()
-        renderer_fn = getattr(fig.canvas, "get_renderer", None)
-        renderer = renderer_fn() if callable(renderer_fn) else None
-        if renderer is not None:
-            placed_bboxes = []
-            for txt in texts:
-                bbox = txt.get_window_extent(renderer=renderer).expanded(1.05, 1.1)
-                if any(bbox.overlaps(prev) for prev in placed_bboxes):
-                    txt.set_visible(False)
-                else:
-                    placed_bboxes.append(bbox)
+        if not label_all_points:
+            fig.canvas.draw()
+            renderer_fn = getattr(fig.canvas, "get_renderer", None)
+            renderer = renderer_fn() if callable(renderer_fn) else None
+            if renderer is not None:
+                placed_bboxes = []
+                for txt in texts:
+                    bbox = txt.get_window_extent(renderer=renderer).expanded(1.05, 1.1)
+                    if any(bbox.overlaps(prev) for prev in placed_bboxes):
+                        txt.set_visible(False)
+                    else:
+                        placed_bboxes.append(bbox)
 
     # ── Legends ────────────────────────────────────────────────────────
         # Group scatter-dot legend (when --group-encoders is active)
@@ -1079,9 +1083,443 @@ def plot_compression_vs_random_access(results, output_dir, colours, source_label
 
         plt.tight_layout(rect=[0, 0, 1, 0.82])
         fname = output_dir / f'compression_vs_random_access_{dataset.replace(" ", "_")}.png'
-        plt.savefig(fname, dpi=150)
-        print(f"Saved: {fname}")
+        _save_fig(fname, dpi=150)
         plt.close()
+
+
+def plot_compression_vs_range_access(results, output_dir, colours, source_label, group_encoders=False, label_all_points=False):
+    """Scatter of compression ratio vs range access time, with Pareto frontier.
+
+    Axes orientation
+    ----------------
+    X : compression ratio (higher = better → right)
+    Y : avg range access time — axis is **inverted** so that lower (faster)
+        values appear at the **top**.  The ideal encoder therefore sits in the
+        top-right corner.  The global Pareto frontier and the per-group
+        frontiers all curve toward that corner.
+    """
+    datasets = sorted(set(r['datasetName'] for r in results['results']))
+    encoders = _sorted_encoders(results, group_encoders=group_encoders)
+
+    def _pareto(pts):
+        frontier = []
+        for cx, ra in sorted(pts, key=lambda t: t[0], reverse=True):
+            if not frontier or ra < frontier[-1][1]:
+                frontier.append((cx, ra))
+        return frontier
+
+    for dataset in datasets:
+        size = _pick_size_for_dataset(results, dataset)
+        points = []
+        for enc in encoders:
+            row = _row(results, enc, dataset, size)
+            if not row:
+                continue
+            ratio = row['metrics']['memory']['compressionRatio']
+            range_ns = row['metrics']['randomAccess'].get('averageRangeAccessTime_ns', 0)
+            if ratio <= 0 or range_ns <= 0:
+                continue
+            points.append((enc, 1.0 / ratio, range_ns))
+
+        if not points:
+            continue
+
+        fig, ax = plt.subplots(figsize=(8, 6))
+        fig.suptitle(f'Compression vs range access — {dataset}  (n={size:,})', fontsize=13, y=0.98)
+        _annotate_source(fig, source_label)
+
+        for enc, ratio, range_ns in points:
+            marker = 'o' if _is_random_access_encoder(enc) else 'X'
+            ax.scatter(ratio, range_ns, color=colours.get(enc, 'tab:blue'), marker=marker, s=45, zorder=3)
+
+        # ── Global Pareto frontier ─────────────────────────────────────────
+        global_frontier = _pareto([(cx, ra) for _, cx, ra in points])
+        pareto_handle = None
+        if len(global_frontier) >= 2:
+            line = ax.plot([p[0] for p in global_frontier],
+                           [p[1] for p in global_frontier],
+                           color='black', linestyle='--', linewidth=1.4,
+                           zorder=4, label='Pareto frontier (global)')
+            pareto_handle = line[0]
+
+        # ── Per-group Pareto frontiers ─────────────────────────────────────
+        group_frontier_handles = []
+        group_rules = _default_group_rules()
+        groups = _group_encoders([p[0] for p in points], group_rules)
+        for group_name, group_encs in groups:
+            group_pts = [(cx, ra) for enc, cx, ra in points if enc in group_encs]
+            if len(group_pts) < 2:
+                continue
+            gf = _pareto(group_pts)
+            if len(gf) < 2:
+                continue
+            rep_color = colours.get(group_encs[0], 'grey')
+            ax.plot([p[0] for p in gf], [p[1] for p in gf],
+                    color=rep_color, linestyle=':', linewidth=1.0,
+                    alpha=0.55, zorder=2)
+            group_frontier_handles.append(
+                mlines.Line2D([0], [0], color=rep_color, linestyle=':',
+                              linewidth=1.0, alpha=0.55, label=group_name))
+
+        # ── Point labels (staggered, overlaps culled) ──────────────────────
+        offsets = [(6, 4), (6, -6), (-6, 4), (-6, -6), (10, 0), (-10, 0), (0, 8), (0, -8)]
+        texts = []
+        for idx, (enc, ratio, range_ns) in enumerate(points):
+            dx, dy = offsets[idx % len(offsets)]
+            txt = ax.annotate(enc, (ratio, range_ns), textcoords="offset points",
+                              xytext=(dx, dy), fontsize=7,
+                              bbox=dict(boxstyle="round,pad=0.2", fc="white",
+                                        ec="none", alpha=0.7))
+            texts.append(txt)
+
+        if not label_all_points:
+            fig.canvas.draw()
+            renderer_fn = getattr(fig.canvas, "get_renderer", None)
+            renderer = renderer_fn() if callable(renderer_fn) else None
+            if renderer is not None:
+                placed_bboxes = []
+                for txt in texts:
+                    bbox = txt.get_window_extent(renderer=renderer).expanded(1.05, 1.1)
+                    if any(bbox.overlaps(prev) for prev in placed_bboxes):
+                        txt.set_visible(False)
+                    else:
+                        placed_bboxes.append(bbox)
+
+        # ── Legends ────────────────────────────────────────────────────────
+        group_dot_handles = []
+        group_dot_labels = []
+        if group_encoders:
+            for group_name, encs in groups:
+                if not encs:
+                    continue
+                color = colours.get(encs[0], 'tab:blue')
+                group_dot_handles.append(
+                    mlines.Line2D([0], [0], marker='o', color='w',
+                                  markerfacecolor=color, markersize=6))
+                group_dot_labels.append(group_name)
+
+        frontier_handles = []
+        frontier_labels  = []
+        if pareto_handle is not None:
+            frontier_handles.append(pareto_handle)
+            frontier_labels.append('Global Pareto frontier')
+        if group_frontier_handles:
+            frontier_handles += group_frontier_handles
+            frontier_labels  += [h.get_label() for h in group_frontier_handles]
+
+        legend_specs = []
+        if group_dot_handles:
+            legend_specs.append(dict(
+                handles=group_dot_handles,
+                labels=group_dot_labels,
+                title='Encoder groups',
+                ncol=min(len(group_dot_handles), 4),
+                framealpha=0.85,
+            ))
+        if frontier_handles:
+            legend_specs.append(dict(
+                handles=frontier_handles,
+                labels=frontier_labels,
+                title='Pareto frontiers',
+                framealpha=0.85,
+            ))
+
+        ra_handles = _ra_scatter_legend_handles()
+        legend_specs.append(dict(
+            handles=ra_handles,
+            labels=[h.get_label() for h in ra_handles],
+            title='Access capability',
+            framealpha=0.85,
+        ))
+
+        legend_top_y = 0.94
+        legend_x = 0.02
+        legend_gap = 0.02
+        fig.canvas.draw()
+        for spec in legend_specs:
+            leg = fig.legend(
+                spec['handles'], spec['labels'],
+                fontsize=7,
+                loc='upper left',
+                bbox_to_anchor=(legend_x, legend_top_y),
+                bbox_transform=fig.transFigure,
+                title=spec.get('title'),
+                title_fontsize=7,
+                ncol=spec.get('ncol', 1),
+                framealpha=spec.get('framealpha', 0.85),
+            )
+            fig.canvas.draw()
+            renderer = fig.canvas.get_renderer()
+            bbox = leg.get_window_extent(renderer=renderer)
+            fig_w_px = fig.get_size_inches()[0] * fig.dpi
+            legend_x += (bbox.width / fig_w_px) + legend_gap
+
+        # ── Axes ───────────────────────────────────────────────────────────
+        ax.set_xlabel('Compression (× smaller than raw, higher = better →)')
+        ax.set_ylabel('Avg range access time (ns) — faster at top ↑')
+        ax.set_xscale('linear')
+        ax.set_yscale('log')
+        ax.invert_yaxis()
+        ax.grid(True, alpha=0.3)
+
+        plt.tight_layout(rect=[0, 0, 1, 0.82])
+        fname = output_dir / f'compression_vs_range_access_{dataset.replace(" ", "_")}.png'
+        _save_fig(fname, dpi=150)
+        plt.close()
+
+
+def _shoelace_area(xs, ys):
+    """Signed area of a polygon via the shoelace formula; returns the absolute value."""
+    n = len(xs)
+    area = 0.0
+    for i in range(n):
+        j = (i + 1) % n
+        area += xs[i] * ys[j]
+        area -= xs[j] * ys[i]
+    return abs(area) / 2.0
+
+
+def _polygon_centroid(xs, ys):
+    """Area-weighted centroid of a simple polygon (shoelace method)."""
+    n = len(xs)
+    signed_area = 0.0
+    cx = cy = 0.0
+    for i in range(n):
+        j = (i + 1) % n
+        cross = xs[i] * ys[j] - xs[j] * ys[i]
+        signed_area += cross
+        cx += (xs[i] + xs[j]) * cross
+        cy += (ys[i] + ys[j]) * cross
+    signed_area *= 0.5
+    if abs(signed_area) < 1e-12:
+        return sum(xs) / n, sum(ys) / n
+    cx /= 6.0 * signed_area
+    cy /= 6.0 * signed_area
+    return cx, cy
+
+
+def _find_largest_gap(frontier):
+    """Return (gap_index, pt_a, pt_b) for the consecutive frontier pair with the
+    largest area gap in normalized (linear-x, log-y) space.
+
+    frontier is a list of (cx, ra) sorted by cx descending (highest compression
+    first).  pt_a has higher compression / slower access; pt_b has lower
+    compression / faster access.  Returns (None, None, None) if < 2 points.
+    """
+    if len(frontier) < 2:
+        return None, None, None
+
+    xs = [p[0] for p in frontier]
+    ys = [p[1] for p in frontier]
+    x_range = max(xs) - min(xs) or 1.0
+    log_y_range = (math.log(max(ys)) - math.log(min(ys))) or 1.0
+
+    best_score = -1.0
+    best_i = 0
+    for i in range(len(frontier) - 1):
+        dx = abs(frontier[i][0] - frontier[i + 1][0]) / x_range
+        dy = abs(math.log(frontier[i][1]) - math.log(frontier[i + 1][1])) / log_y_range
+        score = dx * dy
+        if score > best_score:
+            best_score = score
+            best_i = i
+
+    return best_i, frontier[best_i], frontier[best_i + 1]
+
+
+def plot_pareto_paper(results, output_dir, colours, source_label, group_encoders=False):
+    """Publication-quality Pareto frontier scatter plots.
+
+    - Plots only encoders that lie on the global Pareto frontier.
+    - Shades the gap between the current frontier and the ideal point
+      (best compression × best access time), forming a concave polygon.
+    - Marks the ideal corner with a star and dashed boundary lines.
+    - Labels every frontier point.
+
+    Two output files are produced per dataset:
+        pareto_paper_random_access_{dataset}.png
+        pareto_paper_range_access_{dataset}.png
+    """
+    datasets = sorted(set(r['datasetName'] for r in results['results']))
+    encoders = _sorted_encoders(results, group_encoders=group_encoders)
+
+    def _pareto(pts):
+        frontier = []
+        for cx, ra in sorted(pts, key=lambda t: t[0], reverse=True):
+            if not frontier or ra < frontier[-1][1]:
+                frontier.append((cx, ra))
+        return frontier
+
+    metric_specs = [
+        ('averageRandomAccessTime_ns',
+         'Avg random access time (ns)  —  faster ↑',
+         'random_access',
+         'Compression vs random access'),
+        ('averageRangeAccessTime_ns',
+         'Avg range access time (ns)  —  faster ↑',
+         'range_access',
+         'Compression vs range access'),
+    ]
+
+    for dataset in datasets:
+        size = _pick_size_for_dataset(results, dataset)
+
+        for metric_key, ylabel, fname_tag, title_tag in metric_specs:
+            # ── Gather points ───────────────────────────────────────────────
+            all_points = []
+            for enc in encoders:
+                row = _row(results, enc, dataset, size)
+                if not row:
+                    continue
+                ratio = row['metrics']['memory']['compressionRatio']
+                t = row['metrics']['randomAccess'].get(metric_key, 0)
+                if ratio <= 0 or t <= 0:
+                    continue
+                all_points.append((enc, 1.0 / ratio, t))
+
+            if len(all_points) < 2:
+                continue
+
+            # ── Global Pareto frontier ──────────────────────────────────────
+            # frontier_pts sorted by cx DESC → first = best compression / slowest,
+            #                                   last  = worst compression / fastest
+            frontier_pts = _pareto([(cx, t) for _, cx, t in all_points])
+            if len(frontier_pts) < 2:
+                continue
+
+            frontier_set = set(frontier_pts)
+            frontier_points = [(enc, cx, t) for enc, cx, t in all_points
+                               if (cx, t) in frontier_set]
+
+            cx_best = frontier_pts[0][0]   # highest compression (rightmost)
+            ra_best = frontier_pts[-1][1]  # fastest access time (topmost, smallest ns)
+
+            # ── Figure setup ────────────────────────────────────────────────
+            fig, ax = plt.subplots(figsize=(7, 5))
+            fig.suptitle(f'{title_tag} — {dataset}  (n={size:,})',
+                         fontsize=12, y=0.98)
+
+            gap_color = '#d62728'
+
+            # ── Hypervolume gap ─────────────────────────────────────────────
+            # Computed in (compression × log₁₀ access-time) space — the same
+            # space the axes display — so the number directly corresponds to
+            # the shaded visual area.
+            #
+            # Utopian bounding box: the rectangle spanned by the worst frontier
+            # point (cx_min, ra_max) and the utopian point (cx_best, ra_best).
+            # Normalised HV gap = gap_area / bounding_box_area, which is 0 if
+            # the frontier collapses to the utopian point and approaches 1 for a
+            # maximally un-pushed frontier.
+            poly_xs_area  = [cx   for cx, ra in frontier_pts] + [cx_best]
+            poly_log10_ys = [math.log10(ra) for cx, ra in frontier_pts] + [math.log10(ra_best)]
+            gap_area = _shoelace_area(poly_xs_area, poly_log10_ys)
+
+            cx_worst  = frontier_pts[-1][0]
+            ra_worst  = frontier_pts[0][1]
+            box_w = cx_best  - cx_worst
+            box_h = math.log10(ra_worst) - math.log10(ra_best)   # > 0
+            utopian_box_area = box_w * box_h if box_w * box_h > 0 else 1.0
+            norm_hv_gap = gap_area / utopian_box_area
+
+            # ── Gap polygon ─────────────────────────────────────────────────
+            # Vertices: frontier p0…pn (right→left), then ideal corner.
+            # matplotlib closes automatically: pn→ideal is horizontal, ideal→p0
+            # is vertical — the two ideal boundary sides.
+            poly_xs = [cx for cx, ra in frontier_pts] + [cx_best]
+            poly_ys = [ra for cx, ra in frontier_pts] + [ra_best]
+            ax.fill(poly_xs, poly_ys, color=gap_color, alpha=0.13, zorder=1)
+
+            # ── Ideal boundary lines (dashed) ────────────────────────────────
+            cx_left   = frontier_pts[-1][0]
+            ra_bottom = frontier_pts[0][1]
+            ax.plot([cx_left, cx_best], [ra_best, ra_best],
+                    color=gap_color, linestyle='--', linewidth=1.1,
+                    alpha=0.65, zorder=3)
+            ax.plot([cx_best, cx_best], [ra_best, ra_bottom],
+                    color=gap_color, linestyle='--', linewidth=1.1,
+                    alpha=0.65, zorder=3)
+
+            # Star at the utopian corner
+            ax.scatter([cx_best], [ra_best], marker='*', s=140,
+                       color=gap_color, zorder=6, edgecolors='white',
+                       linewidths=0.5)
+
+            # ── Gap label + HV metric ────────────────────────────────────────
+            # Use the area-weighted centroid of the gap polygon in
+            # (cx, log10_ra) space so the label sits inside the filled region.
+            cx_label, log10_ra_label = _polygon_centroid(poly_xs_area, poly_log10_ys)
+            ra_label = 10 ** log10_ra_label
+            ax.text(cx_label, ra_label,
+                    f'gap\nHV: {norm_hv_gap:.1%}',
+                    ha='center', va='center',
+                    fontsize=9, color=gap_color, fontweight='bold',
+                    bbox=dict(boxstyle='round,pad=0.3', fc='white',
+                              ec=gap_color, linewidth=0.8, alpha=0.88),
+                    zorder=9)
+
+            # Footnote contextualising the metric
+            ax.annotate(
+                'HV gap = area of gap polygon in (compression × log₁₀ access-time) space,\n'
+                'normalised by the utopian bounding box.  0 % = frontier reaches utopian point.',
+                xy=(0.01, 0.01), xycoords='axes fraction',
+                fontsize=6, color='#666666', style='italic', va='bottom')
+
+            # ── Frontier line and dots ───────────────────────────────────────
+            fxs = [p[0] for p in frontier_pts]
+            fys = [p[1] for p in frontier_pts]
+            ax.plot(fxs, fys, color='#444444', linewidth=1.6,
+                    zorder=2, label='Pareto frontier')
+
+            for enc, cx, t in frontier_points:
+                color = colours.get(enc, 'tab:blue')
+                ax.scatter(cx, t, color=color, s=80, zorder=4,
+                           edgecolors='white', linewidths=0.8)
+
+            # ── Point labels ─────────────────────────────────────────────────
+            cx_mean = sum(cx for _, cx, _ in frontier_points) / len(frontier_points)
+            log_t_mean = sum(math.log(t) for _, _, t in frontier_points) / len(frontier_points)
+            for enc, cx, t in frontier_points:
+                dx = cx - cx_mean
+                dy_log = math.log(t) - log_t_mean
+                norm = math.hypot(dx, dy_log) or 1.0
+                ox = dx / norm * 16
+                oy = dy_log / norm * 16
+                ax.annotate(enc, (cx, t), textcoords='offset points',
+                            xytext=(ox, oy), fontsize=7.5,
+                            ha='center', va='center',
+                            bbox=dict(boxstyle='round,pad=0.25', fc='white',
+                                      ec='none', alpha=0.85),
+                            zorder=8)
+
+            # ── Legend ───────────────────────────────────────────────────────
+            frontier_handle = mlines.Line2D([0], [0], color='#444444',
+                                            linewidth=1.6, label='Pareto frontier')
+            ideal_handle = mlines.Line2D([0], [0], color=gap_color,
+                                         linestyle='--', linewidth=1.1,
+                                         marker='*', markersize=8,
+                                         label='Ideal (best compression + best speed)')
+            gap_handle = mpatches.Patch(facecolor=gap_color, alpha=0.3,
+                                        label='Gap (unexplored)')
+            ax.legend(handles=[frontier_handle, ideal_handle, gap_handle],
+                      fontsize=8, loc='lower left',
+                      bbox_to_anchor=(0.01, 0.09), bbox_transform=ax.transAxes,
+                      framealpha=0.9)
+
+            # ── Axes ─────────────────────────────────────────────────────────
+            ax.set_xlabel('Compression (× smaller than raw — higher is better →)',
+                          fontsize=9)
+            ax.set_ylabel(ylabel, fontsize=9)
+            ax.set_xscale('linear')
+            ax.set_yscale('log')
+            ax.invert_yaxis()
+            ax.grid(True, alpha=0.25)
+            ax.tick_params(labelsize=8)
+
+            plt.tight_layout()
+            fname = output_dir / f'pareto_paper_{fname_tag}_{dataset.replace(" ", "_")}.png'
+            _save_fig(fname, dpi=200)
+            plt.close()
 
 
 def plot_selection_time(results, output_dir, colours, source_label, group_encoders=False):
@@ -1191,8 +1629,7 @@ def plot_memory_encode_decode(results, output_dir, colours, source_label, group_
 
         plt.tight_layout()
         fname = output_dir / f'memory_encode_decode_{dataset.replace(" ", "_")}.png'
-        plt.savefig(fname, dpi=150, bbox_inches='tight')
-        print(f"Saved: {fname}")
+        _save_fig(fname, dpi=150, bbox_inches='tight')
         plt.close()
 
 
@@ -1263,8 +1700,7 @@ def plot_memory_access(results, output_dir, colours, source_label, group_encoder
 
         plt.tight_layout()
         fname = output_dir / f'memory_access_{dataset.replace(" ", "_")}.png'
-        plt.savefig(fname, dpi=150, bbox_inches='tight')
-        print(f"Saved: {fname}")
+        _save_fig(fname, dpi=150, bbox_inches='tight')
         plt.close()
 
 
@@ -1326,8 +1762,7 @@ def plot_time_memory_paired(results, output_dir, colours, source_label, group_en
 
         plt.tight_layout()
         fname = output_dir / f'time_memory_encode_{dataset.replace(" ", "_")}.png'
-        plt.savefig(fname, dpi=150, bbox_inches='tight')
-        print(f"Saved: {fname}")
+        _save_fig(fname, dpi=150, bbox_inches='tight')
         plt.close()
 
         # ── Decode paired ────────────────────────────────────────────────
@@ -1349,8 +1784,7 @@ def plot_time_memory_paired(results, output_dir, colours, source_label, group_en
 
         plt.tight_layout()
         fname = output_dir / f'time_memory_decode_{dataset.replace(" ", "_")}.png'
-        plt.savefig(fname, dpi=150, bbox_inches='tight')
-        print(f"Saved: {fname}")
+        _save_fig(fname, dpi=150, bbox_inches='tight')
         plt.close()
 
 
@@ -1585,8 +2019,7 @@ def plot_encode_decode_time_substreams(results, output_dir, colours, source_labe
         plt.tight_layout(rect=[0, 0.08, 1, 0.93])
         safe_ds = dataset.replace('/', '_').replace(' ', '_')
         fname = output_dir / f'encode_decode_time_substreams_{safe_ds}.png'
-        plt.savefig(fname, dpi=150, bbox_inches='tight')
-        print(f"Saved: {fname}")
+        _save_fig(fname, dpi=150, bbox_inches='tight')
         plt.close(fig)
 
 
@@ -1650,8 +2083,7 @@ def plot_random_access_substreams(results, output_dir, colours, source_label, gr
         plt.tight_layout(rect=[0, 0.08, 1, 0.93])
         safe_ds = dataset.replace('/', '_').replace(' ', '_')
         fname = output_dir / f'random_access_substreams_{safe_ds}.png'
-        plt.savefig(fname, dpi=150, bbox_inches='tight')
-        print(f"Saved: {fname}")
+        _save_fig(fname, dpi=150, bbox_inches='tight')
         plt.close(fig)
 
 
@@ -1719,8 +2151,7 @@ def plot_range_access_substreams(results, output_dir, colours, source_label, gro
         plt.tight_layout(rect=[0, 0.08, 1, 0.93])
         safe_ds = dataset.replace('/', '_').replace(' ', '_')
         fname = output_dir / f'range_access_substreams_{safe_ds}.png'
-        plt.savefig(fname, dpi=150, bbox_inches='tight')
-        print(f"Saved: {fname}")
+        _save_fig(fname, dpi=150, bbox_inches='tight')
         plt.close(fig)
 
 
@@ -1781,8 +2212,7 @@ def plot_compression_size_substreams(results, output_dir, colours, source_label,
         plt.tight_layout(rect=[0, 0.08, 1, 0.93])
         safe_ds = dataset.replace('/', '_').replace(' ', '_')
         fname = output_dir / f'compression_size_substreams_{safe_ds}.png'
-        plt.savefig(fname, dpi=150, bbox_inches='tight')
-        print(f"Saved: {fname}")
+        _save_fig(fname, dpi=150, bbox_inches='tight')
         plt.close(fig)
 
 
@@ -1873,8 +2303,7 @@ def plot_substream_breakdown(results, output_dir, colours, source_label, group_e
         plt.tight_layout()
         safe_ds = dataset.replace('/', '_').replace(' ', '_')
         fname = output_dir / f'substream_breakdown_{safe_ds}.png'
-        plt.savefig(fname, dpi=150, bbox_inches='tight')
-        print(f"Saved: {fname}")
+        _save_fig(fname, dpi=150, bbox_inches='tight')
         plt.close(fig)
 
 
@@ -1889,6 +2318,10 @@ def main():
                         help='Output directory for plots (default: plots/)')
     parser.add_argument('--group-encoders', action='store_true',
                         help='Group encoders by scheme family (AutoSubIntSplit, Raw, SubInt, TriSplit, OpenZL, VarInt)')
+    parser.add_argument('--label-all-points', action='store_true',
+                        help='Label every point on Pareto frontier scatter plots (no overlap culling)')
+    parser.add_argument('--paper-figures', action='store_true',
+                        help='Generate paper-quality Pareto frontier figures with gap highlight')
     args = parser.parse_args()
 
     print(f"Loading results from: {args.input}")
@@ -1913,7 +2346,11 @@ def main():
     plot_random_access(results, args.output, colours, source_label, group_encoders=args.group_encoders)
     plot_range_access(results, args.output, colours, source_label, group_encoders=args.group_encoders)
     plot_throughput_summary(results, args.output, colours, source_label, group_encoders=args.group_encoders)
-    plot_compression_vs_random_access(results, args.output, colours, source_label, group_encoders=args.group_encoders)
+    plot_compression_vs_random_access(results, args.output, colours, source_label, group_encoders=args.group_encoders, label_all_points=args.label_all_points)
+    plot_compression_vs_range_access(results, args.output, colours, source_label, group_encoders=args.group_encoders, label_all_points=args.label_all_points)
+    if args.paper_figures:
+        plot_pareto_paper(results, args.output, colours, source_label,
+                          group_encoders=args.group_encoders)
     # selection time (if present) is shown inside the encode plot
 
     # ── AutoSubIntSplit forced-split sweep ──────────────────────────────
