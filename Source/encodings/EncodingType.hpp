@@ -32,7 +32,28 @@ namespace encodings {
         LZ4,              // LZ4 block compression (fast mode)
         FSEEncoding,      // Finite State Entropy (tANS) entropy coding (sequential decode only)
         FrequencyPartitionEncoding, // Frequency-partitioned fixed-width keys with per-tier bitmaps
-        ReorderingEncoding          // Reordering pre-pass wrapping any inner codec; sub-classified by ReorderingType
+        ReorderingEncoding,         // Reordering pre-pass wrapping any inner codec; sub-classified by ReorderingType
+        MainlyConstantEncoding,     // One dominant value stored inline; others in a sub-stream
+        AdaptiveDictionaryEncoding,  // Block-partitioned dictionary with per-block key widths
+        BlockFrequencyPartitionEncoding, // Block-local frequency-partitioned encoding with compact tier-tag bitfield
+        BlockFSEEncoding,                // Block-indexed Finite State Entropy with per-block byte-offset seek
+        BlockFORFPEEncoding,             // Block-local Frame-of-Reference + flexible-tier FPE with sampled rank index
+        BlockFrequencyPartitionFOREncoding, // Block-local FPE with global FOR prepass (subtract global min before FPE)
+        CascadingFrameOfReference,        // Recursive FOR cascade on residual AND reference streams, runtime frame-size schedule per stream
+        DeltaPrepassEncoding,             // First-order delta prepass with a pluggable leaf codec for the delta stream
+        RangePackEncoding,                // Generic global Frame-of-Reference + narrowest-width repack, composed with any inner section codec
+        RangePackFrequencyPartitionEncoding, // RangePack composed with FrequencyPartitionEncoding (type-narrowed)
+        RangePackBlockFrequencyPartitionEncoding, // RangePack composed with BlockFrequencyPartitionEncoding (type-narrowed)
+        CascadingFORBlockFrequencyPartitionEncoding, // CascadingFOR with BlockFrequencyPartitionEncoding on the residual stream
+        RunLengthCascadingFOREncoding, // RunLengthEncoding with a CascadingFOR-compressed runStarts stream
+        CascadingFORFSEEncoding,      // CascadingFOR with FSEEncoder on the residual stream (NOT random-access safe -- see registration site)
+        CascadingFORBlockFSEEncoding, // CascadingFOR with BlockFSEEncoder on the residual stream (random-access safe)
+        CascadingFORHuffmanEncoding,  // CascadingFOR with HuffmanEncoder on the residual stream (NOT random-access safe -- see registration site)
+        CascadingFORPrevHuffmanEncoding,               // CascadingFOR with FORReferencePolicy::PREV residual schedule + HuffmanEncoder leaf (NOT random-access safe)
+        CascadingFORPrevFSEEncoding,                   // CascadingFOR with FORReferencePolicy::PREV residual schedule + FSEEncoder leaf (NOT random-access safe)
+        CascadingFORPrevBlockFSEEncoding,               // CascadingFOR with FORReferencePolicy::PREV residual schedule + BlockFSEEncoder leaf (random-access safe)
+        CascadingFORPrevFrequencyPartitionEncoding,      // CascadingFOR with FORReferencePolicy::PREV residual schedule + FrequencyPartitionEncoder leaf
+        CascadingFORPrevBlockFrequencyPartitionEncoding  // CascadingFOR with FORReferencePolicy::PREV residual schedule + BlockFrequencyPartitionEncoder leaf
     };
 
     /** Convert EncodingType enum to human-readable string */
@@ -59,6 +80,27 @@ namespace encodings {
             case EncodingType::FSEEncoding:              return "FSEEncoding";
             case EncodingType::FrequencyPartitionEncoding: return "FrequencyPartitionEncoding";
             case EncodingType::ReorderingEncoding:         return "ReorderingEncoding";
+            case EncodingType::MainlyConstantEncoding:       return "MainlyConstantEncoding";
+            case EncodingType::AdaptiveDictionaryEncoding:           return "AdaptiveDictionaryEncoding";
+            case EncodingType::BlockFrequencyPartitionEncoding:     return "BlockFrequencyPartitionEncoding";
+            case EncodingType::BlockFSEEncoding:                     return "BlockFSEEncoding";
+            case EncodingType::BlockFORFPEEncoding:                  return "BlockFORFPEEncoding";
+            case EncodingType::BlockFrequencyPartitionFOREncoding:   return "BlockFrequencyPartitionFOREncoding";
+            case EncodingType::CascadingFrameOfReference:            return "CascadingFrameOfReference";
+            case EncodingType::DeltaPrepassEncoding:                 return "DeltaPrepassEncoding";
+            case EncodingType::RangePackEncoding:                    return "RangePackEncoding";
+            case EncodingType::RangePackFrequencyPartitionEncoding:  return "RangePackFrequencyPartitionEncoding";
+            case EncodingType::RangePackBlockFrequencyPartitionEncoding: return "RangePackBlockFrequencyPartitionEncoding";
+            case EncodingType::CascadingFORBlockFrequencyPartitionEncoding: return "CascadingFORBlockFrequencyPartitionEncoding";
+            case EncodingType::RunLengthCascadingFOREncoding: return "RunLengthCascadingFOREncoding";
+            case EncodingType::CascadingFORFSEEncoding:       return "CascadingFORFSEEncoding";
+            case EncodingType::CascadingFORBlockFSEEncoding:  return "CascadingFORBlockFSEEncoding";
+            case EncodingType::CascadingFORHuffmanEncoding:   return "CascadingFORHuffmanEncoding";
+            case EncodingType::CascadingFORPrevHuffmanEncoding: return "CascadingFORPrevHuffmanEncoding";
+            case EncodingType::CascadingFORPrevFSEEncoding:     return "CascadingFORPrevFSEEncoding";
+            case EncodingType::CascadingFORPrevBlockFSEEncoding: return "CascadingFORPrevBlockFSEEncoding";
+            case EncodingType::CascadingFORPrevFrequencyPartitionEncoding: return "CascadingFORPrevFrequencyPartitionEncoding";
+            case EncodingType::CascadingFORPrevBlockFrequencyPartitionEncoding: return "CascadingFORPrevBlockFrequencyPartitionEncoding";
         }
         return "Unknown";
     }
