@@ -320,7 +320,56 @@ public:
         
         return result;
     }
-    
+
+    // Gather (selective row-range) fast path: a single forward pass accumulating
+    // deltas from index 0 through ranges.back().end once, instead of the default
+    // fallback's independent decodeRangeInto() per range (each of which restarts
+    // the accumulation from index 0 -- O(K * avg(begin)) worst case for K ranges).
+    // Delta encoding has no random entry point, so this must always walk from 0;
+    // the win is doing that walk once for the whole RowRangeList, not once per range.
+    void decodeGatherInto(const EncodedData& encoded,
+                          const RowRangeList& ranges,
+                          T* dst, size_t n) override {
+        if (ranges.empty()) {
+            if (n != 0) throw std::runtime_error("DeltaRunLengthEncoder::decodeGatherInto: decoded size mismatch");
+            return;
+        }
+        if (encoded.size() < 3 * sizeof(size_t) + sizeof(T)) {
+            throw std::runtime_error("DeltaRunLengthEncoder::decodeGatherInto: buffer too small");
+        }
+
+        const uint8_t* readPtr = encoded.data().data();
+        size_t numRuns;       std::memcpy(&numRuns,       readPtr, sizeof(size_t)); readPtr += sizeof(size_t);
+        size_t runStartsSize; std::memcpy(&runStartsSize, readPtr, sizeof(size_t)); readPtr += sizeof(size_t);
+        readPtr += sizeof(size_t);  // runValuesSize, unused (derivable from numRuns)
+        T startValue;         std::memcpy(&startValue, readPtr, sizeof(T));         readPtr += sizeof(T);
+
+        const size_t totalElements = encoded.metadata().elementCount;
+        const size_t* runStartsPtr = reinterpret_cast<const size_t*>(readPtr);
+        const T*      runValuesPtr = reinterpret_cast<const T*>(readPtr + runStartsSize);
+
+        const size_t lastEnd = std::min(ranges.back().end, totalElements);
+
+        T currentValue = startValue;
+        size_t currentRun = 0;
+        size_t curRangeIdx = 0;
+        while (curRangeIdx < ranges.size() && ranges[curRangeIdx].size() == 0) ++curRangeIdx;
+
+        size_t off = 0;
+        for (size_t i = 0; i < lastEnd; ++i) {
+            // i == 0 is startValue itself; no delta consumed there.
+            if (i > 0) {
+                while (currentRun + 1 < numRuns && (i - 1) >= runStartsPtr[currentRun + 1]) ++currentRun;
+                currentValue += runValuesPtr[currentRun];
+            }
+            while (curRangeIdx < ranges.size() && i >= ranges[curRangeIdx].end) ++curRangeIdx;
+            if (curRangeIdx < ranges.size() && i >= ranges[curRangeIdx].begin && i < ranges[curRangeIdx].end) {
+                dst[off++] = currentValue;
+            }
+        }
+        if (off != n) throw std::runtime_error("DeltaRunLengthEncoder::decodeGatherInto: decoded size mismatch");
+    }
+
     EncodingType encodingType() const override {
         return EncodingType::DeltaEncoding;
     }
@@ -338,7 +387,8 @@ public:
             | EncodingProperty::StreamingFriendly
             | EncodingProperty::OptimizedForSorted
             | EncodingProperty::LowMemoryOverhead
-            | EncodingProperty::Composable;
+            | EncodingProperty::Composable
+            | EncodingProperty::FastSkip;
     }
     
     size_t estimateEncodedSize(size_t elementCount) const override {
