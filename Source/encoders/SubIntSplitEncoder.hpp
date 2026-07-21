@@ -3,11 +3,13 @@
 #include <cstdint>
 #include <cstddef>
 #include <cstring>
+#include <future>
 #include <memory>
 #include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -37,11 +39,29 @@ using encodings::encoders::selectors::costs::AdaptiveFORCostModel;
 using encodings::encoders::selectors::costs::AdaptiveFramedBitPrefixCostModel;
 using encodings::encoders::selectors::costs::FORCostModel;
 using encodings::encoders::selectors::costs::DictionaryCostModel;
+using encodings::encoders::selectors::costs::AdaptiveDictionaryCostModel;
 using encodings::encoders::selectors::costs::RLECostModel;
 using encodings::encoders::selectors::costs::HuffmanCostModel;
 using encodings::encoders::selectors::costs::LZ4CostModel;
 using encodings::encoders::selectors::costs::FSECostModel;
 using encodings::encoders::selectors::costs::FrequencyPartitionCostModel;
+using encodings::encoders::selectors::costs::BlockFrequencyPartitionCostModel;
+using encodings::encoders::selectors::costs::BlockFrequencyPartitionFORCostModel;
+using encodings::encoders::selectors::costs::BlockFSECostModel;
+using encodings::encoders::selectors::costs::BlockFORFPECostModel;
+using encodings::encoders::selectors::costs::MainlyConstantCostModel;
+using encodings::encoders::selectors::costs::RangePackCostModel;
+using encodings::encoders::selectors::costs::CascadingFORCostModel;
+using encodings::encoders::selectors::costs::CascadingFORBlockFPECostModel;
+using encodings::encoders::selectors::costs::RunLengthCascadingFORStartsCostModel;
+using encodings::encoders::selectors::costs::CascadingFORFSECostModel;
+using encodings::encoders::selectors::costs::CascadingFORBlockFSECostModel;
+using encodings::encoders::selectors::costs::CascadingFORHuffmanCostModel;
+using encodings::encoders::selectors::costs::CascadingFORPrevFSECostModel;
+using encodings::encoders::selectors::costs::CascadingFORPrevBlockFSECostModel;
+using encodings::encoders::selectors::costs::CascadingFORPrevHuffmanCostModel;
+using encodings::encoders::selectors::costs::CascadingFORPrevFrequencyPartitionCostModel;
+using encodings::encoders::selectors::costs::CascadingFORPrevBlockFrequencyPartitionCostModel;
 using encodings::encoders::selectors::costs::EncodeSpeedCostModel;
 using encodings::encoders::selectors::costs::DecodeAllSpeedCostModel;
 using encodings::encoders::selectors::costs::DecodeAtSpeedCostModel;
@@ -127,26 +147,36 @@ public:
             }
         }
 
-        // Encode each section
-        std::vector<EncodedBuffer<uint8_t>> encodedSections;
-        encodedSections.reserve(splits);
-        std::vector<uint64_t> sectionSizes;
-        sectionSizes.reserve(splits);
+        // Encode each section.
+        // When parallelism is enabled, sections are encoded concurrently via
+        // std::async — each task owns a disjoint slice of sectionsRaw and its
+        // own codec instance, so no synchronisation is needed.
+        std::vector<EncodedBuffer<uint8_t>> encodedSections(splits);
+        std::vector<uint64_t> sectionSizes(splits);
         std::vector<int64_t> sectionEncodeTimes(splits, 0);
 
-        for (size_t s = 0; s < splits; ++s) {
+        auto encodeSection = [&](size_t s) {
             if constexpr (kProfileSections) {
                 const auto t0 = std::chrono::high_resolution_clock::now();
-                auto enc = cfg_.codecs[s]->encode(std::span<const SectionT>(&sectionsRaw[s * N], N));
+                encodedSections[s] = cfg_.codecs[s]->encode(
+                    std::span<const SectionT>(&sectionsRaw[s * N], N));
                 sectionEncodeTimes[s] = std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::high_resolution_clock::now() - t0).count();
-                sectionSizes.push_back(enc.data().size());
-                encodedSections.push_back(std::move(enc));
             } else {
-                auto enc = cfg_.codecs[s]->encode(std::span<const SectionT>(&sectionsRaw[s * N], N));
-                sectionSizes.push_back(enc.data().size());
-                encodedSections.push_back(std::move(enc));
+                encodedSections[s] = cfg_.codecs[s]->encode(
+                    std::span<const SectionT>(&sectionsRaw[s * N], N));
             }
+            sectionSizes[s] = encodedSections[s].data().size();
+        };
+
+        if (cfg_.parallelism.enabled && splits > 1) {
+            std::vector<std::future<void>> futures(splits);
+            for (size_t s = 0; s < splits; ++s)
+                futures[s] = std::async(std::launch::async, encodeSection, s);
+            for (auto& f : futures) f.get();
+        } else {
+            for (size_t s = 0; s < splits; ++s)
+                encodeSection(s);
         }
 
         // Build output in a single pre-sized allocation: header + all payloads.
@@ -236,44 +266,96 @@ public:
             bulkDecodeTimeNs_.assign(splits, 0);
 
         std::vector<std::unique_ptr<SectionT[]>> preDecoded(splits);
-        for (size_t s = 0; s < splits; ++s) {
-            if (!cfg_.codecs[s]->properties().has(EncodingProperty::RandomAccess)) {
-                preDecoded[s] = std::make_unique_for_overwrite<SectionT[]>(h.N);
-                if constexpr (kProfileSections) {
-                    const auto t0 = std::chrono::high_resolution_clock::now();
-                    cfg_.codecs[s]->decodeAllInto(h.views[s], preDecoded[s].get(), h.N);
-                    bulkDecodeTimeNs_[s] = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                        std::chrono::high_resolution_clock::now() - t0).count();
-                } else {
-                    cfg_.codecs[s]->decodeAllInto(h.views[s], preDecoded[s].get(), h.N);
-                }
-            }
-        }
 
-        for (size_t chunkStart = 0; chunkStart < h.N; chunkStart += kDecodeChunkSize) {
-            const size_t chunkEnd   = std::min(chunkStart + kDecodeChunkSize, h.N);
-            const size_t chunkCount = chunkEnd - chunkStart;
-
+        if (cfg_.parallelism.enabled && splits > 1) {
+            // Parallel pre-decode: ALL sections are decoded upfront (including RA
+            // ones) so the subsequent chunk accumulation phase is pure memory and
+            // never calls back into codec instances from worker threads.
+            // Each task writes to its own preDecoded[s] buffer — no shared state.
+            std::vector<std::future<void>> preFutures(splits);
             for (size_t s = 0; s < splits; ++s) {
-                if (preDecoded[s]) {
-                    // Non-random-access: accumulate from pre-decoded buffer slice.
-                    if (s == 0) assignSectionInto (preDecoded[s].get() + chunkStart,
-                                                   acc + chunkStart, chunkCount, h.shifts[0]);
-                    else        combineSectionInto(preDecoded[s].get() + chunkStart,
-                                                   acc + chunkStart, chunkCount, h.shifts[s]);
-                } else {
-                    // Random-access: decode this chunk directly.
+                preDecoded[s] = std::make_unique_for_overwrite<SectionT[]>(h.N);
+                preFutures[s] = std::async(std::launch::async, [&, s]() {
                     if constexpr (kProfileSections) {
                         const auto t0 = std::chrono::high_resolution_clock::now();
-                        cfg_.codecs[s]->decodeRangeAndAccumulate(
-                            h.views[s], chunkStart, chunkEnd,
-                            acc + chunkStart, chunkCount, h.shifts[s], s == 0);
-                        bulkDecodeTimeNs_[s] += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        cfg_.codecs[s]->decodeAllInto(h.views[s], preDecoded[s].get(), h.N);
+                        bulkDecodeTimeNs_[s] = std::chrono::duration_cast<std::chrono::nanoseconds>(
                             std::chrono::high_resolution_clock::now() - t0).count();
                     } else {
-                        cfg_.codecs[s]->decodeRangeAndAccumulate(
-                            h.views[s], chunkStart, chunkEnd,
-                            acc + chunkStart, chunkCount, h.shifts[s], s == 0);
+                        cfg_.codecs[s]->decodeAllInto(h.views[s], preDecoded[s].get(), h.N);
+                    }
+                });
+            }
+            for (auto& f : preFutures) f.get();
+
+            // Parallel chunk accumulation: partition [0, h.N) into contiguous
+            // sub-ranges, one per thread. Each thread runs its own chunk loop over
+            // assign/combineSectionInto — pure memory, disjoint output ranges, no
+            // codec calls, no synchronisation needed.
+            const size_t numChunks   = (h.N + kDecodeChunkSize - 1) / kDecodeChunkSize;
+            const size_t nThreads    = effectiveThreadCount(numChunks);
+            const size_t chunksPerThread = (numChunks + nThreads - 1) / nThreads;
+
+            std::vector<std::future<void>> chunkFutures(nThreads);
+            for (size_t t = 0; t < nThreads; ++t) {
+                const size_t firstChunk = t * chunksPerThread;
+                const size_t lastChunk  = std::min(firstChunk + chunksPerThread, numChunks);
+                if (firstChunk >= numChunks) break;
+                chunkFutures[t] = std::async(std::launch::async, [&, firstChunk, lastChunk]() {
+                    for (size_t c = firstChunk; c < lastChunk; ++c) {
+                        const size_t chunkStart = c * kDecodeChunkSize;
+                        const size_t chunkEnd   = std::min(chunkStart + kDecodeChunkSize, h.N);
+                        const size_t chunkCount = chunkEnd - chunkStart;
+                        for (size_t s = 0; s < splits; ++s) {
+                            if (s == 0) assignSectionInto (preDecoded[s].get() + chunkStart,
+                                                           acc + chunkStart, chunkCount, h.shifts[0]);
+                            else        combineSectionInto(preDecoded[s].get() + chunkStart,
+                                                           acc + chunkStart, chunkCount, h.shifts[s]);
+                        }
+                    }
+                });
+            }
+            for (auto& f : chunkFutures) if (f.valid()) f.get();
+        } else {
+            // Sequential path: pre-decode only non-random-access sections, then
+            // process chunks in order (preserves cache locality across sections).
+            for (size_t s = 0; s < splits; ++s) {
+                if (!cfg_.codecs[s]->properties().has(EncodingProperty::RandomAccess)) {
+                    preDecoded[s] = std::make_unique_for_overwrite<SectionT[]>(h.N);
+                    if constexpr (kProfileSections) {
+                        const auto t0 = std::chrono::high_resolution_clock::now();
+                        cfg_.codecs[s]->decodeAllInto(h.views[s], preDecoded[s].get(), h.N);
+                        bulkDecodeTimeNs_[s] = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::high_resolution_clock::now() - t0).count();
+                    } else {
+                        cfg_.codecs[s]->decodeAllInto(h.views[s], preDecoded[s].get(), h.N);
+                    }
+                }
+            }
+
+            for (size_t chunkStart = 0; chunkStart < h.N; chunkStart += kDecodeChunkSize) {
+                const size_t chunkEnd   = std::min(chunkStart + kDecodeChunkSize, h.N);
+                const size_t chunkCount = chunkEnd - chunkStart;
+
+                for (size_t s = 0; s < splits; ++s) {
+                    if (preDecoded[s]) {
+                        if (s == 0) assignSectionInto (preDecoded[s].get() + chunkStart,
+                                                       acc + chunkStart, chunkCount, h.shifts[0]);
+                        else        combineSectionInto(preDecoded[s].get() + chunkStart,
+                                                       acc + chunkStart, chunkCount, h.shifts[s]);
+                    } else {
+                        if constexpr (kProfileSections) {
+                            const auto t0 = std::chrono::high_resolution_clock::now();
+                            cfg_.codecs[s]->decodeRangeAndAccumulate(
+                                h.views[s], chunkStart, chunkEnd,
+                                acc + chunkStart, chunkCount, h.shifts[s], s == 0);
+                            bulkDecodeTimeNs_[s] += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::high_resolution_clock::now() - t0).count();
+                        } else {
+                            cfg_.codecs[s]->decodeRangeAndAccumulate(
+                                h.views[s], chunkStart, chunkEnd,
+                                acc + chunkStart, chunkCount, h.shifts[s], s == 0);
+                        }
                     }
                 }
             }
@@ -306,68 +388,165 @@ public:
         return static_cast<T>(v);
     }
 
-    std::vector<T> decodeRange(const EncodedBuffer<uint8_t>& encoded, size_t start, size_t end) override {
+    // Writes [start, end) into a caller-provided buffer.  The buffer must hold
+    // at least (end - start) elements and need not be initialised: section 0
+    // always writes every output element before any subsequent OR-accumulation.
+    void decodeRangeInto(const EncodedBuffer<uint8_t>& encoded,
+                         size_t start, size_t end,
+                         T* dst, size_t /*n*/) override {
         const auto& h = getCachedHeader(encoded);
-        if (start >= h.N) return {};
+        if (start >= h.N || start >= end) return;
         end = std::min(end, h.N);
-        if (start >= end) return {};
         const size_t count = end - start;
 
         const size_t splits = h.bits.size();
-
-        std::vector<T> out(count);
-        SectionT* acc = reinterpret_cast<SectionT*>(out.data());
+        SectionT* acc = reinterpret_cast<SectionT*>(dst);
 
         if constexpr (kProfileSections) {
             if (decodeRangeAccumNs_.size() != splits)
                 decodeRangeAccumNs_.assign(splits, 0);
         }
 
-        // Pre-decode non-random-access sections for the requested [start, end) range.
         std::vector<std::unique_ptr<SectionT[]>> preDecoded(splits);
-        for (size_t s = 0; s < splits; ++s) {
-            if (!cfg_.codecs[s]->properties().has(EncodingProperty::RandomAccess)) {
-                preDecoded[s] = std::make_unique_for_overwrite<SectionT[]>(count);
-                if constexpr (kProfileSections) {
-                    const auto t0 = std::chrono::high_resolution_clock::now();
-                    cfg_.codecs[s]->decodeRangeInto(h.views[s], start, end, preDecoded[s].get(), count);
-                    decodeRangeAccumNs_[s] += std::chrono::duration_cast<std::chrono::nanoseconds>(
-                        std::chrono::high_resolution_clock::now() - t0).count();
-                } else {
-                    cfg_.codecs[s]->decodeRangeInto(h.views[s], start, end, preDecoded[s].get(), count);
-                }
-            }
-        }
 
-        for (size_t chunkStart = start; chunkStart < end; chunkStart += kDecodeChunkSize) {
-            const size_t chunkEnd   = std::min(chunkStart + kDecodeChunkSize, end);
-            const size_t chunkCount = chunkEnd - chunkStart;
-            const size_t chunkOff   = chunkStart - start;
-
+        if (cfg_.parallelism.enabled && splits > 1) {
+            // Parallel pre-decode: all sections decoded upfront so the chunk
+            // accumulation phase is pure memory with no codec calls.
+            std::vector<std::future<void>> preFutures(splits);
             for (size_t s = 0; s < splits; ++s) {
-                if (preDecoded[s]) {
-                    if (s == 0) assignSectionInto (preDecoded[s].get() + chunkOff,
-                                                   acc + chunkOff, chunkCount, h.shifts[0]);
-                    else        combineSectionInto(preDecoded[s].get() + chunkOff,
-                                                   acc + chunkOff, chunkCount, h.shifts[s]);
-                } else {
+                preDecoded[s] = std::make_unique_for_overwrite<SectionT[]>(count);
+                preFutures[s] = std::async(std::launch::async, [&, s]() {
                     if constexpr (kProfileSections) {
                         const auto t0 = std::chrono::high_resolution_clock::now();
-                        cfg_.codecs[s]->decodeRangeAndAccumulate(
-                            h.views[s], chunkStart, chunkEnd,
-                            acc + chunkOff, chunkCount, h.shifts[s], s == 0);
+                        cfg_.codecs[s]->decodeRangeInto(h.views[s], start, end, preDecoded[s].get(), count);
                         decodeRangeAccumNs_[s] += std::chrono::duration_cast<std::chrono::nanoseconds>(
                             std::chrono::high_resolution_clock::now() - t0).count();
                     } else {
-                        cfg_.codecs[s]->decodeRangeAndAccumulate(
-                            h.views[s], chunkStart, chunkEnd,
-                            acc + chunkOff, chunkCount, h.shifts[s], s == 0);
+                        cfg_.codecs[s]->decodeRangeInto(h.views[s], start, end, preDecoded[s].get(), count);
+                    }
+                });
+            }
+            for (auto& f : preFutures) f.get();
+
+            // Parallel chunk accumulation over disjoint output sub-ranges.
+            const size_t numChunks      = (count + kDecodeChunkSize - 1) / kDecodeChunkSize;
+            const size_t nThreads       = effectiveThreadCount(numChunks);
+            const size_t chunksPerThread = (numChunks + nThreads - 1) / nThreads;
+
+            std::vector<std::future<void>> chunkFutures(nThreads);
+            for (size_t t = 0; t < nThreads; ++t) {
+                const size_t firstChunk = t * chunksPerThread;
+                const size_t lastChunk  = std::min(firstChunk + chunksPerThread, numChunks);
+                if (firstChunk >= numChunks) break;
+                chunkFutures[t] = std::async(std::launch::async, [&, firstChunk, lastChunk]() {
+                    for (size_t c = firstChunk; c < lastChunk; ++c) {
+                        const size_t chunkStart = start + c * kDecodeChunkSize;
+                        const size_t chunkEnd   = std::min(chunkStart + kDecodeChunkSize, end);
+                        const size_t chunkCount = chunkEnd - chunkStart;
+                        const size_t chunkOff   = chunkStart - start;
+                        for (size_t s = 0; s < splits; ++s) {
+                            if (s == 0) assignSectionInto (preDecoded[s].get() + chunkOff,
+                                                           acc + chunkOff, chunkCount, h.shifts[0]);
+                            else        combineSectionInto(preDecoded[s].get() + chunkOff,
+                                                           acc + chunkOff, chunkCount, h.shifts[s]);
+                        }
+                    }
+                });
+            }
+            for (auto& f : chunkFutures) if (f.valid()) f.get();
+        } else {
+            // Sequential path: pre-decode only non-random-access sections.
+            for (size_t s = 0; s < splits; ++s) {
+                if (!cfg_.codecs[s]->properties().has(EncodingProperty::RandomAccess)) {
+                    preDecoded[s] = std::make_unique_for_overwrite<SectionT[]>(count);
+                    if constexpr (kProfileSections) {
+                        const auto t0 = std::chrono::high_resolution_clock::now();
+                        cfg_.codecs[s]->decodeRangeInto(h.views[s], start, end, preDecoded[s].get(), count);
+                        decodeRangeAccumNs_[s] += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::high_resolution_clock::now() - t0).count();
+                    } else {
+                        cfg_.codecs[s]->decodeRangeInto(h.views[s], start, end, preDecoded[s].get(), count);
+                    }
+                }
+            }
+
+            for (size_t chunkStart = start; chunkStart < end; chunkStart += kDecodeChunkSize) {
+                const size_t chunkEnd   = std::min(chunkStart + kDecodeChunkSize, end);
+                const size_t chunkCount = chunkEnd - chunkStart;
+                const size_t chunkOff   = chunkStart - start;
+
+                for (size_t s = 0; s < splits; ++s) {
+                    if (preDecoded[s]) {
+                        if (s == 0) assignSectionInto (preDecoded[s].get() + chunkOff,
+                                                       acc + chunkOff, chunkCount, h.shifts[0]);
+                        else        combineSectionInto(preDecoded[s].get() + chunkOff,
+                                                       acc + chunkOff, chunkCount, h.shifts[s]);
+                    } else {
+                        if constexpr (kProfileSections) {
+                            const auto t0 = std::chrono::high_resolution_clock::now();
+                            cfg_.codecs[s]->decodeRangeAndAccumulate(
+                                h.views[s], chunkStart, chunkEnd,
+                                acc + chunkOff, chunkCount, h.shifts[s], s == 0);
+                            decodeRangeAccumNs_[s] += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::high_resolution_clock::now() - t0).count();
+                        } else {
+                            cfg_.codecs[s]->decodeRangeAndAccumulate(
+                                h.views[s], chunkStart, chunkEnd,
+                                acc + chunkOff, chunkCount, h.shifts[s], s == 0);
+                        }
                     }
                 }
             }
         }
+    }
 
+    std::vector<T> decodeRange(const EncodedBuffer<uint8_t>& encoded, size_t start, size_t end) override {
+        const auto& h = getCachedHeader(encoded);
+        if (start >= h.N) return {};
+        end = std::min(end, h.N);
+        if (start >= end) return {};
+        const size_t count = end - start;
+        std::vector<T> out(count);
+        decodeRangeInto(encoded, start, end, out.data(), count);
         return out;
+    }
+
+    // Fast path for the "selective/gather" access pattern: an ascending,
+    // non-overlapping RowRangeList with gaps to skip between surviving runs
+    // (mirrors Nimble's TableScan bulkScan pattern). Reuses the same cached
+    // header / chunked decodeRangeInto machinery as the range-access path per
+    // range, and — when EnableProfiling is on — records the skip vs.
+    // materialize time split so the paper's skip-latency argument can be
+    // measured directly. There is no physical seek/skip cost to pay here
+    // beyond this loop's own iteration, since decodeRangeInto is already
+    // offset-addressable (no forward-only cursor to advance) — contrast with
+    // a codec backed by a stateful sequential decoder, where skipping a gap
+    // has a real, non-zero cost.
+    void decodeGatherInto(const EncodedBuffer<uint8_t>& encoded,
+                           const RowRangeList& ranges,
+                           T* dst, size_t n) override {
+        if constexpr (kProfileSections) {
+            gatherSkipNs_ = 0;
+            gatherMatNs_ = 0;
+        }
+
+        size_t off = 0;
+        for (const auto& r : ranges) {
+            const size_t count = r.size();
+            if (count == 0) continue;
+
+            if constexpr (kProfileSections) {
+                const auto t0 = std::chrono::high_resolution_clock::now();
+                decodeRangeInto(encoded, r.begin, r.end, dst + off, count);
+                gatherMatNs_ += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::high_resolution_clock::now() - t0).count();
+            } else {
+                decodeRangeInto(encoded, r.begin, r.end, dst + off, count);
+            }
+            off += count;
+        }
+        if (off != n) [[unlikely]]
+            throw std::runtime_error("SubIntSplitEncoder::decodeGatherInto: decoded size mismatch");
     }
 
     EncodingType encodingType() const override { return EncodingType::Structural; }
@@ -387,7 +566,7 @@ public:
         props.add(EP::Lossless)
              .add(EP::PreservesOrder)
              .add(EP::Composable);
-        if (allSectionsRandomAccess()) props.add(EP::RandomAccess);
+        if (allSectionsRandomAccess()) props.add(EP::RandomAccess).add(EP::FastSkip);
         return props;
     }
 
@@ -677,6 +856,27 @@ public:
         if constexpr (kProfileSections) decodeRangeAccumNs_.assign(cfg_.splitCount(), 0);
     }
 
+    // ── Gather (selective row-range) profiling overrides ──────────────────
+    int64_t gatherSkipTimeNs() const override {
+        if constexpr (kProfileSections) return gatherSkipNs_; else return -1;
+    }
+    int64_t gatherMaterializeTimeNs() const override {
+        if constexpr (kProfileSections) return gatherMatNs_; else return -1;
+    }
+    void resetGatherProfilingAccum() override {
+        if constexpr (kProfileSections) { gatherSkipNs_ = 0; gatherMatNs_ = 0; }
+    }
+
+    // Returns the number of threads to use, capped by both workUnits and the
+    // configured maxThreads (or hardware_concurrency() when maxThreads==0).
+    size_t effectiveThreadCount(size_t workUnits) const {
+        const size_t hw  = std::thread::hardware_concurrency();
+        const size_t cap = (cfg_.parallelism.maxThreads > 0)
+                             ? cfg_.parallelism.maxThreads
+                             : (hw > 0 ? hw : 1);
+        return std::min(workUnits, cap);
+    }
+
 private:
     SubIntSplitConfigIntegral<SectionT> cfg_;
     mutable const uint8_t* cachedOuterPtr_{nullptr};
@@ -690,6 +890,13 @@ private:
     [[no_unique_address]] mutable DecodeTimingVec bulkDecodeTimeNs_;
     [[no_unique_address]] mutable DecodeTimingVec decodeAtAccumNs_;
     [[no_unique_address]] mutable DecodeTimingVec decodeRangeAccumNs_;
+
+    // Gather (selective row-range) skip/materialize timing accumulators —
+    // zero-size when EnableProfiling=false.
+    struct NoGatherState {};
+    using GatherTimeT = std::conditional_t<EnableProfiling, int64_t, NoGatherState>;
+    [[no_unique_address]] mutable GatherTimeT gatherSkipNs_{};
+    [[no_unique_address]] mutable GatherTimeT gatherMatNs_{};
 };
 
 // ---------------------------------------------------------------------------
@@ -746,6 +953,9 @@ inline std::shared_ptr<SubIntSplitEncoder<T>> makeSubIntSplitEncoderManual(
             case encodings::EncodingType::DictionaryEncoding:
                 cfg.codecs.push_back(detail_trisplit::makeDictionarySection<SectionT>(width));
                 break;
+            case encodings::EncodingType::AdaptiveDictionaryEncoding:
+                cfg.codecs.push_back(detail_trisplit::makeAdaptiveDictionarySection<SectionT>(width));
+                break;
             case encodings::EncodingType::FrameOfReference:
                 cfg.codecs.push_back(detail_trisplit::makeFORSection<512, SectionT>(width));
                 break;
@@ -775,6 +985,57 @@ inline std::shared_ptr<SubIntSplitEncoder<T>> makeSubIntSplitEncoderManual(
                 break;
             case encodings::EncodingType::FrequencyPartitionEncoding:
                 cfg.codecs.push_back(detail_trisplit::makeFrequencyPartitionSection<SectionT>(width));
+                break;
+            case encodings::EncodingType::BlockFrequencyPartitionEncoding:
+                cfg.codecs.push_back(detail_trisplit::makeBlockFrequencyPartitionSection<SectionT>(width));
+                break;
+            case encodings::EncodingType::BlockFrequencyPartitionFOREncoding:
+                cfg.codecs.push_back(detail_trisplit::makeBlockFrequencyPartitionFORSection<SectionT>(width));
+                break;
+            case encodings::EncodingType::BlockFORFPEEncoding:
+                cfg.codecs.push_back(detail_trisplit::makeBlockFORFPESection<SectionT>(width));
+                break;
+            case encodings::EncodingType::RangePackFrequencyPartitionEncoding:
+                cfg.codecs.push_back(detail_trisplit::makeRangePackFrequencyPartitionSection<SectionT>(width));
+                break;
+            case encodings::EncodingType::RangePackBlockFrequencyPartitionEncoding:
+                cfg.codecs.push_back(detail_trisplit::makeRangePackBlockFrequencyPartitionSection<SectionT>(width));
+                break;
+            case encodings::EncodingType::CascadingFrameOfReference:
+                cfg.codecs.push_back(detail_trisplit::makeCascadingFORSection<SectionT>(width));
+                break;
+            case encodings::EncodingType::CascadingFORBlockFrequencyPartitionEncoding:
+                cfg.codecs.push_back(detail_trisplit::makeCascadingFORBlockFrequencyPartitionSection<SectionT>(width));
+                break;
+            case encodings::EncodingType::RunLengthCascadingFOREncoding:
+                cfg.codecs.push_back(detail_trisplit::makeRLECascadingFORSection<SectionT>(width));
+                break;
+            case encodings::EncodingType::CascadingFORFSEEncoding:
+                cfg.codecs.push_back(detail_trisplit::makeCascadingFORFSESection<SectionT>(width));
+                break;
+            case encodings::EncodingType::CascadingFORBlockFSEEncoding:
+                cfg.codecs.push_back(detail_trisplit::makeCascadingFORBlockFSESection<SectionT>(width));
+                break;
+            case encodings::EncodingType::CascadingFORHuffmanEncoding:
+                cfg.codecs.push_back(detail_trisplit::makeCascadingFORHuffmanSection<SectionT>(width));
+                break;
+            case encodings::EncodingType::CascadingFORPrevFSEEncoding:
+                cfg.codecs.push_back(detail_trisplit::makeCascadingFORPrevFSESection<SectionT>(width));
+                break;
+            case encodings::EncodingType::CascadingFORPrevBlockFSEEncoding:
+                cfg.codecs.push_back(detail_trisplit::makeCascadingFORPrevBlockFSESection<SectionT>(width));
+                break;
+            case encodings::EncodingType::CascadingFORPrevHuffmanEncoding:
+                cfg.codecs.push_back(detail_trisplit::makeCascadingFORPrevHuffmanSection<SectionT>(width));
+                break;
+            case encodings::EncodingType::CascadingFORPrevFrequencyPartitionEncoding:
+                cfg.codecs.push_back(detail_trisplit::makeCascadingFORPrevFrequencyPartitionSection<SectionT>(width));
+                break;
+            case encodings::EncodingType::CascadingFORPrevBlockFrequencyPartitionEncoding:
+                cfg.codecs.push_back(detail_trisplit::makeCascadingFORPrevBlockFrequencyPartitionSection<SectionT>(width));
+                break;
+            case encodings::EncodingType::BlockFSEEncoding:
+                cfg.codecs.push_back(detail_trisplit::makeBlockFSESection<SectionT>(width));
                 break;
             default:
                 throw std::invalid_argument("makeSubIntSplitEncoderManual: unsupported encoding type: " + std::to_string(static_cast<int>(encodings[i])));
@@ -875,6 +1136,34 @@ inline std::shared_ptr<SubIntSplitEncoderProf<T>> makeSubIntSplitEncoderManualPr
                 cfg.codecs.push_back(detail_trisplit::makeFSESection<SectionT>(width)); break;
             case encodings::EncodingType::FrequencyPartitionEncoding:
                 cfg.codecs.push_back(detail_trisplit::makeFrequencyPartitionSection<SectionT>(width)); break;
+            case encodings::EncodingType::BlockFrequencyPartitionEncoding:
+                cfg.codecs.push_back(detail_trisplit::makeBlockFrequencyPartitionSection<SectionT>(width)); break;
+            case encodings::EncodingType::BlockFrequencyPartitionFOREncoding:
+                cfg.codecs.push_back(detail_trisplit::makeBlockFrequencyPartitionFORSection<SectionT>(width)); break;
+            case encodings::EncodingType::BlockFSEEncoding:
+                cfg.codecs.push_back(detail_trisplit::makeBlockFSESection<SectionT>(width)); break;
+            case encodings::EncodingType::CascadingFrameOfReference:
+                cfg.codecs.push_back(detail_trisplit::makeCascadingFORSection<SectionT>(width)); break;
+            case encodings::EncodingType::CascadingFORBlockFrequencyPartitionEncoding:
+                cfg.codecs.push_back(detail_trisplit::makeCascadingFORBlockFrequencyPartitionSection<SectionT>(width)); break;
+            case encodings::EncodingType::RunLengthCascadingFOREncoding:
+                cfg.codecs.push_back(detail_trisplit::makeRLECascadingFORSection<SectionT>(width)); break;
+            case encodings::EncodingType::CascadingFORFSEEncoding:
+                cfg.codecs.push_back(detail_trisplit::makeCascadingFORFSESection<SectionT>(width)); break;
+            case encodings::EncodingType::CascadingFORBlockFSEEncoding:
+                cfg.codecs.push_back(detail_trisplit::makeCascadingFORBlockFSESection<SectionT>(width)); break;
+            case encodings::EncodingType::CascadingFORHuffmanEncoding:
+                cfg.codecs.push_back(detail_trisplit::makeCascadingFORHuffmanSection<SectionT>(width)); break;
+            case encodings::EncodingType::CascadingFORPrevFSEEncoding:
+                cfg.codecs.push_back(detail_trisplit::makeCascadingFORPrevFSESection<SectionT>(width)); break;
+            case encodings::EncodingType::CascadingFORPrevBlockFSEEncoding:
+                cfg.codecs.push_back(detail_trisplit::makeCascadingFORPrevBlockFSESection<SectionT>(width)); break;
+            case encodings::EncodingType::CascadingFORPrevHuffmanEncoding:
+                cfg.codecs.push_back(detail_trisplit::makeCascadingFORPrevHuffmanSection<SectionT>(width)); break;
+            case encodings::EncodingType::CascadingFORPrevFrequencyPartitionEncoding:
+                cfg.codecs.push_back(detail_trisplit::makeCascadingFORPrevFrequencyPartitionSection<SectionT>(width)); break;
+            case encodings::EncodingType::CascadingFORPrevBlockFrequencyPartitionEncoding:
+                cfg.codecs.push_back(detail_trisplit::makeCascadingFORPrevBlockFrequencyPartitionSection<SectionT>(width)); break;
             default:
                 throw std::invalid_argument("makeSubIntSplitEncoderManualProf: unsupported encoding type");
         }
@@ -955,6 +1244,11 @@ struct SubIntSplitAutoEncoderConfig {
     std::optional<BitSplitOrder> orderHint{}; // allow forcing MSB/LSB ordering
     bool debugLogging{true};
     bool enableSelectionTiming{false};
+    // Parallelism applied to the resolved inner SubIntSplitEncoder at runtime.
+    SubIntSplitParallelismConfig parallelism{};
+    // When true, FPE section codecs are constructed with parallelDecode enabled.
+    // Defaults to true so AutoSIS benefits from intra-FPE tier parallelism by default.
+    bool fpeSectionParallelDecode{true};
 };
 
 template <typename T, bool EnableProfiling = false>
@@ -965,7 +1259,8 @@ public:
 
     explicit SubIntSplitAutoEncoder(Config cfg)
         : selector_(cfg.selectorConfig), samplerCfg_(cfg.samplerConfig), orderHint_(cfg.orderHint), debugLogging_(cfg.debugLogging),
-          selectionTimingEnabled_(cfg.enableSelectionTiming) {
+          selectionTimingEnabled_(cfg.enableSelectionTiming), parallelism_(cfg.parallelism),
+          fpeSectionParallelDecode_(cfg.fpeSectionParallelDecode) {
         if (cfg.costModels.empty()) {
             throw std::invalid_argument("SubIntSplitAutoEncoder: costModels must not be empty");
         }
@@ -1000,6 +1295,24 @@ public:
         return impl_->decodeRange(encoded, start, end);
     }
 
+    void decodeRangeInto(const EncodedBuffer<uint8_t>& encoded,
+                          size_t start, size_t end,
+                          T* dst, size_t n) override {
+        ensureDecoderInitialized();
+        impl_->decodeRangeInto(encoded, start, end, dst, n);
+    }
+
+    // Forward to impl_'s decodeGatherInto so the auto-selected encoder still
+    // gets its genuine skip-then-materialize fast path (and skip/materialize
+    // timing split below) instead of silently falling back to the base
+    // Decoder::decodeGatherInto's independent-decodeRangeInto-per-range loop.
+    void decodeGatherInto(const EncodedBuffer<uint8_t>& encoded,
+                           const RowRangeList& ranges,
+                           T* dst, size_t n) override {
+        ensureDecoderInitialized();
+        impl_->decodeGatherInto(encoded, ranges, dst, n);
+    }
+
     EncodingType encodingType() const override { return EncodingType::Structural; }
 
     std::string name() const override {
@@ -1029,6 +1342,17 @@ public:
     }
     void resetSubStreamDecodeAtAccum() override    { if (impl_) impl_->resetSubStreamDecodeAtAccum(); }
     void resetSubStreamDecodeRangeAccum() override { if (impl_) impl_->resetSubStreamDecodeRangeAccum(); }
+
+    // Forward gather (selective row-range) profiling to impl_ for the same
+    // reason as the subStream* forwarding above.
+    int64_t gatherSkipTimeNs() const override {
+        return impl_ ? impl_->gatherSkipTimeNs() : -1;
+    }
+    int64_t gatherMaterializeTimeNs() const override {
+        return impl_ ? impl_->gatherMaterializeTimeNs() : -1;
+    }
+    void resetGatherProfilingAccum() override { if (impl_) impl_->resetGatherProfilingAccum(); }
+
     void reset() override {
         impl_.reset();
         lastSelection_       = selectors::IDSubStreamEncodingSelector::Result{};
@@ -1109,9 +1433,12 @@ private:
         }
 
         using SectionT = std::conditional_t<(sizeof(T) <= 4), uint32_t, uint64_t>;
-        const auto cfg = orderHint_.has_value()
-            ? SubIntSplitConfigIntegral<SectionT>::fromSegments(segments, *orderHint_)
-            : SubIntSplitConfigIntegral<SectionT>::fromSegments(segments);
+        typename SubIntSplitConfigIntegral<SectionT>::SectionBuildOptions sectionOpts;
+        sectionOpts.fpeSectionParallelDecode = fpeSectionParallelDecode_;
+        auto cfg = orderHint_.has_value()
+            ? SubIntSplitConfigIntegral<SectionT>::fromSegments(segments, *orderHint_, sectionOpts)
+            : SubIntSplitConfigIntegral<SectionT>::fromSegments(segments, sectionOpts);
+        cfg.parallelism = parallelism_;
         // Reflect remapped segments in the cached selection for accurate logging
         lastSelection_.segments = segments;
         impl_ = std::make_shared<SubIntSplitEncoder<T, EnableProfiling>>(std::move(cfg));
@@ -1132,6 +1459,8 @@ private:
     std::shared_ptr<SubIntSplitEncoder<T, EnableProfiling>> impl_{};
     bool debugLogging_{true};
     bool selectionTimingEnabled_{false};
+    SubIntSplitParallelismConfig parallelism_{};
+    bool fpeSectionParallelDecode_{true};
     std::optional<std::chrono::nanoseconds> lastSelectionTimeNs_{};
     selectors::IDSubStreamEncodingSelector::Result lastSelection_{};
 
@@ -1223,7 +1552,11 @@ inline std::vector<encodings::EncodingType> defaultAutoSubIntSplitCostModelTypes
         encodings::EncodingType::RunLengthEncoding,
         encodings::EncodingType::AdaptiveFrameOfReference,
         encodings::EncodingType::DictionaryEncoding,
-        encodings::EncodingType::FrequencyPartitionEncoding
+        encodings::EncodingType::FrequencyPartitionEncoding,
+        encodings::EncodingType::BlockFrequencyPartitionEncoding,
+        encodings::EncodingType::BlockFrequencyPartitionFOREncoding,
+        encodings::EncodingType::BlockFSEEncoding,
+        encodings::EncodingType::MainlyConstantEncoding
     };
 }
 
@@ -1252,6 +1585,9 @@ makeAutoSubIntSplitCostModelsFromTypes(const std::vector<encodings::EncodingType
             case encodings::EncodingType::AdaptiveFramedBitPrefix:
                 models.emplace_back(std::make_unique<AdaptiveFramedBitPrefixCostModel>());
                 break;
+            case encodings::EncodingType::AdaptiveDictionaryEncoding:
+                models.emplace_back(std::make_unique<AdaptiveDictionaryCostModel>());
+                break;
             case encodings::EncodingType::DictionaryEncoding:
                 models.emplace_back(std::make_unique<DictionaryCostModel>());
                 break;
@@ -1266,6 +1602,64 @@ makeAutoSubIntSplitCostModelsFromTypes(const std::vector<encodings::EncodingType
                 break;
             case encodings::EncodingType::FrequencyPartitionEncoding:
                 models.emplace_back(std::make_unique<FrequencyPartitionCostModel>());
+                break;
+            case encodings::EncodingType::BlockFrequencyPartitionEncoding:
+                models.emplace_back(std::make_unique<BlockFrequencyPartitionCostModel>());
+                break;
+            case encodings::EncodingType::BlockFrequencyPartitionFOREncoding:
+                models.emplace_back(std::make_unique<BlockFrequencyPartitionFORCostModel>());
+                break;
+            case encodings::EncodingType::BlockFSEEncoding:
+                models.emplace_back(std::make_unique<BlockFSECostModel>());
+                break;
+            case encodings::EncodingType::BlockFORFPEEncoding:
+                models.emplace_back(std::make_unique<BlockFORFPECostModel>());
+                break;
+            case encodings::EncodingType::MainlyConstantEncoding:
+                models.emplace_back(std::make_unique<MainlyConstantCostModel>());
+                break;
+            case encodings::EncodingType::RangePackFrequencyPartitionEncoding:
+                models.emplace_back(std::make_unique<RangePackCostModel>(
+                    std::make_unique<FrequencyPartitionCostModel>(),
+                    encodings::EncodingType::RangePackFrequencyPartitionEncoding));
+                break;
+            case encodings::EncodingType::RangePackBlockFrequencyPartitionEncoding:
+                models.emplace_back(std::make_unique<RangePackCostModel>(
+                    std::make_unique<BlockFrequencyPartitionCostModel>(),
+                    encodings::EncodingType::RangePackBlockFrequencyPartitionEncoding));
+                break;
+            case encodings::EncodingType::CascadingFrameOfReference:
+                models.emplace_back(std::make_unique<CascadingFORCostModel>());
+                break;
+            case encodings::EncodingType::CascadingFORBlockFrequencyPartitionEncoding:
+                models.emplace_back(std::make_unique<CascadingFORBlockFPECostModel>());
+                break;
+            case encodings::EncodingType::RunLengthCascadingFOREncoding:
+                models.emplace_back(std::make_unique<RunLengthCascadingFORStartsCostModel>());
+                break;
+            case encodings::EncodingType::CascadingFORFSEEncoding:
+                models.emplace_back(std::make_unique<CascadingFORFSECostModel>());
+                break;
+            case encodings::EncodingType::CascadingFORBlockFSEEncoding:
+                models.emplace_back(std::make_unique<CascadingFORBlockFSECostModel>());
+                break;
+            case encodings::EncodingType::CascadingFORHuffmanEncoding:
+                models.emplace_back(std::make_unique<CascadingFORHuffmanCostModel>());
+                break;
+            case encodings::EncodingType::CascadingFORPrevFSEEncoding:
+                models.emplace_back(std::make_unique<CascadingFORPrevFSECostModel>());
+                break;
+            case encodings::EncodingType::CascadingFORPrevBlockFSEEncoding:
+                models.emplace_back(std::make_unique<CascadingFORPrevBlockFSECostModel>());
+                break;
+            case encodings::EncodingType::CascadingFORPrevHuffmanEncoding:
+                models.emplace_back(std::make_unique<CascadingFORPrevHuffmanCostModel>());
+                break;
+            case encodings::EncodingType::CascadingFORPrevFrequencyPartitionEncoding:
+                models.emplace_back(std::make_unique<CascadingFORPrevFrequencyPartitionCostModel>());
+                break;
+            case encodings::EncodingType::CascadingFORPrevBlockFrequencyPartitionEncoding:
+                models.emplace_back(std::make_unique<CascadingFORPrevBlockFrequencyPartitionCostModel>());
                 break;
             default:
                 throw std::invalid_argument("makeAutoSubIntSplitCostModelsFromTypes: unsupported encoding type for cost model");
@@ -1289,11 +1683,11 @@ inline typename SubIntSplitAutoEncoder<T>::Config makeDefaultAutoSubIntSplitConf
     cfg.selectorConfig = selectors::IDSubStreamEncodingSelector::Config{}; // defaults
     cfg.selectorConfig.verboseLevel = 1; // leave quiet by default; enable when debugging
     cfg.selectorConfig.minSegmentWidth = 1; // avoid tiny slices that inflate headers/rounding
-    cfg.selectorConfig.splitPenalty = 10.0; // discourage excessive splitting (heavier for MSB)
+    cfg.selectorConfig.splitPenalty = 100.0; // discourage excessive splitting (heavier for MSB)
     cfg.selectorConfig.enableMergePhase = false; // merge adjacent in MSB mode to reduce fragmentation
-    cfg.samplerConfig.maxSamples = 10'000;   // cap total sampled points
+    cfg.samplerConfig.maxSamples = 100'000;   // cap total sampled points
     cfg.samplerConfig.stride = 0;           // unused when blockSize > 0
-    cfg.samplerConfig.blockSize = 128;      // 78 blocks × 128 elements — preserves local temporal structure
+    cfg.samplerConfig.blockSize = 32;       // 625 blocks × 16 elements — diverse enough to capture slowly-varying fields (e.g. Snowflake timestamps that change every 4096 IDs)
     cfg.samplerConfig.maxPercentage = 0; // or maxSamples, whichever is smaller
     cfg.debugLogging = false;                 // enable instrumentation by default for now
     cfg.enableSelectionTiming = enableSelectionTiming;
@@ -1329,17 +1723,18 @@ inline typename SubIntSplitAutoEncoder<T>::Config makeDefaultAutoSubIntSplitConf
     cfg.selectorConfig = selectors::IDSubStreamEncodingSelector::Config{};
     cfg.selectorConfig.verboseLevel = 1;
     cfg.selectorConfig.minSegmentWidth = 1;
-    cfg.selectorConfig.splitPenalty = 10.0;
     cfg.selectorConfig.enableMergePhase = false;
     cfg.samplerConfig.maxSamples = 10'000;
     cfg.samplerConfig.stride = 0;
-    cfg.samplerConfig.blockSize = 128;
+    cfg.samplerConfig.blockSize = 16;
     cfg.samplerConfig.maxPercentage = 0;
     cfg.debugLogging = false;
     cfg.enableSelectionTiming = enableSelectionTiming;
     cfg.orderHint = order;
     if (numSplits > 0)
         cfg.selectorConfig.forcedNumSegments = numSplits;
+    cfg.selectorConfig.splitPenalty =
+        costModelSet.recommendedSplitPenalty(cfg.samplerConfig.maxSamples);
     cfg.costModels = costModelSet.build();
     if (allowReorderers)
         cfg.reordererModels.push_back(std::make_unique<selectors::costs::BWTReordererCostModel>());
@@ -1404,13 +1799,15 @@ inline std::shared_ptr<SubIntSplitAutoEncoderProf<T>> makeDefaultAutoSubIntSplit
     bool enablePrune = true,
     bool enableSelectionTiming = false,
     std::vector<encodings::EncodingType> costModelTypes = {},
-    int numSplits = -1) {
+    int numSplits = -1,
+    SubIntSplitParallelismConfig parallelism = {}) {
     // Config type is identical to the non-profiling variant (EnableProfiling only affects runtime)
     auto cfg = makeDefaultAutoSubIntSplitConfig<T>(order, enableSelectionTiming, std::move(costModelTypes), numSplits);
     cfg.selectorConfig.orderHint          = order;
     cfg.selectorConfig.useExhaustiveSearch = exhaustiveSearch;
     cfg.selectorConfig.enablePrune         = enablePrune;
     cfg.selectorConfig.costGridCsvPath     = "../Source/encoders/auto_subintsplit_cost_grid_twitter_snowflake_64.csv";
+    cfg.parallelism                        = parallelism;
     return makeAutoSubIntSplitEncoderProf<T>(std::move(cfg));
 }
 
@@ -1422,12 +1819,14 @@ inline std::shared_ptr<SubIntSplitAutoEncoderProf<T>> makeDefaultAutoSubIntSplit
     bool enablePrune = true,
     int numSplits = -1,
     bool allowReorderers = true,
-    bool enableSelectionTiming = false) {
+    bool enableSelectionTiming = false,
+    SubIntSplitParallelismConfig parallelism = {}) {
     auto cfg = makeDefaultAutoSubIntSplitConfig<T>(order, std::move(costModelSet), numSplits, allowReorderers, enableSelectionTiming);
     cfg.selectorConfig.orderHint          = order;
     cfg.selectorConfig.useExhaustiveSearch = exhaustiveSearch;
     cfg.selectorConfig.enablePrune         = enablePrune;
     cfg.selectorConfig.costGridCsvPath     = "../Source/encoders/auto_subintsplit_cost_grid_twitter_snowflake_64.csv";
+    cfg.parallelism                        = parallelism;
     return makeAutoSubIntSplitEncoderProf<T>(std::move(cfg));
 }
 
@@ -1443,9 +1842,10 @@ inline std::shared_ptr<SubIntSplitAutoEncoder64Prof> makeDefaultAutoSubIntSplitE
     bool enablePrune = true,
     bool enableSelectionTiming = false,
     std::vector<encodings::EncodingType> costModelTypes = {},
-    int numSplits = -1) {
+    int numSplits = -1,
+    SubIntSplitParallelismConfig parallelism = {}) {
     return makeDefaultAutoSubIntSplitEncoderProf<int64_t>(
-        order, exhaustiveSearch, enablePrune, enableSelectionTiming, std::move(costModelTypes), numSplits);
+        order, exhaustiveSearch, enablePrune, enableSelectionTiming, std::move(costModelTypes), numSplits, parallelism);
 }
 
 inline std::shared_ptr<SubIntSplitAutoEncoder64Prof> makeDefaultAutoSubIntSplitEncoderProf(
@@ -1455,9 +1855,10 @@ inline std::shared_ptr<SubIntSplitAutoEncoder64Prof> makeDefaultAutoSubIntSplitE
     bool enablePrune = true,
     int numSplits = -1,
     bool allowReorderers = true,
-    bool enableSelectionTiming = false) {
+    bool enableSelectionTiming = false,
+    SubIntSplitParallelismConfig parallelism = {}) {
     return makeDefaultAutoSubIntSplitEncoderProf<int64_t>(
-        order, std::move(costModelSet), exhaustiveSearch, enablePrune, numSplits, allowReorderers, enableSelectionTiming);
+        order, std::move(costModelSet), exhaustiveSearch, enablePrune, numSplits, allowReorderers, enableSelectionTiming, parallelism);
 }
 
 // ---------------------------------------------------------------------------
