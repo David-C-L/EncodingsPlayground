@@ -7,6 +7,7 @@
 #include <optional>
 #include <sstream>
 #include "core/DataType.hpp"
+#include "encodings/RowRange.hpp"
 #ifdef VTUNE_ENABLED
 #include <ittnotify.h>
 #endif
@@ -76,6 +77,8 @@ struct MemoryMetrics {
     size_t decodeStridedPeakHeapBytes{0};
     /// Peak heap above baseline while executing all range-access decode calls.
     size_t decodeRangePeakHeapBytes{0};
+    /// Peak heap above baseline while executing the selective/gather decode call.
+    size_t decodeSelectivePeakHeapBytes{0};
 
     // ── Legacy aliases kept for back-compat with existing JSON consumers ──
     /// Alias for encodePeakHeapBytes (populated alongside it).
@@ -120,6 +123,15 @@ struct AccuracyMetrics {
 
 /**
  * @brief Random access performance metrics
+ *
+ * NOTE: these three patterns (shuffled point lookups, fixed-stride point
+ * lookups, independent range queries) model worst-case uniform-random or
+ * regularly-strided point access — e.g. an in-memory embedding-table /
+ * DLRM-style sparse-selection-vector lookup. They do NOT model an on-disk
+ * TableScan's filtered/selective read, where surviving rows form an ordered,
+ * ascending list of contiguous ranges with gaps that are skipped rather than
+ * scattered across the whole index space. For that pattern, see
+ * SelectiveAccessMetrics / benchmarkSelectiveAccess below.
  */
 struct RandomAccessMetrics {
     // Random access (shuffled indices)
@@ -127,16 +139,41 @@ struct RandomAccessMetrics {
     nanoseconds minRandomAccessTime{0};
     nanoseconds maxRandomAccessTime{0};
     size_t randomAccessCount{0};
-    
+
     // Strided access pattern
     nanoseconds averageStridedAccessTime{0};
     size_t stridedAccessCount{0};
     size_t stride{0};
-    
+
     // Range queries
     nanoseconds averageRangeAccessTime{0};
     size_t rangeQueryCount{0};
     size_t averageRangeSize{0};
+};
+
+/**
+ * @brief Selective/gather-read performance metrics.
+ *
+ * Models a TableScan-style filtered read: an ordered, ascending, non-overlapping
+ * list of surviving row ranges (RowRangeList), decoded in one decodeGatherInto()
+ * call that skips the gaps between ranges rather than materializing them.
+ * When the codec being measured overrides Codec::gatherSkipTimeNs() /
+ * gatherMaterializeTimeNs() (currently only SubIntSplitEncoder), the skip vs.
+ * materialize time split is also available — this is the quantity the
+ * skip-latency argument cares about.
+ */
+struct SelectiveAccessMetrics {
+    nanoseconds totalGatherTime{0};     ///< one decodeGatherInto() call over the whole trace
+    size_t rangeCount{0};               ///< number of surviving ranges in the trace
+    size_t totalSelectedRows{0};        ///< sum of range sizes (rows actually decoded)
+    double selectivity{0.0};            ///< totalSelectedRows / (span from first range's begin to last range's end)
+    double meanRunLength{0.0};          ///< totalSelectedRows / rangeCount
+
+    /// True only if the codec overrode gatherSkipTimeNs()/gatherMaterializeTimeNs()
+    /// (i.e. reported >= 0 for both) during the most recent run.
+    bool skipMaterializeSplitAvailable{false};
+    nanoseconds averageSkipTimeNs{0};
+    nanoseconds averageMaterializeTimeNs{0};
 };
 
 /**
@@ -167,6 +204,7 @@ struct BenchmarkMetrics {
     MemoryMetrics memory;
     AccuracyMetrics accuracy;
     RandomAccessMetrics randomAccess;
+    SelectiveAccessMetrics selectiveAccess;
     
     // Benchmark configuration
     size_t iterations{1};
@@ -223,6 +261,7 @@ struct VTuneConfig {
     bool randomAccess{true};
     bool stridedAccess{true};
     bool rangeAccess{true};
+    bool selectiveAccess{true};
 };
 
 /**
@@ -255,7 +294,16 @@ struct BenchmarkConfig {
     std::vector<size_t> rangeSizes{10, 100, 1000};  // Different range sizes to test
     // Optional explicit range-access trace (start, end) with end exclusive.
     std::vector<std::pair<size_t, size_t>> rangeAccesses;
-    
+
+    // Selective/gather access testing (models a TableScan filtered read: an
+    // ascending, non-overlapping list of surviving row ranges with gaps to
+    // skip between them). Opt-in per scenario — unlike random/strided/range,
+    // there is no implicit default trace, since the point of this benchmark
+    // is sensitivity analysis over an explicitly constructed (selectivity,
+    // meanRunLength) trace; see SelectiveTraceGen.hpp::makeSelectiveTrace().
+    bool testSelectiveAccess{true};
+    encodings::RowRangeList selectiveAccessRanges;
+
     // Validation
     bool validateCorrectness{true};      // Verify decoded data matches original
     bool validateRandomAccess{true};     // Verify random access against sequential decode

@@ -321,6 +321,16 @@ public:
                 substreamAccum[s].decodeRangeTime_ns = static_cast<double>(rangeTimes[s]) / rangeCount;
         }
 
+        // Selective/gather access — reset gather profiling accumulators first.
+        encoder->resetGatherProfilingAccum();
+        if (config_.testSelectiveAccess) {
+            if (config_.verboseOutput) {
+                std::cout << "  [" << encoderName << "/" << datasetName << "] selective (gather) access..." << std::flush;
+            }
+            benchmarkSelectiveAccess(encoder, encoded, result.originalData, result.metrics);
+            if (config_.verboseOutput) { std::cout << " done\n"; }
+        }
+
         // Store final sub-stream breakdown
         if (!substreamAccum.empty())
             result.metrics.subStreamMetrics = std::move(substreamAccum);
@@ -427,6 +437,10 @@ private:
         accuracy.isLossless = allMatch;
     }
     
+    // Models worst-case uniform-random point lookups (e.g. embedding-table /
+    // DLRM-style sparse-selection-vector access), NOT Nimble's on-disk
+    // TableScan selective-read pattern — for the latter see
+    // benchmarkSelectiveAccess() below.
     void benchmarkRandomAccess(std::shared_ptr<encodings::Codec<T>> encoder,
                                const encodings::EncodedData& encoded,
                                const std::vector<T>& original,
@@ -711,6 +725,31 @@ private:
             }
             result.metrics.memory.decodeRangePeakHeapBytes = track.stop();
         }
+
+        // ── Phase 6: Selective/gather access ─────────────────────────────
+        // decodeGatherInto writes into a caller-supplied buffer; the peak here
+        // is the worst-case working memory for one full gather call (output
+        // buffer + any internal temporaries used to skip/materialize ranges).
+        if (config_.testSelectiveAccess &&
+            !config_.selectiveAccessRanges.empty() &&
+            encoder->properties().has(encodings::EncodingProperty::RandomAccess)) {
+
+            encodings::RowRangeList ranges;
+            size_t totalSelected = 0;
+            for (const auto& r : config_.selectiveAccessRanges) {
+                size_t b = std::min(r.begin, n);
+                size_t e = std::min(r.end, n);
+                if (b >= e) continue;
+                ranges.push_back({b, e});
+                totalSelected += (e - b);
+            }
+            if (!ranges.empty()) {
+                std::vector<T> dst(totalSelected);
+                ScopedAllocationTrack track;
+                encoder->decodeGatherInto(encoded, ranges, dst.data(), totalSelected);
+                result.metrics.memory.decodeSelectivePeakHeapBytes = track.stop();
+            }
+        }
     }
 
     // ────────────────────────────────────────────────────────────────────
@@ -722,10 +761,26 @@ private:
         if (!encoder->properties().has(encodings::EncodingProperty::RandomAccess)) {
             return;
         }
-        
+
         std::vector<nanoseconds> accessTimes;
         size_t totalRangeSize = 0;
         size_t queryCount = 0;
+
+        // Pre-allocate a persistent output buffer large enough for the largest range
+        // query.  decodeRangeInto writes directly into this buffer, avoiding the
+        // per-call heap allocation and zero-initialisation of decodeRange's vector.
+        const size_t maxRangeSize = [&]() -> size_t {
+            if (!config_.rangeAccesses.empty()) {
+                size_t mx = 0;
+                for (const auto& [s, e] : config_.rangeAccesses)
+                    mx = std::max(mx, e > s ? e - s : size_t{0});
+                return std::min(mx, original.size());
+            }
+            if (!config_.rangeSizes.empty())
+                return *std::max_element(config_.rangeSizes.begin(), config_.rangeSizes.end());
+            return original.size();
+        }();
+        std::vector<T> rangeBuf(maxRangeSize);
 
 #ifdef VTUNE_ENABLED
         if (config_.vtune.rangeAccess) __itt_resume();
@@ -739,7 +794,7 @@ private:
                 size_t rangeSize = end - start;
 
                 auto accessStart = high_resolution_clock::now();
-                auto range = encoder->decodeRange(encoded, start, end);
+                encoder->decodeRangeInto(encoded, start, end, rangeBuf.data(), rangeSize);
                 auto accessEnd = high_resolution_clock::now();
 
                 accessTimes.push_back(duration_cast<nanoseconds>(accessEnd - accessStart));
@@ -750,17 +805,16 @@ private:
         } else {
             for (size_t rangeSize : config_.rangeSizes) {
                 if (rangeSize > original.size()) continue;
-                
+
                 for (size_t q = 0; q < config_.rangeQueryCount; ++q) {
-                    // Random start position
                     std::uniform_int_distribution<size_t> dist(0, original.size() - rangeSize);
                     size_t start = dist(rng_);
                     size_t end = start + rangeSize;
-                    
+
                     auto accessStart = high_resolution_clock::now();
-                    auto range = encoder->decodeRange(encoded, start, end);
+                    encoder->decodeRangeInto(encoded, start, end, rangeBuf.data(), rangeSize);
                     auto accessEnd = high_resolution_clock::now();
-                    
+
                     accessTimes.push_back(duration_cast<nanoseconds>(accessEnd - accessStart));
                     totalRangeSize += rangeSize;
                     queryCount++;
@@ -776,6 +830,87 @@ private:
             metrics.randomAccess.averageRangeAccessTime = totalTime / accessTimes.size();
             metrics.randomAccess.rangeQueryCount = queryCount;
             metrics.randomAccess.averageRangeSize = totalRangeSize / queryCount;
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+
+    // Models a TableScan-style selective read: an ascending, non-overlapping
+    // list of surviving row ranges (config_.selectiveAccessRanges), decoded
+    // via one decodeGatherInto() call that skips the gaps between ranges
+    // rather than materializing them. See RandomAccessMetrics's doc-comment
+    // for why this is a distinct pattern from benchmarkRandomAccess above.
+    void benchmarkSelectiveAccess(std::shared_ptr<encodings::Codec<T>> encoder,
+                                   const encodings::EncodedData& encoded,
+                                   const std::vector<T>& original,
+                                   BenchmarkMetrics& metrics) {
+        if (!encoder->properties().has(encodings::EncodingProperty::RandomAccess)) {
+            return;
+        }
+        if (config_.selectiveAccessRanges.empty()) {
+            return;
+        }
+
+        // Clamp ranges to original.size(), same idiom as benchmarkRangeAccess's
+        // rangeAccesses handling.
+        encodings::RowRangeList ranges;
+        size_t totalSelected = 0;
+        for (const auto& r : config_.selectiveAccessRanges) {
+            size_t b = std::min(r.begin, original.size());
+            size_t e = std::min(r.end, original.size());
+            if (b >= e) continue;
+            ranges.push_back({b, e});
+            totalSelected += (e - b);
+        }
+        if (ranges.empty()) {
+            return;
+        }
+        const size_t totalSpanned = ranges.back().end - ranges.front().begin;
+
+        std::vector<T> dst(totalSelected);
+
+        encoder->resetGatherProfilingAccum();
+
+#ifdef VTUNE_ENABLED
+        if (config_.vtune.selectiveAccess) __itt_resume();
+#endif
+        auto start = high_resolution_clock::now();
+        encoder->decodeGatherInto(encoded, ranges, dst.data(), totalSelected);
+        auto end = high_resolution_clock::now();
+#ifdef VTUNE_ENABLED
+        if (config_.vtune.selectiveAccess) __itt_pause();
+#endif
+
+        metrics.selectiveAccess.totalGatherTime = duration_cast<nanoseconds>(end - start);
+        metrics.selectiveAccess.rangeCount = ranges.size();
+        metrics.selectiveAccess.totalSelectedRows = totalSelected;
+        metrics.selectiveAccess.selectivity =
+            totalSpanned ? static_cast<double>(totalSelected) / totalSpanned : 0.0;
+        metrics.selectiveAccess.meanRunLength =
+            static_cast<double>(totalSelected) / ranges.size();
+
+        auto skipNs = encoder->gatherSkipTimeNs();
+        auto matNs  = encoder->gatherMaterializeTimeNs();
+        if (skipNs >= 0 && matNs >= 0) {
+            metrics.selectiveAccess.skipMaterializeSplitAvailable = true;
+            metrics.selectiveAccess.averageSkipTimeNs = nanoseconds(skipNs);
+            metrics.selectiveAccess.averageMaterializeTimeNs = nanoseconds(matNs);
+        }
+
+        if (config_.validateRandomAccess) {
+            bool ok = true;
+            size_t off = 0;
+            for (const auto& r : ranges) {
+                for (size_t i = r.begin; i < r.end; ++i, ++off) {
+                    if (dst[off] != original[i]) { ok = false; break; }
+                }
+                if (!ok) break;
+            }
+            if (!ok) {
+                metrics.accuracy.isLossless = false;
+                std::cerr << "Warning: Selective/gather access validation failed for "
+                          << metrics.encoderName << std::endl;
+            }
         }
     }
 };

@@ -73,7 +73,8 @@ public:
         ss << "      \"decodeBulkNetHeapDeltaBytes\": " << memory.decodeBulkNetHeapDeltaBytes << ",\n";
         ss << "      \"decodeRandomPeakHeapBytes\": " << memory.decodeRandomPeakHeapBytes << ",\n";
         ss << "      \"decodeStridedPeakHeapBytes\": " << memory.decodeStridedPeakHeapBytes << ",\n";
-        ss << "      \"decodeRangePeakHeapBytes\": " << memory.decodeRangePeakHeapBytes << "\n";
+        ss << "      \"decodeRangePeakHeapBytes\": " << memory.decodeRangePeakHeapBytes << ",\n";
+        ss << "      \"decodeSelectivePeakHeapBytes\": " << memory.decodeSelectivePeakHeapBytes << "\n";
         ss << "    }";
         return ss.str();
     }
@@ -106,7 +107,24 @@ public:
         ss << "    }";
         return ss.str();
     }
-    
+
+    static std::string toJSON(const SelectiveAccessMetrics& sel) {
+        std::ostringstream ss;
+        ss << "{\n";
+        ss << "      \"totalGatherTime_ns\": " << sel.totalGatherTime.count() << ",\n";
+        ss << "      \"rangeCount\": " << sel.rangeCount << ",\n";
+        ss << "      \"totalSelectedRows\": " << sel.totalSelectedRows << ",\n";
+        ss << "      \"selectivity\": " << sel.selectivity << ",\n";
+        ss << "      \"meanRunLength\": " << sel.meanRunLength << ",\n";
+        ss << "      \"skipMaterializeSplitAvailable\": " << (sel.skipMaterializeSplitAvailable ? "true" : "false");
+        if (sel.skipMaterializeSplitAvailable) {
+            ss << ",\n      \"averageSkipTimeNs\": " << sel.averageSkipTimeNs.count()
+               << ",\n      \"averageMaterializeTimeNs\": " << sel.averageMaterializeTimeNs.count();
+        }
+        ss << "\n    }";
+        return ss.str();
+    }
+
     static std::string toJSON(const SubStreamMetrics& ss) {
         std::ostringstream o;
         o << "{\n";
@@ -136,7 +154,8 @@ public:
         ss << "    \"timing\": " << toJSON(metrics.timing) << ",\n";
         ss << "    \"memory\": " << toJSON(metrics.memory, metrics.elementCount) << ",\n";
         ss << "    \"accuracy\": " << toJSON(metrics.accuracy) << ",\n";
-        ss << "    \"randomAccess\": " << toJSON(metrics.randomAccess);
+        ss << "    \"randomAccess\": " << toJSON(metrics.randomAccess) << ",\n";
+        ss << "    \"selectiveAccess\": " << toJSON(metrics.selectiveAccess);
         if (!metrics.subStreamMetrics.empty()) {
             ss << ",\n    \"subStreamMetrics\": [\n";
             for (size_t i = 0; i < metrics.subStreamMetrics.size(); ++i) {
@@ -304,10 +323,21 @@ public:
             
             if (m.randomAccess.randomAccessCount > 0) {
                 out << "  Random access: " << std::setw(10) << m.randomAccess.averageRandomAccessTime.count() << " ns/read"
-                    << "  (min: " << m.randomAccess.minRandomAccessTime.count() 
+                    << "  (min: " << m.randomAccess.minRandomAccessTime.count()
                     << " ns, max: " << m.randomAccess.maxRandomAccessTime.count() << " ns)\n";
             }
-            
+            if (m.selectiveAccess.rangeCount > 0) {
+                out << "  Selective (gather): " << std::setw(10) << m.selectiveAccess.totalGatherTime.count() << " ns total"
+                    << "  (" << m.selectiveAccess.rangeCount << " ranges, "
+                    << m.selectiveAccess.totalSelectedRows << " rows, selectivity="
+                    << std::fixed << std::setprecision(2) << m.selectiveAccess.selectivity
+                    << ", meanRunLength=" << m.selectiveAccess.meanRunLength << ")\n";
+                if (m.selectiveAccess.skipMaterializeSplitAvailable) {
+                    out << "    skip: " << m.selectiveAccess.averageSkipTimeNs.count()
+                        << " ns, materialize: " << m.selectiveAccess.averageMaterializeTimeNs.count() << " ns\n";
+                }
+            }
+
             // Memory
             out << "\nMEMORY:\n";
             out << "  Original:               " << std::setw(12) << m.memory.originalSize << " bytes\n";
@@ -333,6 +363,9 @@ public:
                 if (m.memory.decodeRangePeakHeapBytes > 0)
                     out << "  Decode range peak:      " << std::setw(12)
                         << m.memory.decodeRangePeakHeapBytes << " bytes\n";
+                if (m.memory.decodeSelectivePeakHeapBytes > 0)
+                    out << "  Decode selective peak:  " << std::setw(12)
+                        << m.memory.decodeSelectivePeakHeapBytes << " bytes\n";
             }
             
             // Accuracy
