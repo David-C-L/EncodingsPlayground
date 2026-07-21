@@ -9,6 +9,7 @@ target_sources(encodings_benchmark INTERFACE
         BenchmarkMetrics.hpp
         BenchmarkRunner.hpp
         BenchmarkOutput.hpp
+        SelectiveTraceGen.hpp
 )
 
 target_include_directories(encodings_benchmark INTERFACE
