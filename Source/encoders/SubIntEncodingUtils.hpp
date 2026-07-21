@@ -18,6 +18,7 @@
 #include "encodings/EncodedData.hpp"
 #include "encodings/EncodingProperty.hpp"
 #include "encodings/EncodingType.hpp"
+#include "encoders/ISectionCodecIntegral.hpp"
 #include "encoders/DictionaryEncoder.hpp"
 #include "encoders/RawEncoder.hpp"
 #include "encoders/RawBitPackedEncoder.hpp"
@@ -25,73 +26,35 @@
 #include "encoders/LZ4Encoder.hpp"
 #include "encoders/FSEEncoder.hpp"
 #include "encoders/AdaptiveFOREncoder.hpp"
+#include "encoders/AdaptiveDictionaryEncoder.hpp"
 #include "encoders/AdaptiveFramedBitPrefixEncoder.hpp"
 #include "encoders/RunLengthEncoder.hpp"
 #include "encoders/HuffmanEncoder.hpp"
 #include "encoders/BWTSectionEncoder.hpp"
 #include "encoders/selectors/SubStreamReordererType.hpp"
 #include "encoders/FrequencyPartitionEncoder.hpp"
+#include "encoders/BlockFrequencyPartitionEncoder.hpp"
+#include "encoders/BlockFSEEncoder.hpp"
+#include "encoders/BlockFORFPEEncoder.hpp"
+#include "encoders/MainlyConstantEncoder.hpp"
 #include "encoders/FOREncoder.hpp"
+#include "encoders/RangePackEncoder.hpp"
+#include "encoders/CascadingFOREncoder.hpp"
 #include "encoders/BitSplitOrder.hpp"
 #include "encoders/selectors/IDSubStreamEncodingSelector.hpp"
 
 namespace encodings::encoders {
 
-// ---------------------------------------------------------------------------
-// Section codec type-erased adapter
-// ---------------------------------------------------------------------------
+// ISectionCodecIntegral lives in its own header (encoders/ISectionCodecIntegral.hpp)
+// so new section-codec-level classes (e.g. RangePackEncoder.hpp) can depend on
+// it without creating a circular include with this file.
 
-template <typename TIn = uint64_t>
-    requires (std::is_same_v<TIn, uint64_t> || std::is_same_v<TIn, uint32_t>)
-class ISectionCodecIntegral {
-public:
-    virtual ~ISectionCodecIntegral() = default;
-
-    virtual EncodedBuffer<uint8_t> encode(std::span<const TIn> data) = 0;
-    virtual std::vector<TIn> decodeAll(const EncodedBuffer<uint8_t>& enc) = 0;
-    virtual std::optional<TIn> decodeAt(const EncodedBuffer<uint8_t>& enc, size_t idx) = 0;
-    virtual std::vector<TIn> decodeRange(const EncodedBuffer<uint8_t>& enc, size_t start, size_t end) = 0;
-
-    // Decode directly into a caller-supplied buffer, eliminating the intermediate
-    // vector allocation that decodeAll / decodeRange would otherwise return.
-    // Implementations must write exactly n elements; a size mismatch is a hard error.
-    virtual void decodeAllInto(const EncodedBuffer<uint8_t>& enc, TIn* dst, size_t n) = 0;
-    virtual void decodeRangeInto(const EncodedBuffer<uint8_t>& enc,
-                                  size_t start, size_t end,
-                                  TIn* dst, size_t n) = 0;
-
-    // Fused decode-and-accumulate: decode and OR-shift directly into acc, avoiding
-    // a separate wide tmp buffer.  isFirst=true: pure write (acc[i] = v << shift);
-    // isFirst=false: read-modify-write (acc[i] |= v << shift).
-    // Default implementation allocates a temporary via decodeAllInto; override in
-    // TypedSectionCodecAdapter (and any other concrete codec) for the hot path.
-    virtual void decodeAllAndAccumulate(const EncodedBuffer<uint8_t>& enc,
-                                        TIn* acc, size_t n,
-                                        uint8_t shift, bool isFirst) {
-        std::vector<TIn> tmp(n);
-        decodeAllInto(enc, tmp.data(), n);
-        if (isFirst) {
-            for (size_t i = 0; i < n; ++i) acc[i] = tmp[i] << shift;
-        } else {
-            for (size_t i = 0; i < n; ++i) acc[i] |= tmp[i] << shift;
-        }
-    }
-
-    virtual void decodeRangeAndAccumulate(const EncodedBuffer<uint8_t>& enc,
-                                          size_t start, size_t end,
-                                          TIn* acc, size_t n,
-                                          uint8_t shift, bool isFirst) {
-        std::vector<TIn> tmp(n);
-        decodeRangeInto(enc, start, end, tmp.data(), n);
-        if (isFirst) {
-            for (size_t i = 0; i < n; ++i) acc[i] = tmp[i] << shift;
-        } else {
-            for (size_t i = 0; i < n; ++i) acc[i] |= tmp[i] << shift;
-        }
-    }
-
-    virtual EncodingProperties properties() const = 0;
-    virtual std::string name() const = 0;
+// Parallelism settings shared by SubIntSplitConfigIntegral and SubIntSplitAutoEncoderConfig.
+// Disabled by default — zero overhead when enabled==false.
+struct SubIntSplitParallelismConfig {
+    bool enabled{false};
+    // Maximum threads to use. 0 means std::thread::hardware_concurrency().
+    size_t maxThreads{0};
 };
 
 // Generic config for sub-integer splits (up to 64 sections, sum(bits)=64)
@@ -102,6 +65,11 @@ struct SubIntSplitConfigIntegral {
     std::vector<uint8_t> bits;  // per-section bit widths
     BitSplitOrder order{BitSplitOrder::LSB_TO_MSB};
     std::vector<std::shared_ptr<ISectionCodecIntegral<TIn>>> codecs; // parallel to bits
+
+    // Optional thread parallelism across sections (encode) and chunks (decode).
+    // Disabled by default — zero overhead and identical behaviour when disabled.
+    using ParallelismConfig = SubIntSplitParallelismConfig;
+    ParallelismConfig parallelism{};
 
     size_t splitCount() const { return bits.size(); }
 
@@ -132,10 +100,18 @@ struct SubIntSplitConfigIntegral {
         }
     }
 
+    // Options that control how section codecs are constructed inside fromSegments().
+    // Does not affect the runtime behaviour of the config itself.
+    struct SectionBuildOptions {
+        bool fpeSectionParallelDecode{false};
+    };
+
     // Build from selector SegmentPlan results (auto-infers order if not provided).
-    static SubIntSplitConfigIntegral fromSegments(const std::vector<selectors::SegmentPlan>& segments);
     static SubIntSplitConfigIntegral fromSegments(const std::vector<selectors::SegmentPlan>& segments,
-                                            BitSplitOrder orderHint);
+                                                  SectionBuildOptions opts = {});
+    static SubIntSplitConfigIntegral fromSegments(const std::vector<selectors::SegmentPlan>& segments,
+                                                  BitSplitOrder orderHint,
+                                                  SectionBuildOptions opts = {});
 };
 
 using SubIntSplitConfig64 = SubIntSplitConfigIntegral<uint64_t>;
@@ -476,6 +452,22 @@ inline std::shared_ptr<ISectionCodecIntegral<SectionCodecTIn>> makeDictionarySec
 }
 
 template <typename SectionCodecTIn = uint64_t>
+inline std::shared_ptr<ISectionCodecIntegral<SectionCodecTIn>>
+makeAdaptiveDictionarySection(uint8_t bits) {
+    const uint8_t w = chooseTypeBits(bits);
+    switch (w) {
+        case  8: return makeSectionCodecForBits<SectionCodecTIn>(
+                     std::make_shared<AdaptiveDictionaryEncoder<uint8_t>>(),  bits);
+        case 16: return makeSectionCodecForBits<SectionCodecTIn>(
+                     std::make_shared<AdaptiveDictionaryEncoder<uint16_t>>(), bits);
+        case 32: return makeSectionCodecForBits<SectionCodecTIn>(
+                     std::make_shared<AdaptiveDictionaryEncoder<uint32_t>>(), bits);
+        default: return makeSectionCodecForBits<SectionCodecTIn>(
+                     std::make_shared<AdaptiveDictionaryEncoder<uint64_t>>(), bits);
+    }
+}
+
+template <typename SectionCodecTIn = uint64_t>
 inline std::shared_ptr<ISectionCodecIntegral<SectionCodecTIn>> makeRawSection(uint8_t bits) {
     const uint8_t w = chooseTypeBits(bits);
     switch (w) {
@@ -583,13 +575,93 @@ inline std::shared_ptr<ISectionCodecIntegral<SectionCodecTIn>> makeFSESection(ui
 }
 
 template <typename SectionCodecTIn = uint64_t>
-inline std::shared_ptr<ISectionCodecIntegral<SectionCodecTIn>> makeFrequencyPartitionSection(uint8_t bits) {
+inline std::shared_ptr<ISectionCodecIntegral<SectionCodecTIn>> makeFrequencyPartitionSection(
+    uint8_t bits, bool parallelDecode = false) {
+    const FrequencyPartitionConfig fpeCfg{.parallelDecode = parallelDecode};
     const uint8_t w = chooseTypeBits(bits);
     switch (w) {
-        case 8:  return makeSectionCodecForBits<SectionCodecTIn>(std::make_shared<FrequencyPartitionEncoder<uint8_t>>(),  bits);
-        case 16: return makeSectionCodecForBits<SectionCodecTIn>(std::make_shared<FrequencyPartitionEncoder<uint16_t>>(), bits);
-        case 32: return makeSectionCodecForBits<SectionCodecTIn>(std::make_shared<FrequencyPartitionEncoder<uint32_t>>(), bits);
-        default: return makeSectionCodecForBits<SectionCodecTIn>(std::make_shared<FrequencyPartitionEncoder<uint64_t>>(), bits);
+        case 8:  return makeSectionCodecForBits<SectionCodecTIn>(std::make_shared<FrequencyPartitionEncoder<uint8_t>>(fpeCfg),  bits);
+        case 16: return makeSectionCodecForBits<SectionCodecTIn>(std::make_shared<FrequencyPartitionEncoder<uint16_t>>(fpeCfg), bits);
+        case 32: return makeSectionCodecForBits<SectionCodecTIn>(std::make_shared<FrequencyPartitionEncoder<uint32_t>>(fpeCfg), bits);
+        default: return makeSectionCodecForBits<SectionCodecTIn>(std::make_shared<FrequencyPartitionEncoder<uint64_t>>(fpeCfg), bits);
+    }
+}
+
+template <typename SectionCodecTIn = uint64_t>
+inline std::shared_ptr<ISectionCodecIntegral<SectionCodecTIn>> makeBlockFrequencyPartitionSection(uint8_t bits) {
+    const uint8_t w = chooseTypeBits(bits);
+    switch (w) {
+        case 8:  return makeSectionCodecForBits<SectionCodecTIn>(std::make_shared<BlockFrequencyPartitionEncoder<uint8_t>>(),  bits);
+        case 16: return makeSectionCodecForBits<SectionCodecTIn>(std::make_shared<BlockFrequencyPartitionEncoder<uint16_t>>(), bits);
+        case 32: return makeSectionCodecForBits<SectionCodecTIn>(std::make_shared<BlockFrequencyPartitionEncoder<uint32_t>>(), bits);
+        default: return makeSectionCodecForBits<SectionCodecTIn>(std::make_shared<BlockFrequencyPartitionEncoder<uint64_t>>(), bits);
+    }
+}
+
+// RangePack composed with FrequencyPartitionEncoding / BlockFrequencyPartitionEncoding
+// (type-narrowed — see encoders/RangePackEncoder.hpp for why a same-width
+// value shift alone would not help these two encoders). The outer 'bits'
+// parameter is accepted only for signature uniformity with every other
+// makeXSection(uint8_t bits) factory; RangePackSectionCodec derives the real
+// narrowed width from the data itself at encode() time.
+template <typename SectionCodecTIn = uint64_t>
+inline std::shared_ptr<ISectionCodecIntegral<SectionCodecTIn>>
+makeRangePackFrequencyPartitionSection(uint8_t /*bits*/) {
+    return makeRangePackSection<SectionCodecTIn>(
+        [](uint8_t narrowedBits) { return makeFrequencyPartitionSection<SectionCodecTIn>(narrowedBits); },
+        encodings::EncodingType::RangePackFrequencyPartitionEncoding);
+}
+
+template <typename SectionCodecTIn = uint64_t>
+inline std::shared_ptr<ISectionCodecIntegral<SectionCodecTIn>>
+makeRangePackBlockFrequencyPartitionSection(uint8_t /*bits*/) {
+    return makeRangePackSection<SectionCodecTIn>(
+        [](uint8_t narrowedBits) { return makeBlockFrequencyPartitionSection<SectionCodecTIn>(narrowedBits); },
+        encodings::EncodingType::RangePackBlockFrequencyPartitionEncoding);
+}
+
+template <typename SectionCodecTIn = uint64_t>
+inline std::shared_ptr<ISectionCodecIntegral<SectionCodecTIn>> makeBlockFSESection(uint8_t bits) {
+    const uint8_t w = chooseTypeBits(bits);
+    switch (w) {
+        case  8: return makeSectionCodecForBits<SectionCodecTIn>(std::make_shared<BlockFSEEncoder<uint8_t>>(),  bits);
+        case 16: return makeSectionCodecForBits<SectionCodecTIn>(std::make_shared<BlockFSEEncoder<uint16_t>>(), bits);
+        case 32: return makeSectionCodecForBits<SectionCodecTIn>(std::make_shared<BlockFSEEncoder<uint32_t>>(), bits);
+        default: return makeSectionCodecForBits<SectionCodecTIn>(std::make_shared<BlockFSEEncoder<uint64_t>>(), bits);
+    }
+}
+
+template <typename SectionCodecTIn = uint64_t>
+inline std::shared_ptr<ISectionCodecIntegral<SectionCodecTIn>> makeBlockFrequencyPartitionFORSection(uint8_t bits) {
+    const uint8_t w = chooseTypeBits(bits);
+    switch (w) {
+        case  8: return makeSectionCodecForBits<SectionCodecTIn>(std::make_shared<BlockFrequencyPartitionEncoder<uint8_t,  FORPrepass::GlobalFOR>>(), bits);
+        case 16: return makeSectionCodecForBits<SectionCodecTIn>(std::make_shared<BlockFrequencyPartitionEncoder<uint16_t, FORPrepass::GlobalFOR>>(), bits);
+        case 32: return makeSectionCodecForBits<SectionCodecTIn>(std::make_shared<BlockFrequencyPartitionEncoder<uint32_t, FORPrepass::GlobalFOR>>(), bits);
+        default: return makeSectionCodecForBits<SectionCodecTIn>(std::make_shared<BlockFrequencyPartitionEncoder<uint64_t, FORPrepass::GlobalFOR>>(), bits);
+    }
+}
+
+template <typename SectionCodecTIn = uint64_t>
+inline std::shared_ptr<ISectionCodecIntegral<SectionCodecTIn>> makeBlockFORFPESection(uint8_t bits) {
+    const uint8_t w = chooseTypeBits(bits);
+    switch (w) {
+        case  8: return makeSectionCodecForBits<SectionCodecTIn>(std::make_shared<BlockFORFPEEncoder<uint8_t>>(),  bits);
+        case 16: return makeSectionCodecForBits<SectionCodecTIn>(std::make_shared<BlockFORFPEEncoder<uint16_t>>(), bits);
+        case 32: return makeSectionCodecForBits<SectionCodecTIn>(std::make_shared<BlockFORFPEEncoder<uint32_t>>(), bits);
+        default: return makeSectionCodecForBits<SectionCodecTIn>(std::make_shared<BlockFORFPEEncoder<uint64_t>>(), bits);
+    }
+}
+
+// Flat (maxDepth=0) MainlyConstant section for SubIntSplit — no recursive overhead.
+template <typename SectionCodecTIn = uint64_t>
+inline std::shared_ptr<ISectionCodecIntegral<SectionCodecTIn>> makeMainlyConstantSection(uint8_t bits) {
+    const uint8_t w = chooseTypeBits(bits);
+    switch (w) {
+        case 8:  return makeSectionCodecForBits<SectionCodecTIn>(std::make_shared<MainlyConstantEncoder<uint8_t>>(),  bits);
+        case 16: return makeSectionCodecForBits<SectionCodecTIn>(std::make_shared<MainlyConstantEncoder<uint16_t>>(), bits);
+        case 32: return makeSectionCodecForBits<SectionCodecTIn>(std::make_shared<MainlyConstantEncoder<uint32_t>>(), bits);
+        default: return makeSectionCodecForBits<SectionCodecTIn>(std::make_shared<MainlyConstantEncoder<uint64_t>>(), bits);
     }
 }
 
@@ -620,6 +692,277 @@ inline std::shared_ptr<ISectionCodecIntegral<SectionCodecTIn>> makeFORSection(ui
     }
 }
 
+// CascadingFOREncoder, standalone. Internal cascade arithmetic is always
+// int64_t regardless of the section's own T (per CascadingFOREncoder's own
+// design), so there is exactly one instantiation needed here, not a width
+// switch like every other makeXSection factory -- but `bits` is still passed
+// straight through to makeSectionCodecForBits (NOT hardcoded to 64), since
+// TypedSectionCodecAdapter uses it to validate incoming values actually fit in
+// the section's declared width, exactly like every other factory.
+// Default schedule mirrors makeFORSection<512,...>'s frame-size convention
+// (512 is the FrameSize used by every existing makeFORSection<512,...> call
+// site in this file), with a small reference cascade so the cascade machinery
+// itself is exercised rather than degenerating to a single flat FOR pass.
+template <typename SectionCodecTIn = uint64_t>
+inline std::shared_ptr<ISectionCodecIntegral<SectionCodecTIn>>
+makeCascadingFORSection(uint8_t bits) {
+    CascadingFORConfig cfg;
+    cfg.residualSchedule  = { {512, FORReferencePolicy::MIN} };
+    cfg.referenceSchedule = { {64,  FORReferencePolicy::MIN} };
+    // residualLeafEncoder / referenceLeafEncoder left at CascadingFORConfig's
+    // own defaults (RawBitPackedEncoder<int64_t>).
+    return makeSectionCodecForBits<SectionCodecTIn>(
+        std::make_shared<CascadingFOREncoder<int64_t>>(std::move(cfg)), bits);
+}
+
+// CascadingFOR composed with BlockFrequencyPartitionEncoder on the residual
+// stream ("BlockFrequencyPartitionEncoder on the residuals and CascadingFOR on
+// the references, then eventually bitpacking") -- same schedule as
+// makeCascadingFORSection above, but with a BlockFrequencyPartitionEncoder
+// residual leaf instead of the default RawBitPackedEncoder; referenceLeafEncoder
+// stays default (plain bitpacked).
+template <typename SectionCodecTIn = uint64_t>
+inline std::shared_ptr<ISectionCodecIntegral<SectionCodecTIn>>
+makeCascadingFORBlockFrequencyPartitionSection(uint8_t bits) {
+    CascadingFORConfig cfg;
+    cfg.residualSchedule    = { {512, FORReferencePolicy::MIN} };
+    cfg.referenceSchedule   = { {64,  FORReferencePolicy::MIN} };
+    cfg.residualLeafEncoder = std::make_shared<BlockFrequencyPartitionEncoder<int64_t>>();
+    return makeSectionCodecForBits<SectionCodecTIn>(
+        std::make_shared<CascadingFOREncoder<int64_t>>(std::move(cfg)), bits);
+}
+
+// CascadingFOR composed with a genuine entropy coder (FSE/BlockFSE/Huffman) on
+// the residual stream, same "1 level of CascadingFOR + bitpacked leaf" schedule
+// on the references as the other makeCascadingFOR*Section factories above.
+//
+// RANDOM ACCESS CAVEAT: unlike runStarts (sparse, R << N) or the per-frame
+// reference array (shrinks by frameSize each level), the RESIDUAL stream is
+// always exactly N-sized regardless of cascade depth -- residual arrays
+// preserve full N-length indexing at every level (see CascadingFOREncoder.hpp's
+// class doc). So composing with a residual leaf that lacks genuine RandomAccess
+// does NOT get the same "safe because sparse" argument that motivated
+// RunLengthEncoder's runStarts composition:
+//   - makeCascadingFORFSESection / makeCascadingFORHuffmanSection: FSEEncoder
+//     and HuffmanEncoder do NOT have genuine random access (their properties()
+//     no longer claims otherwise -- see FSEEncoder.hpp/HuffmanEncoder.hpp fixes).
+//     CascadingFOREncoder::properties() correctly reports RandomAccess=false for
+//     these two compositions, and decodeAt/decodeRange fall back to a one-time
+//     cached decodeAll() of the FULL N-element residual stream -- i.e. an O(N)
+//     first touch, same cost a flat standalone FSEEncoding/HuffmanEncoding
+//     section already has today. These two are registered for OFFLINE
+//     comparison in the oracle DP (to see whether entropy coding could help
+//     compression at all here) -- NOT as safe candidates for real random-access
+//     deployment.
+//   - makeCascadingFORBlockFSESection: BlockFSEEncoder genuinely has O(blockSize)
+//     decodeAt (confirmed via its own properties()/docstring), so this
+//     composition DOES preserve real random access end-to-end.
+template <typename SectionCodecTIn = uint64_t>
+inline std::shared_ptr<ISectionCodecIntegral<SectionCodecTIn>>
+makeCascadingFORFSESection(uint8_t bits) {
+    CascadingFORConfig cfg;
+    cfg.residualSchedule    = { {512, FORReferencePolicy::MIN} };
+    cfg.referenceSchedule   = { {64,  FORReferencePolicy::MIN} };
+    cfg.residualLeafEncoder = std::make_shared<FSEEncoder<int64_t>>();
+    return makeSectionCodecForBits<SectionCodecTIn>(
+        std::make_shared<CascadingFOREncoder<int64_t>>(std::move(cfg)), bits);
+}
+
+template <typename SectionCodecTIn = uint64_t>
+inline std::shared_ptr<ISectionCodecIntegral<SectionCodecTIn>>
+makeCascadingFORBlockFSESection(uint8_t bits) {
+    CascadingFORConfig cfg;
+    cfg.residualSchedule    = { {512, FORReferencePolicy::MIN} };
+    cfg.referenceSchedule   = { {64,  FORReferencePolicy::MIN} };
+    cfg.residualLeafEncoder = std::make_shared<BlockFSEEncoder<int64_t>>();
+    return makeSectionCodecForBits<SectionCodecTIn>(
+        std::make_shared<CascadingFOREncoder<int64_t>>(std::move(cfg)), bits);
+}
+
+template <typename SectionCodecTIn = uint64_t>
+inline std::shared_ptr<ISectionCodecIntegral<SectionCodecTIn>>
+makeCascadingFORHuffmanSection(uint8_t bits) {
+    CascadingFORConfig cfg;
+    cfg.residualSchedule    = { {512, FORReferencePolicy::MIN} };
+    cfg.referenceSchedule   = { {64,  FORReferencePolicy::MIN} };
+    cfg.residualLeafEncoder = std::make_shared<HuffmanEncoder<int64_t>>();
+    return makeSectionCodecForBits<SectionCodecTIn>(
+        std::make_shared<CascadingFOREncoder<int64_t>>(std::move(cfg)), bits);
+}
+
+// PREV-policy siblings of the three makeCascadingFOR*Section factories above
+// (FSE/BlockFSE/Huffman) plus PREV-composed FrequencyPartitionEncoder/
+// BlockFrequencyPartitionEncoder leaves: residualSchedule uses
+// FORReferencePolicy::PREV (consecutive-element delta, bounded to this
+// frame -- see FOREncoder.hpp's FORReferencePolicy::PREV doc) instead of MIN.
+// referenceSchedule stays MIN -- the reference array stores raw data[lo]
+// anchors, not deltas, so PREV doesn't apply there.
+//
+// Motivation (root-caused this session against the real Twitter Snowflake
+// dataset): bits[22..49] (28 bits) is stuck at plain BitPacking -- every
+// registered MIN-policy encoding fails to beat it, while MANUALLY
+// byte-plane-transposing the segment (4 separate 8-bit-wide arrays), THEN
+// delta-coding WITHIN each plane, THEN Huffman/FSE-coding each plane
+// separately, reproduced OpenZL's ~10.6% external-tool win almost exactly.
+//
+// IMPORTANT (empirically verified, do not skip when evaluating this
+// composition): PREV applied directly to the WHOLE 28-bit value (as these
+// factories do -- there is no byte-plane transpose here) does NOT reproduce
+// that win. A real sweep against the actual bits[22..49] column (10M rows)
+// showed every leaf performing 2-3x WORSE than plain BitPacking (Huffman:
+// ~81MB, BlockFSE: ~108MB, FrequencyPartition: ~71MB,
+// BlockFrequencyPartition: ~80MB, all vs BitPacking's 35MB; FSE couldn't even
+// build a table -- residual cardinality ~6M exceeds its ~1M-symbol limit).
+// This is because the FULL-VALUE delta stream is still close to injective:
+// only 2 of the segment's 4 underlying bytes have real delta-friendly
+// structure, and mixing all 4 bytes' deltas into one value swamps that
+// structure with the other two (near-random) bytes' noise. Frame size barely
+// matters for this ill-fitting case (best vs 512/64 default differed by only
+// 0.16-0.30% across all 5 leaves), which is itself informative -- there is no
+// "correct" tuning to rescue a fundamentally mismatched transform granularity.
+//
+// These compositions remain genuinely useful for segments where the FULL
+// VALUE (not just some of its bytes) is delta-friendly -- confirmed via this
+// session's own test suite (test_prev_reference_policy.cpp's monotone/
+// drifting-counter cases show real, large wins). Closing the bits[22..49]
+// gap specifically requires an actual byte-plane transpose reorderer
+// (splitting a section into its native byte-planes before any of these
+// factories run on each plane independently) -- a separate, not-yet-built
+// follow-up; PREV alone is necessary but not sufficient for that gap.
+//
+// Frame size 512/64 kept at the existing MIN-policy siblings' convention --
+// confirmed empirically (not a placeholder) that finer tuning doesn't matter
+// for the mismatched full-value case above, and no delta-friendly-full-value
+// dataset was available in this session to tune against instead.
+//
+// CascadingFORPrevFrequencyPartitionEncoding has no existing MIN-policy
+// sibling (only the Block variant was ever wired up as a Cascading
+// composition) -- registered directly in its PREV form since that's the
+// combination actually motivated by the root-cause investigation above.
+template <typename SectionCodecTIn = uint64_t>
+inline std::shared_ptr<ISectionCodecIntegral<SectionCodecTIn>>
+makeCascadingFORPrevFSESection(uint8_t bits) {
+    CascadingFORConfig cfg;
+    cfg.residualSchedule    = { {512, FORReferencePolicy::PREV} };
+    cfg.referenceSchedule   = { {64,  FORReferencePolicy::MIN} };
+    cfg.residualLeafEncoder = std::make_shared<FSEEncoder<int64_t>>();
+    return makeSectionCodecForBits<SectionCodecTIn>(
+        std::make_shared<CascadingFOREncoder<int64_t>>(std::move(cfg)), bits);
+}
+
+template <typename SectionCodecTIn = uint64_t>
+inline std::shared_ptr<ISectionCodecIntegral<SectionCodecTIn>>
+makeCascadingFORPrevBlockFSESection(uint8_t bits) {
+    CascadingFORConfig cfg;
+    cfg.residualSchedule    = { {512, FORReferencePolicy::PREV} };
+    cfg.referenceSchedule   = { {64,  FORReferencePolicy::MIN} };
+    cfg.residualLeafEncoder = std::make_shared<BlockFSEEncoder<int64_t>>();
+    return makeSectionCodecForBits<SectionCodecTIn>(
+        std::make_shared<CascadingFOREncoder<int64_t>>(std::move(cfg)), bits);
+}
+
+template <typename SectionCodecTIn = uint64_t>
+inline std::shared_ptr<ISectionCodecIntegral<SectionCodecTIn>>
+makeCascadingFORPrevHuffmanSection(uint8_t bits) {
+    CascadingFORConfig cfg;
+    cfg.residualSchedule    = { {512, FORReferencePolicy::PREV} };
+    cfg.referenceSchedule   = { {64,  FORReferencePolicy::MIN} };
+    cfg.residualLeafEncoder = std::make_shared<HuffmanEncoder<int64_t>>();
+    return makeSectionCodecForBits<SectionCodecTIn>(
+        std::make_shared<CascadingFOREncoder<int64_t>>(std::move(cfg)), bits);
+}
+
+template <typename SectionCodecTIn = uint64_t>
+inline std::shared_ptr<ISectionCodecIntegral<SectionCodecTIn>>
+makeCascadingFORPrevFrequencyPartitionSection(uint8_t bits) {
+    CascadingFORConfig cfg;
+    cfg.residualSchedule    = { {512, FORReferencePolicy::PREV} };
+    cfg.referenceSchedule   = { {64,  FORReferencePolicy::MIN} };
+    cfg.residualLeafEncoder = std::make_shared<FrequencyPartitionEncoder<int64_t>>();
+    return makeSectionCodecForBits<SectionCodecTIn>(
+        std::make_shared<CascadingFOREncoder<int64_t>>(std::move(cfg)), bits);
+}
+
+template <typename SectionCodecTIn = uint64_t>
+inline std::shared_ptr<ISectionCodecIntegral<SectionCodecTIn>>
+makeCascadingFORPrevBlockFrequencyPartitionSection(uint8_t bits) {
+    CascadingFORConfig cfg;
+    cfg.residualSchedule    = { {512, FORReferencePolicy::PREV} };
+    cfg.referenceSchedule   = { {64,  FORReferencePolicy::MIN} };
+    cfg.residualLeafEncoder = std::make_shared<BlockFrequencyPartitionEncoder<int64_t>>();
+    return makeSectionCodecForBits<SectionCodecTIn>(
+        std::make_shared<CascadingFOREncoder<int64_t>>(std::move(cfg)), bits);
+}
+
+// Dedicated schedule for CascadingFOR applied to a runStarts array specifically
+// (as opposed to makeCascadingFORSection's 512/64, tuned for dense per-element
+// VALUE streams). Empirically validated against the actual runStarts arrays of
+// the two real segments RunLengthCascadingFOREncoding wins on in the Twitter
+// Snowflake benchmark (bits[51..58]: 658,849 runs; bits[59..63]: 6,057 runs):
+// a frame-size sweep (64/128/256/512/1024/2048/4096 residual x 8/16/32/64/128
+// reference) showed 128/16 is best-or-near-best on BOTH -- 1,164,411 vs the
+// old 512/64 default's 1,238,787 bytes (-6.0%) on the first, and 14,699 vs
+// 16,099 bytes (-8.7%) on the second (not quite the absolute best there --
+// 64/8 gets 14,067 -- but 128/16 is the better single compromise across both).
+// This makes intuitive sense: runStarts values grow at a roughly constant
+// rate (~N/numRuns apart on average), so a SMALL frame keeps the local
+// reference tight relative to that growth; a dense value stream doesn't have
+// this property, which is why makeCascadingFORSection's own 512/64 default
+// stays reasonable there (only ~0.2-0.3% off the empirical optimum when swept
+// the same way against real bits[0..12]/[14..21]/[22..50] value streams).
+template <typename SectionCodecTIn = uint64_t>
+inline std::shared_ptr<ISectionCodecIntegral<SectionCodecTIn>>
+makeCascadingFORSectionForRunStarts(uint8_t bits) {
+    CascadingFORConfig cfg;
+    cfg.residualSchedule  = { {128, FORReferencePolicy::MIN} };
+    cfg.referenceSchedule = { {16,  FORReferencePolicy::MIN} };
+    return makeSectionCodecForBits<SectionCodecTIn>(
+        std::make_shared<CascadingFOREncoder<int64_t>>(std::move(cfg)), bits);
+}
+
+// RunLengthEncoding with its runStarts array (absolute run-start positions,
+// monotonically increasing, R entries where R = number of runs, R << N)
+// compressed via CascadingFOR instead of stored at a fixed 8 bytes/run --
+// runStarts is exactly the "sparse, aggregate-level stream" a FOR-cascade is
+// safe to apply to without sacrificing random access (see RunLengthConfig's
+// doc in RunLengthEncoder.hpp). runValues stays raw. The runStartsFactory
+// lambda is uint64_t-typed regardless of the section's own T, so it is reused
+// unchanged across all four width branches below.
+template <typename SectionCodecTIn = uint64_t>
+inline std::shared_ptr<ISectionCodecIntegral<SectionCodecTIn>>
+makeRLECascadingFORSection(uint8_t bits) {
+    const uint8_t w = chooseTypeBits(bits);
+    auto runStartsFactory = [](uint8_t startsBits) {
+        return makeCascadingFORSectionForRunStarts<uint64_t>(startsBits);
+    };
+    switch (w) {
+        case 8: {
+            RunLengthConfig<uint8_t> cfg;
+            cfg.runStartsFactory = runStartsFactory;
+            return makeSectionCodecForBits<SectionCodecTIn>(
+                std::make_shared<RunLengthEncoder<uint8_t>>(std::move(cfg)), bits);
+        }
+        case 16: {
+            RunLengthConfig<uint16_t> cfg;
+            cfg.runStartsFactory = runStartsFactory;
+            return makeSectionCodecForBits<SectionCodecTIn>(
+                std::make_shared<RunLengthEncoder<uint16_t>>(std::move(cfg)), bits);
+        }
+        case 32: {
+            RunLengthConfig<uint32_t> cfg;
+            cfg.runStartsFactory = runStartsFactory;
+            return makeSectionCodecForBits<SectionCodecTIn>(
+                std::make_shared<RunLengthEncoder<uint32_t>>(std::move(cfg)), bits);
+        }
+        default: {
+            RunLengthConfig<uint64_t> cfg;
+            cfg.runStartsFactory = runStartsFactory;
+            return makeSectionCodecForBits<SectionCodecTIn>(
+                std::make_shared<RunLengthEncoder<uint64_t>>(std::move(cfg)), bits);
+        }
+    }
+}
+
 } // namespace detail_trisplit
 
 // ---------------------------------------------------------------------------
@@ -637,7 +980,16 @@ inline std::shared_ptr<encodings::Codec<T, uint8_t>>
 makeTypedSectionCodec(encodings::EncodingType enc) {
     switch (enc) {
         case encodings::EncodingType::DictionaryEncoding:
-            return std::make_shared<DictionaryEncoder<T>>();
+            return std::make_shared<AdaptiveDictionaryEncoder<T>>();
+            // return std::make_shared<DictionaryEncoder<T>>();
+        case encodings::EncodingType::AdaptiveDictionaryEncoding:
+            return std::make_shared<AdaptiveDictionaryEncoder<T>>();
+        case encodings::EncodingType::BlockFrequencyPartitionEncoding:
+            return std::make_shared<BlockFrequencyPartitionEncoder<T>>();
+        case encodings::EncodingType::BlockFrequencyPartitionFOREncoding:
+            return std::make_shared<BlockFrequencyPartitionEncoder<T, FORPrepass::GlobalFOR>>();
+        case encodings::EncodingType::BlockFSEEncoding:
+            return std::make_shared<BlockFSEEncoder<T>>();
         case encodings::EncodingType::BitPacking:
             return std::make_shared<RawBitPackedEncoder<T>>();
         case encodings::EncodingType::RunLengthEncoding:
@@ -688,19 +1040,24 @@ inline BitSplitOrder inferOrderFromSegments(const std::vector<selectors::Segment
 
 template <typename TIn>
     requires (std::is_same_v<TIn, uint64_t> || std::is_same_v<TIn, uint32_t>)
-inline SubIntSplitConfigIntegral<TIn> SubIntSplitConfigIntegral<TIn>::fromSegments(const std::vector<selectors::SegmentPlan>& segments) {
+inline SubIntSplitConfigIntegral<TIn> SubIntSplitConfigIntegral<TIn>::fromSegments(
+    const std::vector<selectors::SegmentPlan>& segments,
+    SectionBuildOptions opts) {
     const BitSplitOrder inferred = SubIntSplitConfigIntegralFactory::inferOrderFromSegments(segments);
-    return fromSegments(segments, inferred);
+    return fromSegments(segments, inferred, opts);
 }
 
 template <typename TIn>
     requires (std::is_same_v<TIn, uint64_t> || std::is_same_v<TIn, uint32_t>)
 inline SubIntSplitConfigIntegral<TIn> SubIntSplitConfigIntegral<TIn>::fromSegments(
     const std::vector<selectors::SegmentPlan>& segments,
-    BitSplitOrder orderHint) {
+    BitSplitOrder orderHint,
+    SectionBuildOptions opts) {
     if (segments.empty()) {
         throw std::invalid_argument("SubIntSplitConfigIntegral::fromSegments: no segments provided");
     }
+
+    // std::cout << opts.fpeSectionParallelDecode << std::endl;
 
     // Copy and sort based on order hint to enforce contiguity check.
     std::vector<selectors::SegmentPlan> sorted = segments;
@@ -774,7 +1131,11 @@ inline SubIntSplitConfigIntegral<TIn> SubIntSplitConfigIntegral<TIn>::fromSegmen
                 cfg.codecs.push_back(detail_trisplit::makeRawSection<TIn>(width));
                 break;
             case encodings::EncodingType::DictionaryEncoding:
-                cfg.codecs.push_back(detail_trisplit::makeDictionarySection<TIn>(width));
+                cfg.codecs.push_back(detail_trisplit::makeAdaptiveDictionarySection<TIn>(width));
+                // cfg.codecs.push_back(detail_trisplit::makeDictionarySection<TIn>(width));
+                break;
+            case encodings::EncodingType::AdaptiveDictionaryEncoding:
+                cfg.codecs.push_back(detail_trisplit::makeAdaptiveDictionarySection<TIn>(width));
                 break;
             case encodings::EncodingType::FrameOfReference:
                 cfg.codecs.push_back(detail_trisplit::makeFORSection<512, TIn>(width));
@@ -804,7 +1165,60 @@ inline SubIntSplitConfigIntegral<TIn> SubIntSplitConfigIntegral<TIn>::fromSegmen
                 cfg.codecs.push_back(detail_trisplit::makeFSESection<TIn>(width));
                 break;
             case encodings::EncodingType::FrequencyPartitionEncoding:
-                cfg.codecs.push_back(detail_trisplit::makeFrequencyPartitionSection<TIn>(width));
+                // cfg.codecs.push_back(detail_trisplit::makeBlockFrequencyPartitionSection<TIn>(width));
+                cfg.codecs.push_back(detail_trisplit::makeFrequencyPartitionSection<TIn>(
+                    width, opts.fpeSectionParallelDecode));
+                break;
+            case encodings::EncodingType::BlockFrequencyPartitionEncoding:
+                cfg.codecs.push_back(detail_trisplit::makeBlockFrequencyPartitionSection<TIn>(width));
+                break;
+            case encodings::EncodingType::BlockFORFPEEncoding:
+                cfg.codecs.push_back(detail_trisplit::makeBlockFORFPESection<TIn>(width));
+                break;
+            case encodings::EncodingType::BlockFSEEncoding:
+                cfg.codecs.push_back(detail_trisplit::makeBlockFSESection<TIn>(width));
+                break;
+            case encodings::EncodingType::MainlyConstantEncoding:
+                cfg.codecs.push_back(detail_trisplit::makeMainlyConstantSection<TIn>(width));
+                break;
+            case encodings::EncodingType::RangePackFrequencyPartitionEncoding:
+                cfg.codecs.push_back(detail_trisplit::makeRangePackFrequencyPartitionSection<TIn>(width));
+                break;
+            case encodings::EncodingType::RangePackBlockFrequencyPartitionEncoding:
+                cfg.codecs.push_back(detail_trisplit::makeRangePackBlockFrequencyPartitionSection<TIn>(width));
+                break;
+            case encodings::EncodingType::CascadingFrameOfReference:
+                cfg.codecs.push_back(detail_trisplit::makeCascadingFORSection<TIn>(width));
+                break;
+            case encodings::EncodingType::CascadingFORBlockFrequencyPartitionEncoding:
+                cfg.codecs.push_back(detail_trisplit::makeCascadingFORBlockFrequencyPartitionSection<TIn>(width));
+                break;
+            case encodings::EncodingType::RunLengthCascadingFOREncoding:
+                cfg.codecs.push_back(detail_trisplit::makeRLECascadingFORSection<TIn>(width));
+                break;
+            case encodings::EncodingType::CascadingFORFSEEncoding:
+                cfg.codecs.push_back(detail_trisplit::makeCascadingFORFSESection<TIn>(width));
+                break;
+            case encodings::EncodingType::CascadingFORBlockFSEEncoding:
+                cfg.codecs.push_back(detail_trisplit::makeCascadingFORBlockFSESection<TIn>(width));
+                break;
+            case encodings::EncodingType::CascadingFORHuffmanEncoding:
+                cfg.codecs.push_back(detail_trisplit::makeCascadingFORHuffmanSection<TIn>(width));
+                break;
+            case encodings::EncodingType::CascadingFORPrevFSEEncoding:
+                cfg.codecs.push_back(detail_trisplit::makeCascadingFORPrevFSESection<TIn>(width));
+                break;
+            case encodings::EncodingType::CascadingFORPrevBlockFSEEncoding:
+                cfg.codecs.push_back(detail_trisplit::makeCascadingFORPrevBlockFSESection<TIn>(width));
+                break;
+            case encodings::EncodingType::CascadingFORPrevHuffmanEncoding:
+                cfg.codecs.push_back(detail_trisplit::makeCascadingFORPrevHuffmanSection<TIn>(width));
+                break;
+            case encodings::EncodingType::CascadingFORPrevFrequencyPartitionEncoding:
+                cfg.codecs.push_back(detail_trisplit::makeCascadingFORPrevFrequencyPartitionSection<TIn>(width));
+                break;
+            case encodings::EncodingType::CascadingFORPrevBlockFrequencyPartitionEncoding:
+                cfg.codecs.push_back(detail_trisplit::makeCascadingFORPrevBlockFrequencyPartitionSection<TIn>(width));
                 break;
             default:
                 throw std::invalid_argument("SubIntSplitConfigIntegral::fromSegments: unsupported encoding type for section");
