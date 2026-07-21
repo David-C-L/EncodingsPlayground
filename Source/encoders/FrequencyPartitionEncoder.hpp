@@ -7,11 +7,13 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
+#include <future>
 #include <iostream>
 #include <limits>
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <thread>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -35,6 +37,19 @@ enum class FreqPartIndexType : uint8_t {
     TierTagArray   = 1, ///< single ceil(log2(numTiers+1))-bit tag per position
     EliasFano      = 2, ///< per-tier Elias-Fano positions + per-tier keys
     NoIndex        = 3, ///< no position index; rows are reordered by tier then fallback
+};
+
+// Runtime config for FrequencyPartitionEncoder.
+// Default-constructed (parallelDecode=false) is identical to the pre-config behaviour.
+struct FrequencyPartitionConfig {
+    bool parallelDecode{false};
+    // Maximum concurrent tier tasks. 0 = std::thread::hardware_concurrency().
+    size_t maxThreads{0};
+    // Minimum number of elements in the decode call before async tasks are launched.
+    // Prevents std::async thread-creation overhead from dominating small decodeRange
+    // calls (e.g. rangeSize=16K).  Default: 128K — well below decodeAll at 10M but
+    // well above typical range query sizes.
+    size_t parallelDecodeMinElements{1u << 17};
 };
 
 /// Frequency-partition encoding with per-tier bitmaps for O(numTiers) random access.
@@ -91,7 +106,7 @@ public:
     // widths 1,2,...,kMaxKeyBits. Each tier's actual capacity is 2^keyBits.
     static constexpr size_t kNumActiveTiers = kMaxKeyBits;
 
-    explicit FrequencyPartitionEncoder() = default;
+    explicit FrequencyPartitionEncoder(FrequencyPartitionConfig cfg = {}) : cfg_(std::move(cfg)) {}
 
     // ---------------------------------------------------------------------------
     // Encode
@@ -520,7 +535,15 @@ public:
     // Decode helpers
     // ---------------------------------------------------------------------------
 
+    size_t effectiveThreadCount(size_t workUnits) const {
+        const size_t hw  = std::thread::hardware_concurrency();
+        const size_t cap = (cfg_.maxThreads > 0) ? cfg_.maxThreads : (hw > 0 ? hw : 1);
+        return std::min(workUnits, cap);
+    }
+
 private:
+    FrequencyPartitionConfig cfg_{};
+
     static bool verboseEnabled() {
         static bool v = (std::getenv("FREQPART_VERBOSE") != nullptr);
         return v;
@@ -942,10 +965,11 @@ private:
     // ---------------------------------------------------------------------------
 
     void decodeAllPerTierBitmapsInto(const EncodedBuffer<uint8_t>& enc, const ParsedHeader& h, T* out) const {
-        const size_t N = static_cast<size_t>(h.numElements);
+        const size_t N         = static_cast<size_t>(h.numElements);
+        const uint8_t* encBase = enc.data().data();
 
-        for (const auto& td : h.tiers) {
-            const uint8_t* keysBase = enc.data().data() + td.keysOffset;
+        auto decodeTier = [&](const ParsedHeader::TierData& td) {
+            const uint8_t* keysBase = encBase + td.keysOffset;
             size_t rank = 0;
             for (size_t w = 0; w < h.numWords; ++w) {
                 uint64_t word = td.bitmap[w];
@@ -957,10 +981,23 @@ private:
                     word &= word - 1;
                 }
             }
+        };
+
+        // Phase 1: decode tiers. Tiers write to disjoint output positions so
+        // concurrent writes are safe without locks.
+        if (cfg_.parallelDecode && h.tiers.size() > 1 && N >= cfg_.parallelDecodeMinElements) {
+            std::vector<std::future<void>> futures;
+            futures.reserve(h.tiers.size());
+            for (const auto& td : h.tiers)
+                futures.push_back(std::async(std::launch::async, decodeTier, std::cref(td)));
+            for (auto& f : futures) f.get();
+        } else {
+            for (const auto& td : h.tiers) decodeTier(td);
         }
 
+        // Phase 2: fallback (sequential; coveredBitmap already computed in header parse).
         if (h.fallbackCount > 0) {
-            const uint8_t* fpBytes = enc.data().data() + h.fallbackOffset + 4;
+            const uint8_t* fpBytes = encBase + h.fallbackOffset + 4;
             size_t fi = 0;
             for (size_t w = 0; w < h.numWords; ++w) {
                 uint64_t uncov = ~h.coveredBitmap[w];
@@ -1095,7 +1132,16 @@ private:
     }
 
     std::optional<T> decodeAtPerTierBitmaps(const EncodedBuffer<uint8_t>& enc, const ParsedHeader& h, size_t i) const {
+        // Prefetch the next element's bitmap word for all tiers; reduces DRAM
+        // latency when decodeAt is called sequentially (CPI 12–41 without this).
+        const size_t nextWord = (i + 1) / 64;
         for (const auto& td : h.tiers) {
+            if (td.tierCount == 0) continue;
+            if (nextWord < td.bitmap.size())
+                __builtin_prefetch(&td.bitmap[nextWord], 0, 1);
+        }
+        for (const auto& td : h.tiers) {
+            if (td.tierCount == 0) continue;
             if (td.bitmap[i / 64] & (uint64_t{1} << (i % 64))) {
                 const size_t rank = popcountPrefixFast(td, i);
                 return td.dict[unpackKey(enc.data().data() + td.keysOffset, rank, td.keyBits)];
@@ -1164,44 +1210,134 @@ private:
                                        size_t start, size_t end, T* dst) const {
         const size_t N      = static_cast<size_t>(h.numElements);
         const size_t wStart = start / 64;
-        const size_t wEnd   = (end + 63) / 64;  // exclusive; shared by tier + fallback loops
+        const size_t wEnd   = (end + 63) / 64;  // exclusive
 
-        // Word-based scan: iterate only over 64-bit words that have set bits,
-        // using __builtin_ctzll to find each set position.  This eliminates the
-        // per-element unpredictable branch that per-position testing would cause
-        // (particularly severe for uint16_t where tier coverage is ~50/50).
+        // Collect active tiers and precompute per-tier starting ranks.
+        // Stored on the stack (max 32 tiers for u64 storage) to avoid heap allocation.
+        struct TierState {
+            const ParsedHeader::TierData* td;
+            const uint8_t*  keysBase;
+            size_t          rank;
+        };
+        TierState tierStates[32];
+        size_t activeTiers = 0;
         for (const auto& td : h.tiers) {
-            size_t rank = popcountPrefixFast(td, start);
-            const uint8_t* keysBase = enc.data().data() + td.keysOffset;
+            if (td.tierCount == 0) continue;
+            tierStates[activeTiers++] = {&td, enc.data().data() + td.keysOffset,
+                                         popcountPrefixFast(td, start)};
+        }
+
+        // Choose decode path based on total tier coverage fraction.
+        //
+        // Word-scan (scattered writes): efficient when coverage is sparse — skips
+        // zero-bit words entirely, processes only set bits per tier.  Writes to
+        // dst at non-contiguous positions (one per set bit), which causes
+        // store-to-load forwarding stalls when accumulateScratch reads dst
+        // sequentially immediately afterward.
+        //
+        // Sequential (stride-1 writes): iterates every element position in order,
+        // tests tier membership per element, and writes dst[i-start] = value
+        // sequentially.  Eliminates the forwarding stall at the cost of checking
+        // all active tiers per element.  Preferred when tieredFraction >= 0.30
+        // so the per-element overhead is outweighed by the forwarding benefit.
+        size_t totalTiered = 0;
+        for (size_t t = 0; t < activeTiers; ++t)
+            totalTiered += tierStates[t].td->tierCount;
+        const bool useSequential = (activeTiers > 0) && (h.numElements > 0) &&
+            (totalTiered * 10 >= h.numElements * 3); // tieredFraction >= 0.30
+
+        const uint8_t* fpBytes = enc.data().data() + h.fallbackOffset + 4;
+
+        if (useSequential) {
+            // Sequential path: stride-1 writes to dst.  Cache each tier's bitmap
+            // word for the current 64-element block to avoid reloading per element.
+            size_t fi = (h.fallbackCount > 0) ? fallbackRankAt(h, start) : 0;
+            uint64_t tierWord[32];
+
             for (size_t w = wStart; w < wEnd; ++w) {
-                uint64_t word = td.bitmap[w];
-                if (w == wStart && (start & 63))  word &= ~((uint64_t{1} << (start & 63)) - 1);
-                if (w + 1 == wEnd && (end & 63))   word &=  (uint64_t{1} << (end   & 63)) - 1;
-                while (word) {
-                    const size_t bit = static_cast<size_t>(__builtin_ctzll(word));
-                    dst[w * 64 + bit - start] = td.dict[unpackKey(keysBase, rank, td.keyBits)];
-                    ++rank;
-                    word &= word - 1;
+                for (size_t t = 0; t < activeTiers; ++t)
+                    tierWord[t] = tierStates[t].td->bitmap[w];
+
+                const size_t iBegin = std::max(start, w * 64);
+                const size_t iEnd   = std::min(end, (w + 1) * 64);
+                for (size_t i = iBegin; i < iEnd; ++i) {
+                    const uint64_t mask = uint64_t{1} << (i & 63);
+                    bool found = false;
+                    for (size_t t = 0; t < activeTiers; ++t) {
+                        if (tierWord[t] & mask) {
+                            TierState& ts = tierStates[t];
+                            dst[i - start] = ts.td->dict[unpackKey(ts.keysBase, ts.rank, ts.td->keyBits)];
+                            ++ts.rank;
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        T v; std::memcpy(&v, fpBytes + fi * sizeof(T), sizeof(T));
+                        dst[i - start] = v;
+                        ++fi;
+                    }
                 }
             }
-        }
-        if (h.fallbackCount > 0) {
-            size_t fi = fallbackRankAt(h, start);
-            const uint8_t* fpBytes = enc.data().data() + h.fallbackOffset + 4;
-            for (size_t w = wStart; w < wEnd; ++w) {
-                uint64_t uncov = ~h.coveredBitmap[w];
-                if (w == wStart && (start & 63))  uncov &= ~((uint64_t{1} << (start & 63)) - 1);
-                // Combine end-of-range mask and N-boundary mask for the last word:
-                const size_t endBit = (w + 1 == wEnd       && (end & 63)) ? (end & 63) : 64;
-                const size_t nBit   = (w + 1 == h.numWords && (N   & 63)) ? (N   & 63) : 64;
-                if (const size_t clamp = std::min(endBit, nBit); clamp < 64)
-                    uncov &= (uint64_t{1} << clamp) - 1;
-                while (uncov) {
-                    const size_t bit = static_cast<size_t>(__builtin_ctzll(uncov));
-                    T v; std::memcpy(&v, fpBytes + fi * sizeof(T), sizeof(T));
-                    dst[w * 64 + bit - start] = v;
-                    ++fi;
-                    uncov &= uncov - 1;
+        } else {
+            // Word-scan path: each tier scans its bitmap for [wStart, wEnd) and
+            // writes to disjoint dst positions (tiers are disjoint by construction).
+            //
+            // When parallelDecode is enabled, each tier is processed by its own
+            // async task (row-major per-tier-outer order). Each task captures its
+            // starting rank by value; no shared mutable state between tasks.
+            //
+            // The sequential fallback (coveredBitmap scan) always runs after all
+            // tier tasks complete, so it can safely read coveredBitmap read-only.
+            auto scanTier = [&](size_t t) {
+                const TierState& ts0 = tierStates[t];
+                size_t rank = ts0.rank;
+                for (size_t w = wStart; w < wEnd; ++w) {
+                    if (w + 8 < wEnd)
+                        __builtin_prefetch(&ts0.td->bitmap[w + 8], 0, 1);
+
+                    const uint64_t loMask = (w == wStart && (start & 63))
+                        ? ~((uint64_t{1} << (start & 63)) - 1) : ~uint64_t{0};
+                    const uint64_t hiMask = (w + 1 == wEnd && (end & 63))
+                        ? (uint64_t{1} << (end & 63)) - 1 : ~uint64_t{0};
+                    const uint64_t tierMask = loMask & hiMask;
+
+                    uint64_t word = ts0.td->bitmap[w] & tierMask;
+                    while (word) {
+                        const size_t bit = static_cast<size_t>(__builtin_ctzll(word));
+                        dst[w * 64 + bit - start] = ts0.td->dict[unpackKey(ts0.keysBase, rank, ts0.td->keyBits)];
+                        ++rank;
+                        word &= word - 1;
+                    }
+                }
+            };
+
+            if (cfg_.parallelDecode && activeTiers > 1 && (end - start) >= cfg_.parallelDecodeMinElements) {
+                std::vector<std::future<void>> futures;
+                futures.reserve(activeTiers);
+                for (size_t t = 0; t < activeTiers; ++t)
+                    futures.push_back(std::async(std::launch::async, scanTier, t));
+                for (auto& f : futures) f.get();
+            } else {
+                for (size_t t = 0; t < activeTiers; ++t) scanTier(t);
+            }
+
+            if (h.fallbackCount > 0) {
+                size_t fi = fallbackRankAt(h, start);
+                for (size_t w = wStart; w < wEnd; ++w) {
+                    uint64_t uncov = ~h.coveredBitmap[w];
+                    if (w == wStart && (start & 63))  uncov &= ~((uint64_t{1} << (start & 63)) - 1);
+                    const size_t endBit = (w + 1 == wEnd       && (end & 63)) ? (end & 63) : 64;
+                    const size_t nBit   = (w + 1 == h.numWords && (N   & 63)) ? (N   & 63) : 64;
+                    if (const size_t clamp = std::min(endBit, nBit); clamp < 64)
+                        uncov &= (uint64_t{1} << clamp) - 1;
+                    while (uncov) {
+                        const size_t bit = static_cast<size_t>(__builtin_ctzll(uncov));
+                        T v; std::memcpy(&v, fpBytes + fi * sizeof(T), sizeof(T));
+                        dst[w * 64 + bit - start] = v;
+                        ++fi;
+                        uncov &= uncov - 1;
+                    }
                 }
             }
         }
@@ -1346,6 +1482,110 @@ private:
         return result;
     }
 
+    // ---------------------------------------------------------------------------
+    // Gather (selective row-range) fast paths
+    // ---------------------------------------------------------------------------
+
+    // PerTierBitmaps: decodeRangePerTierBitmapsInto already seeds every tier's
+    // rank via the Rank9 superblock index (popcountPrefixFast, O(1)-ish
+    // regardless of `start`) and the fallback rank via fallbackPrefixPop
+    // (also O(1)). So this is NOT an asymptotic win over the inherited
+    // default -- it only avoids the small fixed per-call overhead (rebuilding
+    // tierStates[], re-deciding the useSequential heuristic) once per
+    // RowRangeList instead of once per range.
+    void decodeGatherPerTierBitmaps(const EncodedBuffer<uint8_t>& enc, const ParsedHeader& h,
+                                    const RowRangeList& ranges, T* dst, size_t n) const {
+        size_t off = 0;
+        for (const auto& r : ranges) {
+            const size_t count = r.size();
+            if (count == 0) continue;
+            const size_t end = std::min(r.end, static_cast<size_t>(h.numElements));
+            if (r.begin >= end) continue;
+            decodeRangePerTierBitmapsInto(enc, h, r.begin, end, dst + off);
+            off += (end - r.begin);
+        }
+        if (off != n) throw std::runtime_error("FrequencyPartitionEncoder::decodeGatherInto: decoded size mismatch");
+    }
+
+    // TierTagArray: decodeRangeTierTagArrayInto's manual bit-by-bit prescan of
+    // [0, start) (to rebuild tierBitPos[t] = rank(t, start) * keyBits) is
+    // entirely redundant with the sampled-rank table (h.tierRankSamples)
+    // already built once at header-parse time and already used by
+    // decodeAtTierTagArray. Per range, seed every tier's (and the fallback
+    // bucket's) rank from the nearest sample (O(1) lookup) plus a bounded
+    // O(kRankSampleStride) scan -- independent of `begin`'s magnitude --
+    // instead of an O(begin) prescan. This is the genuine complexity-class
+    // fix within this encoder.
+    void decodeGatherTierTagArray(const EncodedBuffer<uint8_t>& enc, const ParsedHeader& h,
+                                  const RowRangeList& ranges, T* dst, size_t n) const {
+        const uint8_t* tagBase = enc.data().data() + h.tagArrayOffset;
+        const uint8_t  tagBits = h.tagBits;
+        alignas(64) uint8_t scratch[kTagChunkSize];
+
+        std::vector<const uint8_t*> tierKeysBase(h.numTiers, nullptr);
+        for (size_t t = 0; t < h.numTiers; ++t)
+            tierKeysBase[t] = enc.data().data() + h.tiers[t].keysOffset;
+        const uint8_t* fpBytes = enc.data().data() + h.fallbackOffset + 4;
+
+        // Per-tier rank (rank-addressable via unpackKey = rank*keyBits, so no
+        // byte-cursor state is needed -- only the integer rank). Bucket
+        // h.numTiers is the fallback rank.
+        std::vector<size_t> tierRank(h.numTiers, 0);
+        size_t fallbackRank = 0;
+
+        auto seedRanksAt = [&](size_t pos) {
+            const size_t sampleIdx = pos / kRankSampleStride;
+            const size_t scanStart = sampleIdx * kRankSampleStride;
+            for (size_t t = 0; t < h.numTiers; ++t) tierRank[t] = h.tierRankSamples[t][sampleIdx];
+            fallbackRank = h.tierRankSamples[h.numTiers][sampleIdx];
+
+            size_t bitCursor = scanStart * tagBits;
+            for (size_t j = scanStart; j < pos; ) {
+                const size_t chunk = std::min<size_t>(kTagChunkSize, pos - j);
+                unpackTagsInto(tagBase, bitCursor, tagBits, chunk, scratch);
+                bitCursor += chunk * tagBits;
+                for (size_t k = 0; k < chunk; ++k) {
+                    const uint8_t t = scratch[k];
+                    if (t < h.numTiers) ++tierRank[t]; else ++fallbackRank;
+                }
+                j += chunk;
+            }
+        };
+
+        size_t off = 0;
+        for (const auto& r : ranges) {
+            const size_t count = r.size();
+            if (count == 0) continue;
+            const size_t begin = r.begin;
+            const size_t end   = std::min(r.end, static_cast<size_t>(h.numElements));
+            if (begin >= end) continue;
+
+            seedRanksAt(begin);
+
+            size_t tagBitCursor = begin * tagBits;
+            size_t pos = begin, outIdx = off;
+            while (pos < end) {
+                const size_t chunk = std::min<size_t>(kTagChunkSize, end - pos);
+                unpackTagsInto(tagBase, tagBitCursor, tagBits, chunk, scratch);
+                tagBitCursor += chunk * tagBits;
+                for (size_t i = 0; i < chunk; ++i, ++pos, ++outIdx) {
+                    const uint8_t tag = scratch[i];
+                    if (tag < h.numTiers) {
+                        const auto& td = h.tiers[tag];
+                        dst[outIdx] = td.dict[unpackKey(tierKeysBase[tag], tierRank[tag], td.keyBits)];
+                        ++tierRank[tag];
+                    } else {
+                        T v; std::memcpy(&v, fpBytes + fallbackRank * sizeof(T), sizeof(T));
+                        dst[outIdx] = v;
+                        ++fallbackRank;
+                    }
+                }
+            }
+            off += (end - begin);
+        }
+        if (off != n) throw std::runtime_error("FrequencyPartitionEncoder::decodeGatherInto: decoded size mismatch");
+    }
+
 public:
     // ---------------------------------------------------------------------------
     // Decode all
@@ -1438,6 +1678,32 @@ public:
     }
 
     // ---------------------------------------------------------------------------
+    // Gather (selective row-range)
+    // ---------------------------------------------------------------------------
+
+    // Only TierTagArray and PerTierBitmaps get a real override (see the
+    // decodeGather* helpers above for why). EliasFano and NoIndex are already
+    // O(log n)-ish and position-independent per call (std::lower_bound /
+    // std::upper_bound on small arrays), so an override there would be pure
+    // duplication of the inherited default -- delegate to it explicitly.
+    void decodeGatherInto(const EncodedBuffer<uint8_t>& enc,
+                         const RowRangeList& ranges,
+                         T* dst, size_t n) override {
+        if (ranges.empty()) {
+            if (n != 0) throw std::runtime_error("FrequencyPartitionEncoder::decodeGatherInto: decoded size mismatch");
+            return;
+        }
+        const ParsedHeader& h = getParsedHeader(enc);
+        if constexpr (IndexType == FreqPartIndexType::TierTagArray) {
+            decodeGatherTierTagArray(enc, h, ranges, dst, n);
+        } else if constexpr (IndexType == FreqPartIndexType::PerTierBitmaps) {
+            decodeGatherPerTierBitmaps(enc, h, ranges, dst, n);
+        } else {
+            Codec<T, uint8_t>::decodeGatherInto(enc, ranges, dst, n);
+        }
+    }
+
+    // ---------------------------------------------------------------------------
     // Metadata
     // ---------------------------------------------------------------------------
 
@@ -1448,10 +1714,18 @@ public:
     std::string name() const override { return "FrequencyPartitionEncoder"; }
 
     EncodingProperties properties() const override {
-        return EncodingProperties(EncodingProperty::Lossless)
+        EncodingProperties props = EncodingProperties(EncodingProperty::Lossless)
              | EncodingProperty::RequiresFullData
              | EncodingProperty::VariableSize
              | EncodingProperty::RandomAccess;
+        // Only the two index types with a genuine decodeGatherInto override
+        // (see decodeGatherPerTierBitmaps/decodeGatherTierTagArray) advertise
+        // FastSkip; EliasFano/NoIndex have no override (inherit the default).
+        if constexpr (IndexType == FreqPartIndexType::TierTagArray ||
+                      IndexType == FreqPartIndexType::PerTierBitmaps) {
+            props.add(EncodingProperty::FastSkip);
+        }
+        return props;
     }
 };
 
