@@ -24,7 +24,13 @@ enum class MetricFlag : uint32_t {
     FreqStats      = 1u << 2,  // uniqueCount, hllEstimatedCardinality, f1, f2, entropyEstimate
     SuffixFrames   = 1u << 3,  // frameMaxSuffixBits, frameAvgSuffixBits
     ResidualFrames = 1u << 4,  // frameMaxResidualBits, frameAvgResidualBits
-    All            = (1u << 5) - 1,
+    DeltaFrames    = 1u << 5,  // frameMaxDeltaBits, frameAvgDeltaBits (consecutive-delta width,
+                               // per candidate frame size, for FORReferencePolicy::PREV)
+    DeltaFreqStats = 1u << 6,  // deltaUniqueCount, deltaUniqueCountCapped, deltaEntropyEstimate
+                               // (frequency/entropy over consecutive deltas, at ONE fixed frame
+                               // size -- see kDeltaFreqStatsFrameSize -- for PREV+FPE/BlockFPE
+                               // cost models)
+    All            = (1u << 7) - 1,
 };
 using MetricFlags = uint32_t;
 
@@ -69,6 +75,27 @@ struct SegmentMetrics {
 	std::array<uint8_t, kBitPrefixFrameCandidateCount> frameMaxSuffixBits{};
 	std::array<double,  kBitPrefixFrameCandidateCount> frameAvgSuffixBits{};
 
+	// Consecutive-delta width per candidate frame size (mirrors
+	// frameMaxResidualBits/frameAvgResidualBits, same kResidualFrameCandidates,
+	// but for FORReferencePolicy::PREV's residual = data[i]-data[i-1] within
+	// each frame rather than data[i]-frameRef). Bit width is measured on the
+	// zigzag-encoded delta (see MetricCollector::zigzagEncode) since deltas
+	// are signed and finalizeDeltaFrame reuses finalizeResidualFrame's exact
+	// span=fmax-fmin shape, which assumes non-negative values.
+	std::array<uint8_t, kResidualFrameCandidateCount> frameMaxDeltaBits{};
+	std::array<double,  kResidualFrameCandidateCount> frameAvgDeltaBits{};
+
+	// Frequency/entropy over consecutive deltas (zigzag-encoded), at ONE
+	// fixed frame size (MetricCollector::kDeltaFreqStatsFrameSize) rather than
+	// all 5 ResidualFrames candidates -- a full frequency-map collection is
+	// far more expensive to replicate 5x than DeltaFrames' O(1)-per-candidate
+	// min/max tracking, and the PREV+FPE/BlockFPE cost models this feeds use
+	// one fixed, already-swept frame size rather than comparing candidates at
+	// DP time. Mirrors uniqueCount/uniqueCountCapped/entropyEstimate above.
+	size_t deltaUniqueCount{0};
+	bool   deltaUniqueCountCapped{false};
+	double deltaEntropyEstimate{0.0};
+
 	// Optional
 	double entropyEstimate{0.0};
 };
@@ -89,6 +116,15 @@ public:
 		kBitPrefixFrameCandidates{ 8, 16, 32, 64, 128 };
 	inline static constexpr std::array<size_t, SegmentMetrics::kResidualFrameCandidateCount>
 		kResidualFrameCandidates{ 256, 512, 1024, 2048, 4096 };
+
+	// Fixed frame size DeltaFreqStats collects at (see SegmentMetrics's doc on
+	// deltaUniqueCount/deltaEntropyEstimate for why this is a single constant
+	// rather than one of the 5 kResidualFrameCandidates). Must match whatever
+	// frame size is actually baked into the registered
+	// makeCascadingFORPrevFrequencyPartitionSection/
+	// makeCascadingFORPrevBlockFrequencyPartitionSection factories -- update
+	// this constant if that empirical sweep picks a different value.
+	static constexpr size_t kDeltaFreqStatsFrameSize = 512;
 
 private:
 	static constexpr size_t kBpN   = SegmentMetrics::kBitPrefixFrameCandidateCount;
@@ -128,10 +164,53 @@ private:
 		}
 	};
 
+	// Mirrors ResidualFrameState, but tracks the zigzag-encoded consecutive
+	// delta's span per candidate frame size instead of the raw value's span
+	// (deltas are signed; zigzag lets finalizeDeltaFrame reuse
+	// finalizeResidualFrame's exact span=fmax-fmin shape unchanged). The first
+	// element of each candidate frame contributes no delta observation
+	// (mirrors the PREV encoder's own residual[frameStart]=0 convention) --
+	// see updateDeltaFrames.
+	struct DeltaFrameState {
+		std::array<uint64_t, kResN> fminDelta;
+		std::array<uint64_t, kResN> fmaxDelta;
+		std::array<size_t,   kResN> fcount;
+		std::array<double,   kResN> fbitsum{};
+		std::array<size_t,   kResN> fbitseen{};
+
+		void initFromFirst() noexcept {
+			fminDelta.fill(std::numeric_limits<uint64_t>::max());
+			fmaxDelta.fill(std::numeric_limits<uint64_t>::min());
+			fcount.fill(1); // element 0 is already "seen" (frame-start, no delta), mirrors ResidualFrameState
+		}
+	};
+
+	// Frequency/entropy state for consecutive deltas at ONE fixed frame size
+	// (kDeltaFreqStatsFrameSize) -- see SegmentMetrics's doc on
+	// deltaUniqueCount/deltaEntropyEstimate for why this doesn't carry all 5
+	// ResidualFrames candidates. Keyed by T to reuse updateFreq/computeEntropy
+	// unchanged (matches this collector's only real instantiation,
+	// MetricCollector<uint64_t>, so zigzag-encoded deltas -- always
+	// representable as uint64_t -- fit T exactly).
+	struct DeltaFreqState {
+		ankerl::unordered_dense::map<T, uint32_t> freqMap;
+		bool uniqueCapped{false};
+		size_t f1{0};
+		size_t f2{0};
+	};
+
 	// -------------------------------------------------------------------------
 	// Hot-path helpers — named so they appear as distinct scopes in profiler
 	// call trees even when inlined (source-level attribution via debug info).
 	// -------------------------------------------------------------------------
+
+	// Zigzag-encode a signed delta into a non-negative uint64_t, so signed
+	// deltas can reuse the exact same "track min/max, span=fmax-fmin,
+	// bits=bit_width(span)" machinery already used for raw (non-negative)
+	// residual values.
+	static uint64_t zigzagEncode(int64_t v) noexcept {
+		return (static_cast<uint64_t>(v) << 1) ^ static_cast<uint64_t>(v >> 63);
+	}
 
 	// HLL register update: branchless max instead of conditional store.
 	static void hllAdd(uint8_t* __restrict__ regs, uint64_t hash) {
@@ -139,7 +218,7 @@ private:
 		const uint64_t w   = hash >> kHllPrecision;
 		const uint8_t rank = (w == 0)
 			? static_cast<uint8_t>(64 - kHllPrecision + 1)
-			: static_cast<uint8_t>(std::countl_zero(w) + 1);
+			: static_cast<uint8_t>(std::countl_zero(w) - kHllPrecision + 1);
 		regs[idx] = std::max(regs[idx], rank);
 	}
 
@@ -260,6 +339,67 @@ private:
 		}
 	}
 
+	// Finalize one delta frame: compute the zigzag-delta span width (if any
+	// delta observations were made -- a frame with exactly one element, only
+	// possible for a truncated trailing frame, has none), accumulate stats,
+	// reset state. Unlike finalizeResidualFrame, must guard fmax>=fmin since
+	// the sentinel values are never overwritten when there are zero
+	// observations (whereas ResidualFrameState's fmin/fmax always start from
+	// a real element via initFromFirst).
+	static void finalizeDeltaFrame(
+		size_t c,
+		DeltaFrameState& s,
+		SegmentMetrics& out)
+	{
+		const size_t fcount = s.fcount[c];
+		if (fcount == 0) return;
+
+		if (s.fmaxDelta[c] >= s.fminDelta[c]) {
+			const uint64_t span = s.fmaxDelta[c] - s.fminDelta[c];
+			const uint8_t bits  = span == 0 ? 0 : static_cast<uint8_t>(std::bit_width(span));
+			out.frameMaxDeltaBits[c] = std::max(out.frameMaxDeltaBits[c], bits);
+			s.fbitsum[c]  += static_cast<double>(bits);
+			++s.fbitseen[c];
+		}
+
+		s.fcount[c]    = 0;
+		s.fminDelta[c] = std::numeric_limits<uint64_t>::max();
+		s.fmaxDelta[c] = std::numeric_limits<uint64_t>::min();
+	}
+
+	// Per-element update for all Delta frames, plus conditional finalization.
+	// Mirrors updateResidualFrames' frame-boundary trigger exactly (frame c,
+	// size 2^(8+c), finalizes when countr_zero(i+1) >= 8+c) but skips folding
+	// a delta observation into fminDelta/fmaxDelta when `i` lands exactly on
+	// one of these candidates' frame boundary (that position is PREV's
+	// residual[frameStart]=0 anchor, not a real delta -- see DeltaFrameState's
+	// doc).
+	static void updateDeltaFrames(
+		uint64_t uv,
+		uint64_t prevUv,
+		DeltaFrameState& s,
+		SegmentMetrics& out,
+		size_t i)
+	{
+		const int64_t delta = static_cast<int64_t>(uv) - static_cast<int64_t>(prevUv);
+		const uint64_t zz = zigzagEncode(delta);
+		for (size_t c = 0; c < kResN; ++c) {
+			const size_t frameSize = size_t{1} << (8 + c);
+			const bool isFrameStart = (i & (frameSize - 1)) == 0;
+			if (!isFrameStart) {
+				if (zz < s.fminDelta[c]) s.fminDelta[c] = zz;
+				if (zz > s.fmaxDelta[c]) s.fmaxDelta[c] = zz;
+			}
+			++s.fcount[c];
+		}
+		const int tz = static_cast<int>(std::countr_zero(i + 1));
+		if (tz >= 8) {
+			const int maxC = std::min(tz - 8, static_cast<int>(kResN) - 1);
+			for (int c = 0; c <= maxC; ++c)
+				finalizeDeltaFrame(static_cast<size_t>(c), s, out);
+		}
+	}
+
 	// -------------------------------------------------------------------------
 	// Cold-path post-processing helpers.
 	// -------------------------------------------------------------------------
@@ -321,10 +461,12 @@ public:
 		const std::vector<T>& values,
 		MetricFlags flags = static_cast<MetricFlags>(MetricFlag::All)) const
 	{
-		const bool doRun      = hasFlag(flags, MetricFlag::RunStats);
-		const bool doFreq     = hasFlag(flags, MetricFlag::FreqStats);
-		const bool doSuffix   = hasFlag(flags, MetricFlag::SuffixFrames);
-		const bool doResidual = hasFlag(flags, MetricFlag::ResidualFrames);
+		const bool doRun       = hasFlag(flags, MetricFlag::RunStats);
+		const bool doFreq      = hasFlag(flags, MetricFlag::FreqStats);
+		const bool doSuffix    = hasFlag(flags, MetricFlag::SuffixFrames);
+		const bool doResidual  = hasFlag(flags, MetricFlag::ResidualFrames);
+		const bool doDelta     = hasFlag(flags, MetricFlag::DeltaFrames);
+		const bool doDeltaFreq = hasFlag(flags, MetricFlag::DeltaFreqStats);
 
 		SegmentMetrics out;
 		if (values.empty()) return out;
@@ -359,6 +501,12 @@ public:
 		ResidualFrameState res{};
 		if (doResidual) res.initFromFirst(uv0);
 
+		DeltaFrameState delta{};
+		if (doDelta) delta.initFromFirst();
+
+		DeltaFreqState deltaFreq{};
+		if (doDeltaFreq) deltaFreq.freqMap.reserve(std::min(n, kUniqueCountCap));
+
 		T      prev             = v0;
 
 		// --- Main loop (i=0 already handled in prolog) ---
@@ -383,6 +531,14 @@ public:
 
 			if (doSuffix)   updateSuffixFrames(uv, sfx, i, out.max);
 			if (doResidual) updateResidualFrames(uv, res, out, i);
+			if (doDelta)    updateDeltaFrames(uv, static_cast<uint64_t>(prev), delta, out, i);
+
+			if (doDeltaFreq && (i % kDeltaFreqStatsFrameSize) != 0) {
+				const int64_t d = static_cast<int64_t>(uv) - static_cast<int64_t>(static_cast<uint64_t>(prev));
+				const T zz = static_cast<T>(zigzagEncode(d));
+				if (!deltaFreq.uniqueCapped)
+					updateFreq(zz, deltaFreq.freqMap, deltaFreq.uniqueCapped, deltaFreq.f1, deltaFreq.f2);
+			}
 
 			prev = v;
 		}
@@ -393,6 +549,9 @@ public:
 		}
 		if (doResidual) {
 			for (size_t c = 0; c < kResN; ++c) finalizeResidualFrame(c, res, out);
+		}
+		if (doDelta) {
+			for (size_t c = 0; c < kResN; ++c) finalizeDeltaFrame(c, delta, out);
 		}
 
 		// --- Commit per-frame averages ---
@@ -409,6 +568,12 @@ public:
 					out.frameAvgResidualBits[c] = res.fbitsum[c] / static_cast<double>(res.fbitseen[c]);
 			}
 		}
+		if (doDelta) {
+			for (size_t c = 0; c < kResN; ++c) {
+				if (delta.fbitseen[c] > 0)
+					out.frameAvgDeltaBits[c] = delta.fbitsum[c] / static_cast<double>(delta.fbitseen[c]);
+			}
+		}
 
 		out.range = out.max - out.min;
 
@@ -421,6 +586,17 @@ public:
 			out.uniqueCountCapped   = uniqueCapped;
 			out.entropyEstimate     = computeEntropy(freqMap, n, uniqueCapped);
 			out.hllEstimatedCardinality = computeHllEstimate(hllRegs);
+		}
+
+		if (doDeltaFreq) {
+			// n-1 delta observations total minus one per kDeltaFreqStatsFrameSize
+			// frame boundary crossed (those positions are PREV's residual[frameStart]=0
+			// anchor, not a real delta observation -- mirrors updateDeltaFrames).
+			const size_t numFrames = (n + kDeltaFreqStatsFrameSize - 1) / kDeltaFreqStatsFrameSize;
+			const size_t deltaObservations = (n > numFrames) ? (n - numFrames) : 0;
+			out.deltaUniqueCount       = deltaFreq.uniqueCapped ? (kUniqueCountCap + 1) : deltaFreq.freqMap.size();
+			out.deltaUniqueCountCapped = deltaFreq.uniqueCapped;
+			out.deltaEntropyEstimate   = computeEntropy(deltaFreq.freqMap, deltaObservations, deltaFreq.uniqueCapped);
 		}
 
 		return out;
