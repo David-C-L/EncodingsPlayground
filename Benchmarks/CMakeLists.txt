@@ -100,6 +100,46 @@ target_include_directories(vector_benchmarks
         ${CMAKE_SOURCE_DIR}/Source
 )
 
+# Range-access heatmap benchmark (SubIntSplit motivation figure)
+add_executable(heatmap_benchmark
+    heatmap_benchmark.cpp
+    allocation_hooks.cpp
+)
+
+target_link_libraries(heatmap_benchmark
+    PRIVATE
+        encodings_core
+        encodings_encodings
+        encodings_generators
+        encodings_encoders
+        encodings_benchmark
+)
+
+target_include_directories(heatmap_benchmark
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/Source
+)
+
+# Oracle vs AutoSIS comparison benchmark
+add_executable(explore_best_encoding
+    explore_best_encoding.cpp
+    allocation_hooks.cpp
+)
+
+target_link_libraries(explore_best_encoding
+    PRIVATE
+        encodings_core
+        encodings_encodings
+        encodings_generators
+        encodings_encoders
+        encodings_benchmark
+)
+
+target_include_directories(explore_best_encoding
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/Source
+)
+
 # Optional VTune ITT pause/resume instrumentation.
 # Build with -DVTUNE_ENABLED=ON to bracket selected benchmark phases with
 # __itt_pause()/__itt_resume() so VTune only collects samples inside those phases.
@@ -154,7 +194,7 @@ target_include_directories(reordering_benchmarks
 file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/benchmark_results)
 
 # Set output directory for the executables
-set_target_properties(run_benchmarks sweep_subint_samples map_benchmarks map_benchmarks_refactored vector_benchmarks reordering_benchmarks PROPERTIES
+set_target_properties(run_benchmarks sweep_subint_samples map_benchmarks map_benchmarks_refactored vector_benchmarks reordering_benchmarks explore_best_encoding heatmap_benchmark PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 
@@ -166,6 +206,8 @@ if(NOT MSVC)
     target_compile_options(map_benchmarks         PRIVATE -march=native -O3)
     target_compile_options(map_benchmarks_refactored PRIVATE -march=native -O3)
     target_compile_options(vector_benchmarks      PRIVATE -march=native -O3)
+    target_compile_options(explore_best_encoding  PRIVATE -march=native -O3)
+    target_compile_options(heatmap_benchmark      PRIVATE -march=native -O3)
 endif()
 
 # Add as tests (optional)
