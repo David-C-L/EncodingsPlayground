@@ -134,8 +134,7 @@ public:
             throw std::runtime_error("AdaptiveFramedBitPrefix: buffer too small for frame records");
         }
 
-        std::vector<T> out;
-        out.resize(hdr.N);
+        std::vector<T> out(hdr.N);
 
         size_t payloadCursor = payloadOffset;
         const uint8_t* records = encoded.data().data() + recordsOffset;
@@ -148,19 +147,14 @@ public:
             const uint8_t suffixBits = info.suffixBits(hdr.bitWidth);
 
             if (info.suffixBytes == 0 && suffixBits == 0) {
-                const U value = info.prefixValue & static_cast<U>(suffixMask);
-                for (size_t i = start; i < end; ++i) out[i] = static_cast<T>(value);
+                const T value = static_cast<T>(info.prefixValue & static_cast<U>(suffixMask));
+                std::fill(out.data() + start, out.data() + end, value);
                 continue;
             }
 
-            const auto frameVals = unpackSuffixes(encoded.data().data() + payloadCursor, info.suffixBytes,
-                                                  end - start, suffixBits, suffixMask, info.prefixValue);
-            if (frameVals.size() != end - start) {
-                throw std::runtime_error("AdaptiveFramedBitPrefix: decoded frame size mismatch");
-            }
-            for (size_t i = 0; i < frameVals.size(); ++i) {
-                out[start + i] = static_cast<T>(frameVals[i]);
-            }
+            unpackSuffixesTo(encoded.data().data() + payloadCursor, info.suffixBytes,
+                             end - start, suffixBits, suffixMask, info.prefixValue,
+                             out.data() + start);
             payloadCursor += info.suffixBytes;
         }
 
@@ -215,37 +209,109 @@ public:
 
         const uint64_t suffixMask = widthMask(hdr.bitWidth);
 
-        std::vector<T> out;
-        out.reserve(end - start);
+        std::vector<T> out(end - start);
+        size_t writePos = 0;
 
-        // Precompute cumulative offsets
-        std::vector<size_t> prefixOffsets(hdr.numFrames + 1, 0);
-        for (size_t f = 0; f < hdr.numFrames; ++f) {
-            FrameInfo info = readFrame(encoded.data().data() + recordsOffset + f * kFrameRecordBytes);
-            prefixOffsets[f + 1] = prefixOffsets[f] + info.suffixBytes;
+        // Walk payload offset forward to the first frame we need, then advance frame-by-frame
+        const size_t firstFrame = start / hdr.frameSize;
+        size_t framePayloadBase = payloadOffset;
+        for (size_t f = 0; f < firstFrame; ++f) {
+            FrameInfo fi = readFrame(encoded.data().data() + recordsOffset + f * kFrameRecordBytes);
+            framePayloadBase += fi.suffixBytes;
         }
 
         for (size_t i = start; i < end; ) {
-            const size_t frameStart = (i / hdr.frameSize) * hdr.frameSize;
+            const size_t frameIdx = i / hdr.frameSize;
+            const size_t frameStart = frameIdx * hdr.frameSize;
             const size_t frameEnd = std::min(frameStart + hdr.frameSize, hdr.N);
-            const FrameInfo info = readFrame(encoded.data().data() + recordsOffset + (i / hdr.frameSize) * kFrameRecordBytes);
+            const FrameInfo info = readFrame(encoded.data().data() + recordsOffset + frameIdx * kFrameRecordBytes);
             const uint8_t suffixBits = info.suffixBits(hdr.bitWidth);
             const size_t localStart = i - frameStart;
             const size_t localEnd = std::min(frameEnd, end) - frameStart;
+            const size_t localCount = localEnd - localStart;
 
             if (suffixBits == 0) {
-                const U val = info.prefixValue & static_cast<U>(suffixMask);
-                for (size_t k = localStart; k < localEnd; ++k) out.push_back(static_cast<T>(val));
+                const T val = static_cast<T>(info.prefixValue & static_cast<U>(suffixMask));
+                std::fill(out.data() + writePos, out.data() + writePos + localCount, val);
             } else {
-                const size_t framePayloadOffset = payloadOffset + prefixOffsets[i / hdr.frameSize];
-                const uint8_t* payload = encoded.data().data() + framePayloadOffset;
-                const auto vals = unpackSuffixesRange(payload, info.suffixBytes, localStart, localEnd, suffixBits, suffixMask, info.prefixValue);
-                for (auto v : vals) out.push_back(static_cast<T>(v));
+                const uint8_t* payload = encoded.data().data() + framePayloadBase;
+                unpackSuffixesRangeTo(payload, info.suffixBytes, localStart, localEnd,
+                                      suffixBits, suffixMask, info.prefixValue,
+                                      out.data() + writePos);
             }
+            writePos += localCount;
+            framePayloadBase += info.suffixBytes;
             i = frameStart + localEnd;
         }
 
         return out;
+    }
+
+    // Gather (selective row-range) fast path. decodeAt/decodeRange both
+    // accumulate suffixBytes from frame 0 to the target frame on every call
+    // (O(frameIdx)). Here we precompute a local O(numFrames) prefix-sum of
+    // per-frame payload byte offsets once, giving O(1) lookup for any frame
+    // regardless of range order -- cheaper and simpler than a manually
+    // advanced cursor, at the same one-time O(numFrames) cost.
+    void decodeGatherInto(const EncodedBuffer<uint8_t>& encoded,
+                          const RowRangeList& ranges,
+                          T* dst, size_t n) override {
+        if (ranges.empty()) {
+            if (n != 0) throw std::runtime_error("AdaptiveFramedBitPrefixEncoder::decodeGatherInto: decoded size mismatch");
+            return;
+        }
+        const auto hdr = parseHeader(encoded);
+        if (hdr.N == 0) {
+            if (n != 0) throw std::runtime_error("AdaptiveFramedBitPrefixEncoder::decodeGatherInto: empty codec, n!=0");
+            return;
+        }
+
+        const size_t recordBytes   = hdr.numFrames * kFrameRecordBytes;
+        const size_t recordsOffset = kHeaderBytes;
+        const size_t payloadOffset = recordsOffset + recordBytes;
+        if (payloadOffset > encoded.data().size())
+            throw std::runtime_error("AdaptiveFramedBitPrefix: buffer too small for frame records");
+
+        std::vector<size_t> frameOffsets(hdr.numFrames + 1);
+        frameOffsets[0] = payloadOffset;
+        for (size_t f = 0; f < hdr.numFrames; ++f) {
+            FrameInfo fi = readFrame(encoded.data().data() + recordsOffset + f * kFrameRecordBytes);
+            frameOffsets[f + 1] = frameOffsets[f] + fi.suffixBytes;
+        }
+
+        const uint64_t suffixMask = widthMask(hdr.bitWidth);
+        size_t off = 0;
+        for (const auto& r : ranges) {
+            const size_t count = r.size();
+            if (count == 0) continue;
+            const size_t start = r.begin;
+            const size_t end   = std::min(r.end, hdr.N);
+            if (start >= end) continue;
+
+            for (size_t i = start; i < end; ) {
+                const size_t frameIdx   = i / hdr.frameSize;
+                const size_t frameStart = frameIdx * hdr.frameSize;
+                const size_t frameEnd   = std::min(frameStart + hdr.frameSize, hdr.N);
+                const FrameInfo info = readFrame(encoded.data().data() + recordsOffset + frameIdx * kFrameRecordBytes);
+                const uint8_t suffixBits = info.suffixBits(hdr.bitWidth);
+                const size_t localStart = i - frameStart;
+                const size_t localEnd   = std::min(frameEnd, end) - frameStart;
+                const size_t localCount = localEnd - localStart;
+
+                if (suffixBits == 0) {
+                    const T val = static_cast<T>(info.prefixValue & static_cast<U>(suffixMask));
+                    std::fill(dst + off, dst + off + localCount, val);
+                } else {
+                    const uint8_t* payload = encoded.data().data() + frameOffsets[frameIdx];
+                    unpackSuffixesRangeTo(payload, info.suffixBytes, localStart, localEnd,
+                                          suffixBits, suffixMask, info.prefixValue,
+                                          dst + off);
+                }
+                off += localCount;
+                i = frameStart + localEnd;
+            }
+        }
+        if (off != n) throw std::runtime_error("AdaptiveFramedBitPrefixEncoder::decodeGatherInto: decoded size mismatch");
     }
 
     EncodingType encodingType() const override { return EncodingType::AdaptiveFramedBitPrefix; }
@@ -260,7 +326,8 @@ public:
             .add(EP::PreservesOrder)
             .add(EP::FixedSize)
             .add(EP::Composable)
-            .add(EP::LowMemoryOverhead);
+            .add(EP::LowMemoryOverhead)
+            .add(EP::FastSkip);
     }
 
 private:
@@ -414,88 +481,157 @@ private:
         return out;
     }
 
-    static std::vector<uint64_t> unpackSuffixes(const uint8_t* payload, size_t payloadBytes,
-                                                size_t count, uint8_t suffixBits,
-                                                uint64_t mask, uint64_t prefix) {
+    // Writes decoded values for elements [0, count) directly into output[0..count-1].
+    static void unpackSuffixesTo(const uint8_t* payload, size_t payloadBytes,
+                                 size_t count, uint8_t suffixBits,
+                                 uint64_t mask, uint64_t prefix,
+                                 T* output) {
         if (suffixBits == 0) {
-            return std::vector<uint64_t>(count, (prefix << suffixBits) & mask);
+            std::fill(output, output + count, static_cast<T>(prefix & mask));
+            return;
         }
-        std::vector<uint64_t> out;
-        out.reserve(count);
-        const uint64_t suffixMask = suffixBits == 64 ? std::numeric_limits<uint64_t>::max() : ((uint64_t{1} << suffixBits) - 1);
+        const uint64_t suffixMask = suffixBits == 64 ? std::numeric_limits<uint64_t>::max()
+                                                     : ((uint64_t{1} << suffixBits) - 1);
 
         if (suffixBits <= 16) {
+            const uint64_t shiftedPrefix = (prefix << suffixBits) & mask;
             encodings::core::BitReader r(payload, payloadBytes, encodings::core::BitOrder::LSB);
             for (size_t i = 0; i < count; ++i) {
-                const uint64_t s = r.read(suffixBits) & suffixMask;
-                out.push_back(((prefix << suffixBits) | s) & mask);
+                const uint64_t s = r.readFast(suffixBits) & suffixMask;
+                output[i] = static_cast<T>(shiftedPrefix | s);
             }
-            return out;
+            return;
         }
 
-        size_t bitPos = 0;
-        for (size_t i = 0; i < count; ++i) {
-            uint64_t s = 0;
-            size_t bitsRead = 0;
-            while (bitsRead < suffixBits) {
-                const size_t byteIdx = bitPos >> 3;
-                if (byteIdx >= payloadBytes) throw std::runtime_error("AdaptiveFramedBitPrefix: payload underrun");
-                const uint8_t offset = static_cast<uint8_t>(bitPos & 7);
-                const uint8_t avail = 8 - offset;
-                const uint8_t take = static_cast<uint8_t>(std::min<size_t>(suffixBits - bitsRead, avail));
-                const uint8_t bits = static_cast<uint8_t>((payload[byteIdx] >> offset) & ((1u << take) - 1));
-                s |= static_cast<uint64_t>(bits) << bitsRead;
-                bitPos += take;
-                bitsRead += take;
+        if (suffixBits == 64) {
+            for (size_t i = 0; i < count; ++i) {
+                uint64_t s;
+                std::memcpy(&s, payload + i * sizeof(uint64_t), sizeof(uint64_t));
+                output[i] = static_cast<T>(s & mask);
             }
-            s &= suffixMask;
-            const uint64_t v = ((prefix << suffixBits) | s) & mask;
-            out.push_back(v);
+            return;
         }
-        return out;
+
+        const uint64_t shiftedPrefix = (prefix << suffixBits) & mask;
+        size_t bytePos = 0;
+
+        if (suffixBits <= 56) {
+            // 64-bit accumulator: acc >>= suffixBits is a single SHR instruction
+            uint64_t acc = 0;
+            uint32_t accBits = 0;
+            while (accBits <= 56 && bytePos < payloadBytes) {
+                acc |= static_cast<uint64_t>(payload[bytePos++]) << accBits;
+                accBits += 8;
+            }
+            for (size_t i = 0; i < count; ++i) {
+                while (accBits < static_cast<uint32_t>(suffixBits) && accBits <= 56 && bytePos < payloadBytes) {
+                    acc |= static_cast<uint64_t>(payload[bytePos++]) << accBits;
+                    accBits += 8;
+                }
+                const uint64_t s = acc & suffixMask;
+                acc >>= suffixBits;
+                accBits -= static_cast<uint32_t>(suffixBits);
+                output[i] = static_cast<T>(shiftedPrefix | s);
+            }
+        } else {
+            // 128-bit fallback for suffixBits in [57, 63]
+            __uint128_t acc = 0;
+            uint32_t accBits = 0;
+            while (accBits <= 56 && bytePos < payloadBytes) {
+                acc |= static_cast<__uint128_t>(payload[bytePos++]) << accBits;
+                accBits += 8;
+            }
+            for (size_t i = 0; i < count; ++i) {
+                while (accBits < static_cast<uint32_t>(suffixBits) && bytePos < payloadBytes) {
+                    acc |= static_cast<__uint128_t>(payload[bytePos++]) << accBits;
+                    accBits += 8;
+                }
+                const uint64_t s = static_cast<uint64_t>(acc) & suffixMask;
+                acc >>= suffixBits;
+                accBits -= static_cast<uint32_t>(suffixBits);
+                output[i] = static_cast<T>(shiftedPrefix | s);
+            }
+        }
     }
 
-    static std::vector<uint64_t> unpackSuffixesRange(const uint8_t* payload, size_t payloadBytes,
-                                                     size_t start, size_t end,
-                                                     uint8_t suffixBits, uint64_t mask,
-                                                     uint64_t prefix) {
+    // Writes decoded values for frame elements [start, end) directly into output[0..end-start-1].
+    static void unpackSuffixesRangeTo(const uint8_t* payload, size_t payloadBytes,
+                                      size_t start, size_t end,
+                                      uint8_t suffixBits, uint64_t mask, uint64_t prefix,
+                                      T* output) {
+        const size_t count = end - start;
         if (suffixBits == 0) {
-            return std::vector<uint64_t>(end - start, (prefix << suffixBits) & mask);
+            std::fill(output, output + count, static_cast<T>(prefix & mask));
+            return;
         }
-        std::vector<uint64_t> out;
-        out.reserve(end - start);
-        const uint64_t suffixMask = suffixBits == 64 ? std::numeric_limits<uint64_t>::max() : ((uint64_t{1} << suffixBits) - 1);
+        const uint64_t suffixMask = suffixBits == 64 ? std::numeric_limits<uint64_t>::max()
+                                                     : ((uint64_t{1} << suffixBits) - 1);
 
         if (suffixBits <= 16) {
+            const uint64_t shiftedPrefix = (prefix << suffixBits) & mask;
             encodings::core::BitReader r(payload, payloadBytes, encodings::core::BitOrder::LSB);
             r.seekToBit(static_cast<size_t>(start) * suffixBits);
-            for (size_t i = start; i < end; ++i) {
-                const uint64_t s = r.read(suffixBits) & suffixMask;
-                out.push_back(((prefix << suffixBits) | s) & mask);
+            for (size_t j = 0; j < count; ++j) {
+                const uint64_t s = r.readFast(suffixBits) & suffixMask;
+                output[j] = static_cast<T>(shiftedPrefix | s);
             }
-            return out;
+            return;
         }
 
-        size_t bitPos = static_cast<size_t>(start) * suffixBits;
-        for (size_t i = start; i < end; ++i) {
-            uint64_t s = 0;
-            size_t bitsRead = 0;
-            while (bitsRead < suffixBits) {
-                const size_t byteIdx = bitPos >> 3;
-                if (byteIdx >= payloadBytes) throw std::runtime_error("AdaptiveFramedBitPrefix: payload underrun");
-                const uint8_t offset = static_cast<uint8_t>(bitPos & 7);
-                const uint8_t avail = 8 - offset;
-                const uint8_t take = static_cast<uint8_t>(std::min<size_t>(suffixBits - bitsRead, avail));
-                const uint8_t bits = static_cast<uint8_t>((payload[byteIdx] >> offset) & ((1u << take) - 1));
-                s |= static_cast<uint64_t>(bits) << bitsRead;
-                bitPos += take;
-                bitsRead += take;
+        if (suffixBits == 64) {
+            for (size_t j = 0; j < count; ++j) {
+                uint64_t s;
+                std::memcpy(&s, payload + (start + j) * sizeof(uint64_t), sizeof(uint64_t));
+                output[j] = static_cast<T>(s & mask);
             }
-            s &= suffixMask;
-            const uint64_t v = ((prefix << suffixBits) | s) & mask;
-            out.push_back(v);
+            return;
         }
-        return out;
+
+        const uint64_t shiftedPrefix = (prefix << suffixBits) & mask;
+        size_t bytePos = (static_cast<size_t>(start) * suffixBits) >> 3;
+        const uint32_t bitOff = static_cast<uint32_t>((static_cast<size_t>(start) * suffixBits) & 7);
+
+        if (suffixBits <= 56) {
+            // 64-bit accumulator: acc >>= suffixBits is a single SHR instruction
+            uint64_t acc = 0;
+            uint32_t accBits = 0;
+            while (accBits <= 56 && bytePos < payloadBytes) {
+                acc |= static_cast<uint64_t>(payload[bytePos++]) << accBits;
+                accBits += 8;
+            }
+            acc >>= bitOff;
+            accBits -= bitOff;
+            for (size_t j = 0; j < count; ++j) {
+                while (accBits < static_cast<uint32_t>(suffixBits) && accBits <= 56 && bytePos < payloadBytes) {
+                    acc |= static_cast<uint64_t>(payload[bytePos++]) << accBits;
+                    accBits += 8;
+                }
+                const uint64_t s = acc & suffixMask;
+                acc >>= suffixBits;
+                accBits -= static_cast<uint32_t>(suffixBits);
+                output[j] = static_cast<T>(shiftedPrefix | s);
+            }
+        } else {
+            // 128-bit fallback for suffixBits in [57, 63]
+            __uint128_t acc = 0;
+            uint32_t accBits = 0;
+            while (accBits <= 56 && bytePos < payloadBytes) {
+                acc |= static_cast<__uint128_t>(payload[bytePos++]) << accBits;
+                accBits += 8;
+            }
+            acc >>= bitOff;
+            accBits -= bitOff;
+            for (size_t j = 0; j < count; ++j) {
+                while (accBits < static_cast<uint32_t>(suffixBits) && bytePos < payloadBytes) {
+                    acc |= static_cast<__uint128_t>(payload[bytePos++]) << accBits;
+                    accBits += 8;
+                }
+                const uint64_t s = static_cast<uint64_t>(acc) & suffixMask;
+                acc >>= suffixBits;
+                accBits -= static_cast<uint32_t>(suffixBits);
+                output[j] = static_cast<T>(shiftedPrefix | s);
+            }
+        }
     }
 
     static uint64_t extractSuffix(const uint8_t* payload, size_t payloadBytes, size_t idx, uint8_t suffixBits) {
