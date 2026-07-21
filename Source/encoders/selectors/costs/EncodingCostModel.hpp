@@ -313,6 +313,80 @@ public:
 	}
 };
 
+class AdaptiveDictionaryCostModel final : public EncodingCostModel {
+public:
+    static constexpr size_t kFileHeaderSize   = 16;
+    static constexpr size_t kBlockDescSize    = 13;
+    static constexpr size_t kKeysPaddingBytes =  8;
+    static constexpr uint32_t kCandidates[]   = {
+        32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536
+    };
+
+    double computeCost(const SegmentMetrics& metrics,
+                       size_t numValues,
+                       size_t bitWidth) const override {
+        if (numValues == 0 || metrics.uniqueCount == 0) return 0.0;
+
+        // Replicate DictionaryCostModel's cardinality estimation.
+        const double observedUniques  = static_cast<double>(metrics.uniqueCount);
+        const double hllEstimate      = metrics.hllEstimatedCardinality;
+        const double chao1Estimate    = detail::estimate_chao1(
+                                            metrics.uniqueCount, metrics.f1, metrics.f2);
+        const double chaoWeight       = (metrics.f2 < 5) ? 0.1 : 0.3;
+        const double blended          = (1.0 - chaoWeight) * hllEstimate
+                                      + chaoWeight * chao1Estimate;
+        const double confidence       = std::min(
+                                            1.0,
+                                            std::sqrt(static_cast<double>(numValues) / 10000.0));
+        double estimatedUniques       = (1.0 - confidence) * observedUniques
+                                      + confidence * blended;
+        estimatedUniques = std::max(estimatedUniques, observedUniques);
+        estimatedUniques = std::min(estimatedUniques, static_cast<double>(numValues));
+        estimatedUniques = std::min(
+            estimatedUniques,
+            static_cast<double>(MetricCollector<uint64_t>::kUniqueCountCap));
+        const double C = std::max(1.0, estimatedUniques);
+
+        const double storageBits = static_cast<double>(
+            storageWidthBits(static_cast<uint8_t>(bitWidth)));
+
+        double bestBits = std::numeric_limits<double>::max();
+
+        for (const uint32_t bs : kCandidates) {
+            const size_t numBlocks = (numValues + bs - 1) / bs;
+
+            // Expected distinct values per block: balls-into-bins approximation.
+            // Converges to bs when bs << C, to C when bs >> C.
+            const double blockCard = std::max(1.0,
+                std::min(C, C * (1.0 - std::exp(-static_cast<double>(bs) / C))));
+            const uint64_t blockCardInt = static_cast<uint64_t>(std::ceil(blockCard));
+            const uint32_t rawWidth = detail::ceil_log2_u64(blockCardInt);
+            const uint32_t keyWidth = detail::clamp_dict_index_width(
+                                          rawWidth == 0 ? 1u : rawWidth);
+
+            const double headerBits      = static_cast<double>(kFileHeaderSize) * 8.0;
+            const double indexBits       = static_cast<double>(numBlocks * kBlockDescSize) * 8.0;
+            const double dictBitsPerBlk  = blockCard * storageBits;
+            const double keyBitsPerBlk   = static_cast<double>(bs) * static_cast<double>(keyWidth);
+            const double padBitsPerBlk   = static_cast<double>(kKeysPaddingBytes) * 8.0;
+            const double totalBits       = headerBits + indexBits
+                + static_cast<double>(numBlocks) * (dictBitsPerBlk + keyBitsPerBlk + padBitsPerBlk);
+
+            bestBits = std::min(bestBits, totalBits);
+        }
+
+        return bestBits;
+    }
+
+    encodings::EncodingType encodingType() const override {
+        return encodings::EncodingType::AdaptiveDictionaryEncoding;
+    }
+
+    MetricFlags requiredMetrics() const override {
+        return static_cast<MetricFlags>(MetricFlag::FreqStats);
+    }
+};
+
 class RLECostModel final : public EncodingCostModel {
 public:
 	double computeCost(const SegmentMetrics& metrics, size_t numValues, size_t bitWidth) const override {
@@ -674,6 +748,12 @@ public:
             coveredFrac  = newCumFrac;
         }
 
+        // When no tier survived the marginal-cost check, FPE degrades to raw
+        // fallback storage plus a fixed header — strictly worse than any direct
+        // encoding.  Return infinity so the selector never chooses it.
+        if (coveredFrac == 0.0)
+            return std::numeric_limits<double>::infinity();
+
         // Fallback cost for uncovered element occurrences.
         const double fallbackBits = N * (1.0 - coveredFrac) * storageBits;
         totalCost += fallbackBits;
@@ -687,6 +767,354 @@ public:
 
     encodings::EncodingType encodingType() const override {
         return encodings::EncodingType::FrequencyPartitionEncoding;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// BlockFrequencyPartitionCostModel
+//
+// Estimates compressed size for BlockFrequencyPartitionEncoder.  Like the
+// global FrequencyPartitionCostModel but replaces per-tier N-bit bitmaps with
+// a compact per-block tier-tag bitfield (1–2 bits/element).  Also adds per-
+// block descriptor overhead (24 bytes × numBlocks) which is negligible at
+// typical block sizes.
+// ---------------------------------------------------------------------------
+class BlockFrequencyPartitionCostModel final : public EncodingCostModel {
+    // Mirrors BlockFrequencyPartitionEncoder constants
+    static constexpr size_t   kBlockDescBits   = 24 * 8;  // 24 bytes per block descriptor
+    static constexpr size_t   kFileHeaderBits  = 16 * 8;  // 16-byte file header
+    static constexpr double   kDefaultBlockSz  = 256.0;
+    static constexpr uint32_t kTierCaps[]      = {2, 4, 16};
+    static constexpr uint32_t kTierKeyBits[]   = {1, 2, 4};
+    static constexpr size_t   kNumTiers        = 3;
+
+public:
+    double computeCost(const SegmentMetrics& metrics, size_t numValues, size_t bitWidth) const override {
+        if (numValues == 0) return 0.0;
+
+        const size_t storageTypeBits = storageWidthBits(static_cast<uint8_t>(bitWidth));
+        // BlockFP's tiers are fixed at 1-/2-/4-bit keys; no point going deeper than
+        // the storage type allows.
+        const size_t tierDefs = std::min(kNumTiers, storageTypeBits / 2);
+        if (tierDefs == 0) return static_cast<double>(numValues * bitWidth);
+
+        const size_t uniqueEst = metrics.uniqueCountCapped
+            ? static_cast<size_t>(size_t{1} << std::min(bitWidth, size_t{20}))
+            : metrics.uniqueCount;
+        const double effectiveUnique = metrics.uniqueCountCapped
+            ? static_cast<double>(uniqueEst)
+            : std::max(1.0, std::exp2(metrics.entropyEstimate));
+        const double N           = static_cast<double>(numValues);
+        const double storageBits = static_cast<double>(storageTypeBits);
+
+        // Simulate greedy tier-fill with marginal-cost pruning (same logic as FP,
+        // but without the per-tier N-bit bitmap).
+        double totalCost     = 0.0;
+        double coveredFrac   = 0.0;
+        size_t cumCapacity   = 0;
+        uint8_t numActiveTiers = 0;
+
+        for (size_t t = 0; t < tierDefs; ++t) {
+            const size_t tierCap  = kTierCaps[t];
+            const double kb       = static_cast<double>(kTierKeyBits[t]);
+            const double prevCum  = std::min(static_cast<double>(cumCapacity),
+                                             static_cast<double>(uniqueEst));
+            cumCapacity += tierCap;
+            const double newCum   = std::min(static_cast<double>(cumCapacity),
+                                             static_cast<double>(uniqueEst));
+            const double dictSize = newCum - prevCum;
+            if (dictSize <= 0.0) break;
+
+            const double newFrac  = std::min(1.0, static_cast<double>(cumCapacity) / effectiveUnique);
+            const double tierFrac = newFrac - coveredFrac;
+            const double tierCnt  = tierFrac * N;
+
+            // No per-tier bitmap (BlockFP uses a shared tag bitfield instead).
+            const double tierCost    = dictSize * storageBits + tierCnt * kb;
+            const double tierSavings = tierCnt * storageBits;
+            if (tierSavings <= tierCost) continue;
+
+            totalCost += tierCost;
+            coveredFrac = newFrac;
+            numActiveTiers++;
+        }
+
+        if (coveredFrac == 0.0)
+            return std::numeric_limits<double>::infinity();
+
+        // Fallback cost for uncovered elements
+        totalCost += N * (1.0 - coveredFrac) * storageBits;
+
+        // Tag bitfield: 1–2 bits/element shared across all active tiers + fallback
+        const uint8_t numTotalCodes = numActiveTiers + (coveredFrac < 1.0 ? 1u : 0u);
+        const uint8_t tagBW = (numTotalCodes <= 1u) ? 0u : (numTotalCodes == 2u) ? 1u : 2u;
+        totalCost += N * static_cast<double>(tagBW);
+
+        // Per-block descriptor overhead + file header
+        const double numBlocks = std::ceil(N / kDefaultBlockSz);
+        totalCost += numBlocks * static_cast<double>(kBlockDescBits)
+                   + static_cast<double>(kFileHeaderBits);
+
+        return totalCost;
+    }
+
+    MetricFlags requiredMetrics() const override {
+        return static_cast<MetricFlags>(MetricFlag::FreqStats);
+    }
+
+    encodings::EncodingType encodingType() const override {
+        return encodings::EncodingType::BlockFrequencyPartitionEncoding;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// BlockFrequencyPartitionFORCostModel
+//
+// Estimates compressed size for BlockFrequencyPartitionEncoder<T, FORPrepass::GlobalFOR>.
+//
+// The GlobalFOR prepass subtracts the global minimum before block-wise FPE, but
+// the encoder still stores residuals at full sizeof(T) width (no bit-packing).
+// Consequently the tier-fill cost is identical to BlockFrequencyPartitionCostModel;
+// the only structural difference is sizeof(T) extra bytes in the file header for
+// the stored global minimum — negligible for typical stream sizes.
+//
+// The model exists as a distinct class so it:
+//   (a) returns BlockFrequencyPartitionFOREncoding from encodingType(), letting the
+//       AutoSubIntSplit DP distinguish it from the None variant, and
+//   (b) declares MinMax as a required metric, signalling to the MetricCollector that
+//       range information is needed (useful for future refinements that exploit the
+//       narrowed residual range when a type-narrowing step is also applied).
+// ---------------------------------------------------------------------------
+class BlockFrequencyPartitionFORCostModel final : public EncodingCostModel {
+    static constexpr size_t   kBlockDescBits  = 24 * 8;
+    static constexpr size_t   kFileHeaderBits = 16 * 8; // globalMin overhead is negligible
+    static constexpr double   kDefaultBlockSz = 256.0;
+    static constexpr uint32_t kTierCaps[]     = {2, 4, 16};
+    static constexpr uint32_t kTierKeyBits[]  = {1, 2, 4};
+    static constexpr size_t   kNumTiers       = 3;
+
+public:
+    double computeCost(const SegmentMetrics& metrics, size_t numValues, size_t bitWidth) const override {
+        if (numValues == 0) return 0.0;
+
+        const size_t storageTypeBits = storageWidthBits(static_cast<uint8_t>(bitWidth));
+        const size_t tierDefs = std::min(kNumTiers, storageTypeBits / 2);
+        if (tierDefs == 0) return static_cast<double>(numValues * bitWidth);
+
+        const size_t uniqueEst = metrics.uniqueCountCapped
+            ? static_cast<size_t>(size_t{1} << std::min(bitWidth, size_t{20}))
+            : metrics.uniqueCount;
+        const double effectiveUnique = metrics.uniqueCountCapped
+            ? static_cast<double>(uniqueEst)
+            : std::max(1.0, std::exp2(metrics.entropyEstimate));
+        const double N           = static_cast<double>(numValues);
+        const double storageBits = static_cast<double>(storageTypeBits);
+
+        double totalCost     = 0.0;
+        double coveredFrac   = 0.0;
+        size_t cumCapacity   = 0;
+        uint8_t numActiveTiers = 0;
+
+        for (size_t t = 0; t < tierDefs; ++t) {
+            const size_t tierCap  = kTierCaps[t];
+            const double kb       = static_cast<double>(kTierKeyBits[t]);
+            const double prevCum  = std::min(static_cast<double>(cumCapacity),
+                                             static_cast<double>(uniqueEst));
+            cumCapacity += tierCap;
+            const double newCum   = std::min(static_cast<double>(cumCapacity),
+                                             static_cast<double>(uniqueEst));
+            const double dictSize = newCum - prevCum;
+            if (dictSize <= 0.0) break;
+
+            const double newFrac  = std::min(1.0, static_cast<double>(cumCapacity) / effectiveUnique);
+            const double tierFrac = newFrac - coveredFrac;
+            const double tierCnt  = tierFrac * N;
+
+            const double tierCost    = dictSize * storageBits + tierCnt * kb;
+            const double tierSavings = tierCnt * storageBits;
+            if (tierSavings <= tierCost) continue;
+
+            totalCost += tierCost;
+            coveredFrac = newFrac;
+            numActiveTiers++;
+        }
+
+        if (coveredFrac == 0.0)
+            return std::numeric_limits<double>::infinity();
+
+        totalCost += N * (1.0 - coveredFrac) * storageBits;
+
+        const uint8_t numTotalCodes = numActiveTiers + (coveredFrac < 1.0 ? 1u : 0u);
+        const uint8_t tagBW = (numTotalCodes <= 1u) ? 0u : (numTotalCodes == 2u) ? 1u : 2u;
+        totalCost += N * static_cast<double>(tagBW);
+
+        const double numBlocks = std::ceil(N / kDefaultBlockSz);
+        totalCost += numBlocks * static_cast<double>(kBlockDescBits)
+                   + static_cast<double>(kFileHeaderBits);
+
+        return totalCost;
+    }
+
+    MetricFlags requiredMetrics() const override {
+        return static_cast<MetricFlags>(MetricFlag::FreqStats)
+             | static_cast<MetricFlags>(MetricFlag::MinMax);
+    }
+
+    encodings::EncodingType encodingType() const override {
+        return encodings::EncodingType::BlockFrequencyPartitionFOREncoding;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// BlockFSECostModel
+//
+// Estimates compressed size for BlockFSEEncoder.
+// Each block carries an independent FSE header + symbol table + ANS payload.
+// The structural overhead (file header + block index) is amortised over all
+// blocks; the per-block FSE header dominates for small blockSizes.
+//
+// Formula (all in bits):
+//   structural   = (kFileHeaderSize + numBlocks x kBlockDescSize) x 8
+//   fse_headers  = numBlocks x (kFSEHeaderFixed + uniqueEst x (storageBytes+2)) x 8
+//   payload      = N x entropyEstimate
+// where numBlocks = ceil(N / kEstBlockSize).
+// ---------------------------------------------------------------------------
+class BlockFSECostModel final : public EncodingCostModel {
+    static constexpr size_t kFileHeaderSize = 16;  // N(8)+blockSize(4)+numBlocks(4)
+    static constexpr size_t kBlockDescSize  =  8;  // payloadByteOffset(8) only
+    static constexpr size_t kFSEHeaderFixed = 17;  // numElements(8)+tableLog(1)+numSymbols(4)+initState(4)
+    static constexpr double kEstBlockSize   = 1024.0;
+
+public:
+    double computeCost(const SegmentMetrics& metrics, size_t numValues, size_t bitWidth) const override {
+        if (numValues == 0) return 0.0;
+
+        const size_t storageBytes = static_cast<size_t>(storageWidthBits(static_cast<uint8_t>(bitWidth))) / 8;
+        const size_t numSymbols   = metrics.uniqueCountCapped
+            ? MetricCollector<uint64_t>::kUniqueCountCap
+            : metrics.uniqueCount;
+
+        // Heavy penalty above 65536 symbols: FSE table grows unboundedly.
+        constexpr size_t kReasonableFSESymbols = 1u << 16;
+        constexpr size_t kImplMaxFSESymbols    = 1u << 20;
+        if (numSymbols > kImplMaxFSESymbols) {
+            return static_cast<double>(numValues) * static_cast<double>(bitWidth) * 16.0;
+        }
+
+        const double numBlocks = std::ceil(static_cast<double>(numValues) / kEstBlockSize);
+
+        const double structuralBits = static_cast<double>(
+            kFileHeaderSize + static_cast<size_t>(numBlocks) * kBlockDescSize) * 8.0;
+
+        const double fseHeaderBits = numBlocks *
+            static_cast<double>(kFSEHeaderFixed + numSymbols * (storageBytes + 2)) * 8.0;
+
+        const double payloadBits = metrics.entropyEstimate * static_cast<double>(numValues);
+
+        double cost = structuralBits + fseHeaderBits + payloadBits;
+
+        if (numSymbols > kReasonableFSESymbols) {
+            const double over = static_cast<double>(numSymbols - kReasonableFSESymbols)
+                              / static_cast<double>(kReasonableFSESymbols);
+            cost *= 1.0 + 12.0 * over * over;
+        }
+        return cost;
+    }
+
+    MetricFlags requiredMetrics() const override {
+        return static_cast<MetricFlags>(MetricFlag::FreqStats);
+    }
+
+    encodings::EncodingType encodingType() const override {
+        return encodings::EncodingType::BlockFSEEncoding;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// BlockFORFPECostModel
+//
+// Estimates compressed size for BlockFORFPEEncoder. Sweeps the five block-size
+// candidates aligned to MetricCollector::kResidualFrameCandidates and returns
+// the minimum expected cost.
+// ---------------------------------------------------------------------------
+
+class BlockFORFPECostModel final : public EncodingCostModel {
+    static constexpr size_t   kFileHeaderBytes  = 16;
+    static constexpr uint32_t kRankSampleStride = 64;
+    // Block-size candidates aligned to kResidualFrameCandidates = {256,512,1024,2048,4096}
+    static constexpr uint32_t kCandidates[5]    = {256, 512, 1024, 2048, 4096};
+
+    // kBlockDescBytes per TIn type width (mirrors BlockFORFPEEncoder constexpr)
+    static constexpr size_t descBytesForStorage(size_t storageBytes) {
+        if (storageBytes <= 2) return 36;   // uint8_t or uint16_t
+        if (storageBytes <= 4) return 40;   // uint32_t
+        return 44;                          // uint64_t
+    }
+
+public:
+    double computeCost(const SegmentMetrics& m, size_t N, size_t bitWidth) const override {
+        if (N == 0) return 0.0;
+        const size_t storageBytes = storageWidthBits(bitWidth) / 8;
+        const size_t descBytes    = descBytesForStorage(storageBytes);
+
+        double bestBits = std::numeric_limits<double>::max();
+
+        for (size_t ci = 0; ci < 5; ++ci) {
+            const uint32_t bs        = kCandidates[ci];
+            const size_t   numBlocks = (N + bs - 1) / bs;
+
+            // residualBits after FOR: max residual in a frame of this size.
+            const uint8_t rawRB       = m.frameMaxResidualBits[ci];
+            const double  residualBits = (rawRB == 0) ? 1.0 : static_cast<double>(rawRB);
+
+            // Structural overhead (file header + per-block descriptors).
+            const double structBits =
+                static_cast<double>((kFileHeaderBytes + numBlocks * descBytes) * 8);
+
+            // Effective bits/element after FPE tier partitioning on residuals.
+            // For small cardinality: all residuals fit in ≤ kMaxTiers tiers → key width ≈ log2(uniq).
+            // Otherwise: most elements go to fallback at residualBits each; use entropy
+            // re-scaled to the residual space as a proxy for payload cost.
+            double effectiveBitsPerElem;
+            if (m.uniqueCount <= 16) {
+                const double avgKeyBits = (m.uniqueCount <= 1)
+                    ? 0.0
+                    : std::ceil(std::log2(static_cast<double>(m.uniqueCount)));
+                effectiveBitsPerElem = std::max(1.0, std::min(residualBits, avgKeyBits));
+            } else {
+                const double scaledEntropy = (bitWidth > 0)
+                    ? m.entropyEstimate * residualBits / static_cast<double>(bitWidth)
+                    : residualBits;
+                effectiveBitsPerElem = std::max(1.0, std::min(residualBits, scaledEntropy));
+            }
+
+            // Rank sample table: ceil(bs/kRankSampleStride) × numTiers × uint16_t per block.
+            const size_t estNumTiers = (m.uniqueCount <= 1) ? 0u
+                : (m.uniqueCount <= 2)  ? 1u
+                : (m.uniqueCount <= 6)  ? 2u
+                : 3u;
+            const double rankBits = static_cast<double>(
+                numBlocks
+                * ((bs + kRankSampleStride - 1) / kRankSampleStride)
+                * estNumTiers
+                * sizeof(uint16_t) * 8);
+
+            const double totalBits =
+                structBits
+                + static_cast<double>(N) * effectiveBitsPerElem
+                + rankBits;
+            if (totalBits < bestBits) bestBits = totalBits;
+        }
+        return bestBits;
+    }
+
+    MetricFlags requiredMetrics() const override {
+        return static_cast<MetricFlags>(MetricFlag::FreqStats)
+             | static_cast<MetricFlags>(MetricFlag::ResidualFrames);
+    }
+
+    encodings::EncodingType encodingType() const override {
+        return encodings::EncodingType::BlockFORFPEEncoding;
     }
 };
 
@@ -761,6 +1189,592 @@ public:
     }
 };
 
+// Cost model for MainlyConstantEncoding.
+// Estimates based on a dense isCommon bitmap (64-bit-aligned) plus raw storage
+// for the uncommon values.  The dominant fraction is estimated from Shannon
+// entropy: p_max ≈ 2^(-H), which is a conservative lower bound.
+class MainlyConstantCostModel final : public EncodingCostModel {
+public:
+    double computeCost(const SegmentMetrics& metrics, size_t numValues, size_t bitWidth) const override {
+        if (numValues == 0) return 0.0;
+
+        // Estimate dominant fraction from entropy: p_max ≈ 2^(-H).
+        // Conservative lower bound — underestimates MC's benefit, avoiding false positives.
+        const double dominantFraction = (metrics.entropyEstimate > 0.0)
+            ? std::min(1.0, std::pow(2.0, -metrics.entropyEstimate))
+            : 1.0;
+        const double uncommonCount = static_cast<double>(numValues) * (1.0 - dominantFraction);
+
+        // Dense isCommon bitmap: rounded up to 64-bit words.
+        const double numWords = std::ceil(static_cast<double>(numValues) / 64.0);
+        const double bitmapBits = numWords * 64.0;
+
+        // Uncommon values stored at storage width.
+        const uint8_t storageBits = storageWidthBits(static_cast<uint8_t>(bitWidth));
+        const double otherValuesBits = uncommonCount * static_cast<double>(storageBits);
+
+        // Header: elementCount(8B) + bitmapByteCount(4B) + uncommonCount(4B) +
+        //         otherValuesEncodedSize(4B) + commonValue(sizeof(T))
+        const double headerBits = (8 + 4 + 4 + 4) * 8.0 + static_cast<double>(storageBits);
+
+        return headerBits + bitmapBits + otherValuesBits;
+    }
+
+    encodings::EncodingType encodingType() const override {
+        return encodings::EncodingType::MainlyConstantEncoding;
+    }
+
+    MetricFlags requiredMetrics() const override {
+        return static_cast<MetricFlags>(MetricFlag::FreqStats);
+    }
+};
+
+// ---------------------------------------------------------------------------
+// RangePackCostModel — decorator mirroring RangePackSectionCodec's encoder-side
+// design (Source/encoders/RangePackEncoder.hpp): re-invokes an inner cost
+// model at the narrower bit width implied by the segment's actual value
+// range, rather than the section's nominal bitWidth, plus a small fixed
+// header overhead (minVal storage + narrowedBits/N/innerBytes fields).
+// ---------------------------------------------------------------------------
+
+class RangePackCostModel final : public EncodingCostModel {
+public:
+    RangePackCostModel(std::unique_ptr<EncodingCostModel> inner, encodings::EncodingType selfType)
+        : inner_(std::move(inner)), selfType_(selfType) {}
+
+    double computeCost(const SegmentMetrics& metrics, size_t numValues, size_t bitWidth) const override {
+        if (numValues == 0) return 0.0;
+        const uint32_t narrowedBits = std::max<uint32_t>(
+            1, detail::ceil_log2_u64(metrics.range + 1));
+        const double headerBits = static_cast<double>(storageWidthBits(static_cast<uint8_t>(bitWidth))) // minVal
+                                 + 72.0; // N(8B)+narrowedBits(1B)+innerBytes(8B) header fields, in bits
+        return headerBits + inner_->computeCost(metrics, numValues, std::min<size_t>(narrowedBits, bitWidth));
+    }
+
+    encodings::EncodingType encodingType() const override { return selfType_; }
+
+    MetricFlags requiredMetrics() const override {
+        return static_cast<MetricFlags>(MetricFlag::MinMax) | inner_->requiredMetrics();
+    }
+
+private:
+    std::unique_ptr<EncodingCostModel> inner_;
+    encodings::EncodingType selfType_;
+};
+
+// ---------------------------------------------------------------------------
+// CascadingFORCostModel
+//
+// Estimates compressed size for CascadingFOREncoder<int64_t> with the default
+// schedule used by makeCascadingFORSection (residualSchedule={{512,MIN}},
+// referenceSchedule={{64,MIN}}, RawBitPackedEncoder<int64_t> leaves). Reuses
+// SegmentMetrics::frameMaxResidualBits at the 512-frame-size candidate index
+// (no new metric needed) for the residual term; the reference-array term is
+// an acknowledged approximation (no dedicated reference-stream-width metric
+// exists, so the same residual-width stat stands in) -- could mis-rank
+// CascadingFrameOfReference for data where residual-width and reference-width
+// behave very differently; worth validating empirically like every other
+// cost model here.
+// ---------------------------------------------------------------------------
+class CascadingFORCostModel final : public EncodingCostModel {
+public:
+    // Index into kResidualFrameCandidates={256,512,1024,2048,4096}, selecting
+    // which precomputed residual-width bucket approximates this instance's
+    // assumed frameSize. Defaults to index 1 (512), matching
+    // makeCascadingFORSection's default residualSchedule[0].frameSize=512.
+    // RunLengthCascadingFORStartsCostModel constructs a SEPARATE instance with
+    // frameSizeCandidateIdx=0 (256), the closest available bucket to
+    // makeCascadingFORSectionForRunStarts's empirically-tuned frameSize=128
+    // (no exact candidate exists for 128; kResidualFrameCandidates only goes
+    // down to 256) -- still an approximation, just a smaller mismatch than
+    // leaving it at 512.
+    explicit CascadingFORCostModel(size_t frameSizeCandidateIdx = 1)
+        : frameSizeCandidateIdx_(frameSizeCandidateIdx) {}
+
+    double computeCost(const SegmentMetrics& metrics, size_t numValues, size_t bitWidth) const override {
+        if (numValues == 0) return 0.0;
+        // Mirror the runtime layout: top header (3x uint64_t) + one level header (5x uint64_t).
+        static constexpr double kHeaderBits = static_cast<double>(3 * sizeof(uint64_t)) * 8.0
+                                             + static_cast<double>(5 * sizeof(uint64_t)) * 8.0;
+
+        const size_t frameSize = MetricCollector<uint64_t>::kResidualFrameCandidates[frameSizeCandidateIdx_];
+        const size_t numFrames = (numValues + frameSize - 1) / frameSize;
+
+        const uint8_t spanBits = metrics.frameMaxResidualBits[frameSizeCandidateIdx_];
+        const uint8_t resBitsPerVal = spanBits == 0 ? 1 : spanBits;
+        const double resBits = static_cast<double>(numValues) * static_cast<double>(resBitsPerVal);
+
+        // APPROXIMATION: the reference array (length numFrames) is itself
+        // cascaded through referenceSchedule={64} then leaf-encoded via
+        // RawBitPackedEncoder<int64_t>. No dedicated reference-array-width
+        // metric exists, so its storage is approximated as numFrames values
+        // at the same resBitsPerVal-derived width, capped to bitWidth.
+        const double refBits = static_cast<double>(numFrames) *
+            static_cast<double>(std::min<uint8_t>(resBitsPerVal, static_cast<uint8_t>(bitWidth)));
+
+        return kHeaderBits + resBits + refBits;
+    }
+
+    encodings::EncodingType encodingType() const override { return encodings::EncodingType::CascadingFrameOfReference; }
+
+    MetricFlags requiredMetrics() const override { return static_cast<MetricFlags>(MetricFlag::ResidualFrames); }
+
+private:
+    size_t frameSizeCandidateIdx_;
+};
+
+// ---------------------------------------------------------------------------
+// CascadingFORBlockFPECostModel
+//
+// Same header/reference-array structure as CascadingFORCostModel, but
+// delegates the residual-stream term to the already-existing
+// BlockFrequencyPartitionCostModel instead of a flat raw-bitwidth estimate,
+// since makeCascadingFORBlockFrequencyPartitionSection's residual leaf
+// genuinely is BlockFrequencyPartitionEncoder, not RawBitPackedEncoder -- this
+// is a MORE accurate estimate than CascadingFORCostModel's own, not an
+// additional approximation.
+// ---------------------------------------------------------------------------
+class CascadingFORBlockFPECostModel final : public EncodingCostModel {
+public:
+    static constexpr size_t kOuterFrameIdx = 1; // candidates[1] == 512
+
+    double computeCost(const SegmentMetrics& metrics, size_t numValues, size_t bitWidth) const override {
+        if (numValues == 0) return 0.0;
+        static constexpr double kHeaderBits = static_cast<double>(3 * sizeof(uint64_t)) * 8.0
+                                             + static_cast<double>(5 * sizeof(uint64_t)) * 8.0;
+
+        constexpr size_t frameSize = 512;
+        const size_t numFrames = (numValues + frameSize - 1) / frameSize;
+
+        const double resBits = blockFpeInner_.computeCost(metrics, numValues, bitWidth);
+
+        // Reference-array term: same approximation as CascadingFORCostModel
+        // (reference cascade + RawBitPackedEncoder leaf, not BlockFPE).
+        const uint8_t spanBits = metrics.frameMaxResidualBits[kOuterFrameIdx];
+        const uint8_t refBitsPerVal = spanBits == 0 ? 1 : spanBits;
+        const double refBits = static_cast<double>(numFrames) *
+            static_cast<double>(std::min<uint8_t>(refBitsPerVal, static_cast<uint8_t>(bitWidth)));
+
+        return kHeaderBits + resBits + refBits;
+    }
+
+    encodings::EncodingType encodingType() const override {
+        return encodings::EncodingType::CascadingFORBlockFrequencyPartitionEncoding;
+    }
+
+    MetricFlags requiredMetrics() const override {
+        return static_cast<MetricFlags>(MetricFlag::ResidualFrames) | blockFpeInner_.requiredMetrics();
+    }
+
+private:
+    BlockFrequencyPartitionCostModel blockFpeInner_{};
+};
+
+// ---------------------------------------------------------------------------
+// CascadingFORFSECostModel / CascadingFORBlockFSECostModel / CascadingFORHuffmanCostModel
+//
+// Same header/reference-array structure as CascadingFORCostModel, delegating
+// the residual-stream term to the already-existing FSECostModel /
+// BlockFSECostModel / HuffmanCostModel respectively instead of a flat
+// raw-bitwidth estimate, mirroring CascadingFORBlockFPECostModel's pattern.
+// ---------------------------------------------------------------------------
+class CascadingFORFSECostModel final : public EncodingCostModel {
+public:
+    static constexpr size_t kOuterFrameIdx = 1; // candidates[1] == 512
+
+    double computeCost(const SegmentMetrics& metrics, size_t numValues, size_t bitWidth) const override {
+        if (numValues == 0) return 0.0;
+        static constexpr double kHeaderBits = static_cast<double>(3 * sizeof(uint64_t)) * 8.0
+                                             + static_cast<double>(5 * sizeof(uint64_t)) * 8.0;
+
+        constexpr size_t frameSize = 512;
+        const size_t numFrames = (numValues + frameSize - 1) / frameSize;
+
+        const double resBits = fseInner_.computeCost(metrics, numValues, bitWidth);
+
+        const uint8_t spanBits = metrics.frameMaxResidualBits[kOuterFrameIdx];
+        const uint8_t refBitsPerVal = spanBits == 0 ? 1 : spanBits;
+        const double refBits = static_cast<double>(numFrames) *
+            static_cast<double>(std::min<uint8_t>(refBitsPerVal, static_cast<uint8_t>(bitWidth)));
+
+        return kHeaderBits + resBits + refBits;
+    }
+
+    encodings::EncodingType encodingType() const override {
+        return encodings::EncodingType::CascadingFORFSEEncoding;
+    }
+
+    MetricFlags requiredMetrics() const override {
+        return static_cast<MetricFlags>(MetricFlag::ResidualFrames) | fseInner_.requiredMetrics();
+    }
+
+private:
+    FSECostModel fseInner_{};
+};
+
+class CascadingFORBlockFSECostModel final : public EncodingCostModel {
+public:
+    static constexpr size_t kOuterFrameIdx = 1; // candidates[1] == 512
+
+    double computeCost(const SegmentMetrics& metrics, size_t numValues, size_t bitWidth) const override {
+        if (numValues == 0) return 0.0;
+        static constexpr double kHeaderBits = static_cast<double>(3 * sizeof(uint64_t)) * 8.0
+                                             + static_cast<double>(5 * sizeof(uint64_t)) * 8.0;
+
+        constexpr size_t frameSize = 512;
+        const size_t numFrames = (numValues + frameSize - 1) / frameSize;
+
+        const double resBits = blockFseInner_.computeCost(metrics, numValues, bitWidth);
+
+        const uint8_t spanBits = metrics.frameMaxResidualBits[kOuterFrameIdx];
+        const uint8_t refBitsPerVal = spanBits == 0 ? 1 : spanBits;
+        const double refBits = static_cast<double>(numFrames) *
+            static_cast<double>(std::min<uint8_t>(refBitsPerVal, static_cast<uint8_t>(bitWidth)));
+
+        return kHeaderBits + resBits + refBits;
+    }
+
+    encodings::EncodingType encodingType() const override {
+        return encodings::EncodingType::CascadingFORBlockFSEEncoding;
+    }
+
+    MetricFlags requiredMetrics() const override {
+        return static_cast<MetricFlags>(MetricFlag::ResidualFrames) | blockFseInner_.requiredMetrics();
+    }
+
+private:
+    BlockFSECostModel blockFseInner_{};
+};
+
+class CascadingFORHuffmanCostModel final : public EncodingCostModel {
+public:
+    static constexpr size_t kOuterFrameIdx = 1; // candidates[1] == 512
+
+    double computeCost(const SegmentMetrics& metrics, size_t numValues, size_t bitWidth) const override {
+        if (numValues == 0) return 0.0;
+        static constexpr double kHeaderBits = static_cast<double>(3 * sizeof(uint64_t)) * 8.0
+                                             + static_cast<double>(5 * sizeof(uint64_t)) * 8.0;
+
+        constexpr size_t frameSize = 512;
+        const size_t numFrames = (numValues + frameSize - 1) / frameSize;
+
+        const double resBits = huffmanInner_.computeCost(metrics, numValues, bitWidth);
+
+        const uint8_t spanBits = metrics.frameMaxResidualBits[kOuterFrameIdx];
+        const uint8_t refBitsPerVal = spanBits == 0 ? 1 : spanBits;
+        const double refBits = static_cast<double>(numFrames) *
+            static_cast<double>(std::min<uint8_t>(refBitsPerVal, static_cast<uint8_t>(bitWidth)));
+
+        return kHeaderBits + resBits + refBits;
+    }
+
+    encodings::EncodingType encodingType() const override {
+        return encodings::EncodingType::CascadingFORHuffmanEncoding;
+    }
+
+    MetricFlags requiredMetrics() const override {
+        return static_cast<MetricFlags>(MetricFlag::ResidualFrames) | huffmanInner_.requiredMetrics();
+    }
+
+private:
+    HuffmanCostModel huffmanInner_{};
+};
+
+// ---------------------------------------------------------------------------
+// CascadingFORPrevFSECostModel / CascadingFORPrevBlockFSECostModel /
+// CascadingFORPrevHuffmanCostModel
+//
+// PREV-policy siblings of CascadingFORFSECostModel/CascadingFORBlockFSECostModel/
+// CascadingFORHuffmanCostModel above -- same header/reference-array structure,
+// but the residual term is computed by handing the inner cost model a PROXY
+// SegmentMetrics whose frameMaxResidualBits/frameAvgResidualBits have been
+// overwritten with frameMaxDeltaBits/frameAvgDeltaBits (from
+// MetricFlag::DeltaFrames) before delegating.
+//
+// APPROXIMATION (flagged, matching this session's practice for every other
+// new cost model): FSECostModel/BlockFSECostModel/HuffmanCostModel's entropy
+// term is still driven by MetricFlag::FreqStats computed over RAW segment
+// values, not deltas -- so the estimated entropy-coding benefit may be
+// systematically off for data whose delta distribution's skew differs a lot
+// from its raw distribution's. This is a reasonable first-cut proxy for the
+// bit-width portion of those inner models' formulas; validate/refine via
+// this benchmark's existing cost-model-accuracy diagnostic rather than
+// building a delta-aware FreqStats metric upfront.
+// ---------------------------------------------------------------------------
+class CascadingFORPrevFSECostModel final : public EncodingCostModel {
+public:
+    static constexpr size_t kOuterFrameIdx = 1; // candidates[1] == 512
+
+    double computeCost(const SegmentMetrics& metrics, size_t numValues, size_t bitWidth) const override {
+        if (numValues == 0) return 0.0;
+        static constexpr double kHeaderBits = static_cast<double>(3 * sizeof(uint64_t)) * 8.0
+                                             + static_cast<double>(5 * sizeof(uint64_t)) * 8.0;
+
+        constexpr size_t frameSize = 512;
+        const size_t numFrames = (numValues + frameSize - 1) / frameSize;
+
+        SegmentMetrics proxy = metrics;
+        proxy.frameMaxResidualBits[kOuterFrameIdx] = metrics.frameMaxDeltaBits[kOuterFrameIdx];
+        proxy.frameAvgResidualBits[kOuterFrameIdx] = metrics.frameAvgDeltaBits[kOuterFrameIdx];
+        const double resBits = fseInner_.computeCost(proxy, numValues, bitWidth);
+
+        // Reference-array term: UNCHANGED -- reference array stores raw
+        // data[lo] anchors, not deltas.
+        const uint8_t spanBits = metrics.frameMaxResidualBits[kOuterFrameIdx];
+        const uint8_t refBitsPerVal = spanBits == 0 ? 1 : spanBits;
+        const double refBits = static_cast<double>(numFrames) *
+            static_cast<double>(std::min<uint8_t>(refBitsPerVal, static_cast<uint8_t>(bitWidth)));
+
+        return kHeaderBits + resBits + refBits;
+    }
+
+    encodings::EncodingType encodingType() const override {
+        return encodings::EncodingType::CascadingFORPrevFSEEncoding;
+    }
+
+    MetricFlags requiredMetrics() const override {
+        return static_cast<MetricFlags>(MetricFlag::ResidualFrames)
+             | static_cast<MetricFlags>(MetricFlag::DeltaFrames)
+             | fseInner_.requiredMetrics();
+    }
+
+private:
+    FSECostModel fseInner_{};
+};
+
+class CascadingFORPrevBlockFSECostModel final : public EncodingCostModel {
+public:
+    static constexpr size_t kOuterFrameIdx = 1; // candidates[1] == 512
+
+    double computeCost(const SegmentMetrics& metrics, size_t numValues, size_t bitWidth) const override {
+        if (numValues == 0) return 0.0;
+        static constexpr double kHeaderBits = static_cast<double>(3 * sizeof(uint64_t)) * 8.0
+                                             + static_cast<double>(5 * sizeof(uint64_t)) * 8.0;
+
+        constexpr size_t frameSize = 512;
+        const size_t numFrames = (numValues + frameSize - 1) / frameSize;
+
+        SegmentMetrics proxy = metrics;
+        proxy.frameMaxResidualBits[kOuterFrameIdx] = metrics.frameMaxDeltaBits[kOuterFrameIdx];
+        proxy.frameAvgResidualBits[kOuterFrameIdx] = metrics.frameAvgDeltaBits[kOuterFrameIdx];
+        const double resBits = blockFseInner_.computeCost(proxy, numValues, bitWidth);
+
+        const uint8_t spanBits = metrics.frameMaxResidualBits[kOuterFrameIdx];
+        const uint8_t refBitsPerVal = spanBits == 0 ? 1 : spanBits;
+        const double refBits = static_cast<double>(numFrames) *
+            static_cast<double>(std::min<uint8_t>(refBitsPerVal, static_cast<uint8_t>(bitWidth)));
+
+        return kHeaderBits + resBits + refBits;
+    }
+
+    encodings::EncodingType encodingType() const override {
+        return encodings::EncodingType::CascadingFORPrevBlockFSEEncoding;
+    }
+
+    MetricFlags requiredMetrics() const override {
+        return static_cast<MetricFlags>(MetricFlag::ResidualFrames)
+             | static_cast<MetricFlags>(MetricFlag::DeltaFrames)
+             | blockFseInner_.requiredMetrics();
+    }
+
+private:
+    BlockFSECostModel blockFseInner_{};
+};
+
+class CascadingFORPrevHuffmanCostModel final : public EncodingCostModel {
+public:
+    static constexpr size_t kOuterFrameIdx = 1; // candidates[1] == 512
+
+    double computeCost(const SegmentMetrics& metrics, size_t numValues, size_t bitWidth) const override {
+        if (numValues == 0) return 0.0;
+        static constexpr double kHeaderBits = static_cast<double>(3 * sizeof(uint64_t)) * 8.0
+                                             + static_cast<double>(5 * sizeof(uint64_t)) * 8.0;
+
+        constexpr size_t frameSize = 512;
+        const size_t numFrames = (numValues + frameSize - 1) / frameSize;
+
+        SegmentMetrics proxy = metrics;
+        proxy.frameMaxResidualBits[kOuterFrameIdx] = metrics.frameMaxDeltaBits[kOuterFrameIdx];
+        proxy.frameAvgResidualBits[kOuterFrameIdx] = metrics.frameAvgDeltaBits[kOuterFrameIdx];
+        const double resBits = huffmanInner_.computeCost(proxy, numValues, bitWidth);
+
+        const uint8_t spanBits = metrics.frameMaxResidualBits[kOuterFrameIdx];
+        const uint8_t refBitsPerVal = spanBits == 0 ? 1 : spanBits;
+        const double refBits = static_cast<double>(numFrames) *
+            static_cast<double>(std::min<uint8_t>(refBitsPerVal, static_cast<uint8_t>(bitWidth)));
+
+        return kHeaderBits + resBits + refBits;
+    }
+
+    encodings::EncodingType encodingType() const override {
+        return encodings::EncodingType::CascadingFORPrevHuffmanEncoding;
+    }
+
+    MetricFlags requiredMetrics() const override {
+        return static_cast<MetricFlags>(MetricFlag::ResidualFrames)
+             | static_cast<MetricFlags>(MetricFlag::DeltaFrames)
+             | huffmanInner_.requiredMetrics();
+    }
+
+private:
+    HuffmanCostModel huffmanInner_{};
+};
+
+// ---------------------------------------------------------------------------
+// CascadingFORPrevFrequencyPartitionCostModel /
+// CascadingFORPrevBlockFrequencyPartitionCostModel
+//
+// PREV-policy compositions with FrequencyPartitionEncoder/
+// BlockFrequencyPartitionEncoder leaves. Unlike the entropy-coder trio above,
+// FrequencyPartitionCostModel/BlockFrequencyPartitionCostModel (checked
+// directly) never read frameMaxResidualBits at all -- both are driven
+// entirely by MetricFlag::FreqStats (metrics.uniqueCount/entropyEstimate/
+// uniqueCountCapped), simulating the encoders' own greedy tier-fill against
+// the segment's frequency distribution. Substituting frameMaxDeltaBits (as
+// above) would do nothing here, so these two instead substitute
+// MetricFlag::DeltaFreqStats's deltaUniqueCount/deltaEntropyEstimate/
+// deltaUniqueCountCapped fields into the proxy's uniqueCount/entropyEstimate/
+// uniqueCountCapped slots.
+//
+// APPROXIMATION (flagged): DeltaFreqStats collects at ONE fixed frame size
+// (MetricCollector::kDeltaFreqStatsFrameSize) rather than comparing multiple
+// candidates the way DeltaFrames does -- see that constant's own doc for why.
+// Keep it in sync with whatever frame size ends up baked into
+// makeCascadingFORPrevFrequencyPartitionSection/
+// makeCascadingFORPrevBlockFrequencyPartitionSection.
+// ---------------------------------------------------------------------------
+class CascadingFORPrevFrequencyPartitionCostModel final : public EncodingCostModel {
+public:
+    static constexpr size_t kOuterFrameIdx = 1; // candidates[1] == 512
+
+    double computeCost(const SegmentMetrics& metrics, size_t numValues, size_t bitWidth) const override {
+        if (numValues == 0) return 0.0;
+        static constexpr double kHeaderBits = static_cast<double>(3 * sizeof(uint64_t)) * 8.0
+                                             + static_cast<double>(5 * sizeof(uint64_t)) * 8.0;
+
+        constexpr size_t frameSize = 512;
+        const size_t numFrames = (numValues + frameSize - 1) / frameSize;
+
+        SegmentMetrics proxy = metrics;
+        proxy.uniqueCount       = metrics.deltaUniqueCount;
+        proxy.uniqueCountCapped = metrics.deltaUniqueCountCapped;
+        proxy.entropyEstimate   = metrics.deltaEntropyEstimate;
+        const double resBits = fpeInner_.computeCost(proxy, numValues, bitWidth);
+
+        const uint8_t spanBits = metrics.frameMaxResidualBits[kOuterFrameIdx];
+        const uint8_t refBitsPerVal = spanBits == 0 ? 1 : spanBits;
+        const double refBits = static_cast<double>(numFrames) *
+            static_cast<double>(std::min<uint8_t>(refBitsPerVal, static_cast<uint8_t>(bitWidth)));
+
+        return kHeaderBits + resBits + refBits;
+    }
+
+    encodings::EncodingType encodingType() const override {
+        return encodings::EncodingType::CascadingFORPrevFrequencyPartitionEncoding;
+    }
+
+    MetricFlags requiredMetrics() const override {
+        return static_cast<MetricFlags>(MetricFlag::ResidualFrames)
+             | static_cast<MetricFlags>(MetricFlag::DeltaFreqStats)
+             | fpeInner_.requiredMetrics();
+    }
+
+private:
+    FrequencyPartitionCostModel fpeInner_{};
+};
+
+class CascadingFORPrevBlockFrequencyPartitionCostModel final : public EncodingCostModel {
+public:
+    static constexpr size_t kOuterFrameIdx = 1; // candidates[1] == 512
+
+    double computeCost(const SegmentMetrics& metrics, size_t numValues, size_t bitWidth) const override {
+        if (numValues == 0) return 0.0;
+        static constexpr double kHeaderBits = static_cast<double>(3 * sizeof(uint64_t)) * 8.0
+                                             + static_cast<double>(5 * sizeof(uint64_t)) * 8.0;
+
+        constexpr size_t frameSize = 512;
+        const size_t numFrames = (numValues + frameSize - 1) / frameSize;
+
+        SegmentMetrics proxy = metrics;
+        proxy.uniqueCount       = metrics.deltaUniqueCount;
+        proxy.uniqueCountCapped = metrics.deltaUniqueCountCapped;
+        proxy.entropyEstimate   = metrics.deltaEntropyEstimate;
+        const double resBits = blockFpeInner_.computeCost(proxy, numValues, bitWidth);
+
+        const uint8_t spanBits = metrics.frameMaxResidualBits[kOuterFrameIdx];
+        const uint8_t refBitsPerVal = spanBits == 0 ? 1 : spanBits;
+        const double refBits = static_cast<double>(numFrames) *
+            static_cast<double>(std::min<uint8_t>(refBitsPerVal, static_cast<uint8_t>(bitWidth)));
+
+        return kHeaderBits + resBits + refBits;
+    }
+
+    encodings::EncodingType encodingType() const override {
+        return encodings::EncodingType::CascadingFORPrevBlockFrequencyPartitionEncoding;
+    }
+
+    MetricFlags requiredMetrics() const override {
+        return static_cast<MetricFlags>(MetricFlag::ResidualFrames)
+             | static_cast<MetricFlags>(MetricFlag::DeltaFreqStats)
+             | blockFpeInner_.requiredMetrics();
+    }
+
+private:
+    BlockFrequencyPartitionCostModel blockFpeInner_{};
+};
+
+// ---------------------------------------------------------------------------
+// RunLengthCascadingFORStartsCostModel
+//
+// Reuses RLECostModel's estimatedRunCount = numValues/avgRunLength logic for
+// the runValues term (reimplemented inline rather than delegated, since
+// RLECostModel::computeCost is monolithic and doesn't expose a decomposable
+// sub-call the way RangePackCostModel's wrapped inner_ does), and delegates
+// the runStarts term to CascadingFORCostModel evaluated on the runStarts
+// stream's OWN size (numValues=estimatedRunCount, bitWidth=ceil_log2(numValues))
+// -- NOT the original segment's numValues/bitWidth, since run-start positions
+// have a completely different domain than run values. The inner
+// CascadingFORCostModel call still reads frameMaxResidualBits computed over
+// the ORIGINAL N-element segment as a proxy for the (unmaterialized)
+// R-element run-starts stream's own residual-width behavior -- an
+// acknowledged, likely-imperfect proxy (run-start positions are monotonically
+// increasing with different bit-width dynamics than run values); worth
+// revisiting if this measurably misleads the DP once benchmarked. Constructed
+// with frameSizeCandidateIdx=0 (256) rather than the default 1 (512), the
+// closest available bucket to makeCascadingFORSectionForRunStarts's actual,
+// empirically-tuned frameSize=128 (see that factory's comment in
+// SubIntEncodingUtils.hpp for the frame-size sweep this was based on).
+// ---------------------------------------------------------------------------
+class RunLengthCascadingFORStartsCostModel final : public EncodingCostModel {
+public:
+    double computeCost(const SegmentMetrics& metrics, size_t numValues, size_t bitWidth) const override {
+        if (numValues == 0 || metrics.avgRunLength <= 0.0) return 0.0;
+
+        const double estimatedRunCountD = static_cast<double>(numValues) / metrics.avgRunLength;
+        const size_t estimatedRunCount  = std::max<size_t>(1, static_cast<size_t>(std::llround(estimatedRunCountD)));
+
+        const double headerBits    = static_cast<double>(3 * sizeof(size_t)) * 8.0;  // RunLengthEncoder's own header
+        const double runValuesBits = estimatedRunCountD *
+            static_cast<double>(storageWidthBits(static_cast<uint8_t>(bitWidth)));   // unchanged from RLECostModel
+
+        const uint32_t startsBitWidth = std::max<uint32_t>(1,
+            detail::ceil_log2_u64(numValues == 0 ? 0 : numValues - 1));
+        const double runStartsBits = cascadingForInner_.computeCost(
+            metrics, estimatedRunCount, std::min<uint32_t>(startsBitWidth, 64));
+
+        return headerBits + runStartsBits + runValuesBits;
+    }
+
+    encodings::EncodingType encodingType() const override {
+        return encodings::EncodingType::RunLengthCascadingFOREncoding;
+    }
+    MetricFlags requiredMetrics() const override {
+        return static_cast<MetricFlags>(MetricFlag::RunStats) | static_cast<MetricFlags>(MetricFlag::ResidualFrames);
+    }
+private:
+    CascadingFORCostModel cascadingForInner_{/*frameSizeCandidateIdx=*/0};
+};
+
 // ---------------------------------------------------------------------------
 // Single-encoding compression model factory
 // ---------------------------------------------------------------------------
@@ -783,6 +1797,8 @@ makeCompressionCostModel(encodings::EncodingType type) {
             return std::make_unique<AdaptiveFramedBitPrefixCostModel>();
         case encodings::EncodingType::DictionaryEncoding:
             return std::make_unique<DictionaryCostModel>();
+        case encodings::EncodingType::AdaptiveDictionaryEncoding:
+            return std::make_unique<AdaptiveDictionaryCostModel>();
         case encodings::EncodingType::HuffmanEncoding:
             return std::make_unique<HuffmanCostModel>();
         case encodings::EncodingType::LZ4:
@@ -791,6 +1807,40 @@ makeCompressionCostModel(encodings::EncodingType type) {
             return std::make_unique<FSECostModel>();
         case encodings::EncodingType::FrequencyPartitionEncoding:
             return std::make_unique<FrequencyPartitionCostModel>();
+        case encodings::EncodingType::BlockFORFPEEncoding:
+            return std::make_unique<BlockFORFPECostModel>();
+        case encodings::EncodingType::BlockFrequencyPartitionFOREncoding:
+            return std::make_unique<BlockFrequencyPartitionFORCostModel>();
+        case encodings::EncodingType::RangePackFrequencyPartitionEncoding:
+            return std::make_unique<RangePackCostModel>(
+                std::make_unique<FrequencyPartitionCostModel>(),
+                encodings::EncodingType::RangePackFrequencyPartitionEncoding);
+        case encodings::EncodingType::RangePackBlockFrequencyPartitionEncoding:
+            return std::make_unique<RangePackCostModel>(
+                std::make_unique<BlockFrequencyPartitionCostModel>(),
+                encodings::EncodingType::RangePackBlockFrequencyPartitionEncoding);
+        case encodings::EncodingType::CascadingFrameOfReference:
+            return std::make_unique<CascadingFORCostModel>();
+        case encodings::EncodingType::CascadingFORBlockFrequencyPartitionEncoding:
+            return std::make_unique<CascadingFORBlockFPECostModel>();
+        case encodings::EncodingType::RunLengthCascadingFOREncoding:
+            return std::make_unique<RunLengthCascadingFORStartsCostModel>();
+        case encodings::EncodingType::CascadingFORFSEEncoding:
+            return std::make_unique<CascadingFORFSECostModel>();
+        case encodings::EncodingType::CascadingFORBlockFSEEncoding:
+            return std::make_unique<CascadingFORBlockFSECostModel>();
+        case encodings::EncodingType::CascadingFORHuffmanEncoding:
+            return std::make_unique<CascadingFORHuffmanCostModel>();
+        case encodings::EncodingType::CascadingFORPrevFSEEncoding:
+            return std::make_unique<CascadingFORPrevFSECostModel>();
+        case encodings::EncodingType::CascadingFORPrevBlockFSEEncoding:
+            return std::make_unique<CascadingFORPrevBlockFSECostModel>();
+        case encodings::EncodingType::CascadingFORPrevHuffmanEncoding:
+            return std::make_unique<CascadingFORPrevHuffmanCostModel>();
+        case encodings::EncodingType::CascadingFORPrevFrequencyPartitionEncoding:
+            return std::make_unique<CascadingFORPrevFrequencyPartitionCostModel>();
+        case encodings::EncodingType::CascadingFORPrevBlockFrequencyPartitionEncoding:
+            return std::make_unique<CascadingFORPrevBlockFrequencyPartitionCostModel>();
         default:
             return nullptr;
     }
