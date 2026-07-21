@@ -3,6 +3,7 @@
 #include <span>
 #include <vector>
 #include <cstring>
+#include <stdexcept>
 #include <zstd.h>
 #include <algorithm>
 #include "encodings/Encoder.hpp"
@@ -22,13 +23,18 @@ concept ZstdVectorType = core::Vector32Type<T>;
 
 /**
  * @brief Zstd encoder for primitive types
- * 
+ *
  * This encoder uses the Zstandard compression algorithm to compress data.
  *
- * Format: [Zstd compressed data]
- * 
+ * Format:
+ * - BlockSize == 0 (default): [Zstd compressed data] — single frame over the whole span.
+ * - BlockSize != 0: [uint64 blockCount] followed by, for each block,
+ *   [uint64 elems][uint64 compSize][compressed block bytes]. Splitting into
+ *   independently-compressed blocks lets decodeAt/decodeRange skip blocks that
+ *   don't overlap the requested index/range instead of always decompressing
+ *   the whole payload.
  */
-template <typename T>
+template <typename T, size_t BlockSize = 0>
 requires ZstdPrimitiveType<T>
 class ZstdEncoder : public Codec<T> {
 public:
@@ -38,8 +44,231 @@ public:
     EncodedData encode(std::span<const T> data) override {
         EncodedData result;
 
-        auto dataType = this->dataType();
-        size_t bytesSize = core::dataTypeSize(dataType) * data.size();
+        const size_t bytesSize = core::dataTypeSize(this->dataType()) * data.size();
+
+        std::vector<uint8_t> buffer;
+
+        if constexpr (BlockSize == 0) {
+            const size_t bound = ZSTD_compressBound(bytesSize);
+            buffer.resize(bound);
+
+            size_t csize = ZSTD_compress(
+                buffer.data(), bound, data.data(), bytesSize, level_
+            );
+
+            if (ZSTD_isError(csize)) {
+                // Handle compression error (e.g., log or throw)
+                return {};
+            }
+
+            buffer.resize(csize);
+        } else {
+            const size_t totalElems = data.size();
+            const size_t blockCount = (totalElems + BlockSize - 1) / BlockSize;
+            appendUint64(buffer, static_cast<uint64_t>(blockCount));
+
+            size_t offset = 0;
+            for (size_t b = 0; b < blockCount; ++b) {
+                const size_t elems = std::min(BlockSize, totalElems - offset);
+                const auto blockSpan = data.subspan(offset, elems);
+                std::vector<uint8_t> compressed = compressBlock(blockSpan);
+
+                appendUint64(buffer, static_cast<uint64_t>(elems));
+                appendUint64(buffer, static_cast<uint64_t>(compressed.size()));
+                buffer.insert(buffer.end(), compressed.begin(), compressed.end());
+
+                offset += elems;
+            }
+        }
+
+        result.data() = std::move(buffer);
+
+        // Set metadata
+        result.metadata().encodingName = name();
+        result.metadata().dataType = this->dataType();
+        result.metadata().elementCount = data.size();
+        result.metadata().compressedSize = result.data().size();
+        result.metadata().uncompressedSize = bytesSize;
+        result.metadata().supportsRandomAccess = (BlockSize != 0);
+
+        return result;
+    }
+
+    std::vector<T> decodeAll(const EncodedData& encoded) override {
+        if (encoded.size() == 0) {
+            return {};
+        }
+
+        const size_t expectedByteSize = encoded.metadata().uncompressedSize;
+        const size_t expectedElemCount = expectedByteSize / sizeof(T);
+
+        if constexpr (BlockSize == 0) {
+            std::vector<uint8_t> decompressed(expectedByteSize);
+            size_t dsize = ZSTD_decompress(
+                decompressed.data(), expectedByteSize,
+                encoded.data().data(), encoded.size()
+            );
+
+            if (ZSTD_isError(dsize) || dsize != expectedByteSize) {
+                return {};
+            }
+
+            // Convert bytes back to T
+            std::vector<T> result(expectedElemCount);
+            std::memcpy(result.data(), decompressed.data(), expectedByteSize);
+
+            return result;
+        } else {
+            const uint8_t* p = encoded.data().data();
+            const uint8_t* end = p + encoded.data().size();
+            if (static_cast<size_t>(end - p) < sizeof(uint64_t)) {
+                throw std::runtime_error("ZstdEncoder: corrupted block header (count)");
+            }
+            const uint64_t blockCount = readUint64(p);
+
+            std::vector<T> out;
+            out.reserve(expectedElemCount);
+
+            for (uint64_t b = 0; b < blockCount; ++b) {
+                if (static_cast<size_t>(end - p) < 2 * sizeof(uint64_t)) {
+                    throw std::runtime_error("ZstdEncoder: corrupted block header (sizes)");
+                }
+                const uint64_t elems = readUint64(p);
+                const uint64_t compSize = readUint64(p);
+                if (static_cast<size_t>(end - p) < compSize) {
+                    throw std::runtime_error("ZstdEncoder: corrupted block payload");
+                }
+                std::vector<T> block = decompressSingle(p, static_cast<size_t>(compSize), static_cast<size_t>(elems));
+                out.insert(out.end(), block.begin(), block.end());
+                p += compSize;
+            }
+
+            if (out.size() != expectedElemCount) {
+                throw std::runtime_error("ZstdEncoder: decoded element count mismatch");
+            }
+            return out;
+        }
+    }
+
+    std::optional<T> decodeAt(const EncodedData& encoded, size_t index) override {
+        const size_t bytes = encoded.metadata().uncompressedSize;
+        if (bytes == 0) return std::nullopt;
+        const size_t N = bytes / sizeof(T);
+        if (index >= N) return std::nullopt;
+
+        if constexpr (BlockSize == 0) {
+            auto all = decodeAll(encoded);
+            if (all.empty() || index >= all.size()) return std::nullopt;
+            return all[index];
+        } else {
+            const uint8_t* p = encoded.data().data();
+            const uint8_t* end = p + encoded.data().size();
+            if (static_cast<size_t>(end - p) < sizeof(uint64_t)) {
+                throw std::runtime_error("ZstdEncoder: corrupted block header (count)");
+            }
+            const uint64_t blockCount = readUint64(p);
+
+            uint64_t base = 0;
+            for (uint64_t b = 0; b < blockCount; ++b) {
+                if (static_cast<size_t>(end - p) < 2 * sizeof(uint64_t)) {
+                    throw std::runtime_error("ZstdEncoder: corrupted block header (sizes)");
+                }
+                const uint64_t elems = readUint64(p);
+                const uint64_t compSize = readUint64(p);
+                if (static_cast<size_t>(end - p) < compSize) {
+                    throw std::runtime_error("ZstdEncoder: corrupted block payload");
+                }
+                if (index < base + elems) {
+                    std::vector<T> block = decompressSingle(p, static_cast<size_t>(compSize), static_cast<size_t>(elems));
+                    return block[static_cast<size_t>(index - base)];
+                }
+                base += elems;
+                p += compSize;
+            }
+            return std::nullopt;
+        }
+    }
+
+    std::vector<T> decodeRange(const EncodedData& encoded, size_t start, size_t end) override {
+        const size_t bytes = encoded.metadata().uncompressedSize;
+        if (bytes == 0) return {};
+        const size_t N = bytes / sizeof(T);
+        if (start >= N) return {};
+        end = std::min(end, N);
+
+        if constexpr (BlockSize == 0) {
+            auto all = decodeAll(encoded);
+            if (all.empty() || start >= all.size()) return {};
+            size_t actualEnd = std::min(end, all.size());
+            return std::vector<T>(all.begin() + static_cast<ptrdiff_t>(start),
+                                  all.begin() + static_cast<ptrdiff_t>(actualEnd));
+        } else {
+            const uint8_t* p = encoded.data().data();
+            const uint8_t* readEnd = p + encoded.data().size();
+            if (static_cast<size_t>(readEnd - p) < sizeof(uint64_t)) {
+                throw std::runtime_error("ZstdEncoder: corrupted block header (count)");
+            }
+            const uint64_t blockCount = readUint64(p);
+
+            std::vector<T> out;
+            out.reserve(end - start);
+            uint64_t base = 0;
+            for (uint64_t b = 0; b < blockCount && base < end; ++b) {
+                if (static_cast<size_t>(readEnd - p) < 2 * sizeof(uint64_t)) {
+                    throw std::runtime_error("ZstdEncoder: corrupted block header (sizes)");
+                }
+                const uint64_t elems = readUint64(p);
+                const uint64_t compSize = readUint64(p);
+                if (static_cast<size_t>(readEnd - p) < compSize) {
+                    throw std::runtime_error("ZstdEncoder: corrupted block payload");
+                }
+
+                const uint64_t blockEnd = base + elems;
+                if (blockEnd > start && base < end) {
+                    // Overlaps requested range
+                    std::vector<T> block = decompressSingle(p, static_cast<size_t>(compSize), static_cast<size_t>(elems));
+                    const size_t localStart = static_cast<size_t>(std::max<uint64_t>(start, base) - base);
+                    const size_t localEnd = static_cast<size_t>(std::min<uint64_t>(end, blockEnd) - base);
+                    out.insert(out.end(), block.begin() + static_cast<ptrdiff_t>(localStart),
+                                          block.begin() + static_cast<ptrdiff_t>(localEnd));
+                }
+
+                base = blockEnd;
+                p += compSize;
+            }
+
+            return out;
+        }
+    }
+
+    EncodingType encodingType() const override {
+        return EncodingType::Zstd;
+    }
+
+    std::string name() const override {
+        if constexpr (BlockSize == 0) {
+            return "Zstd" + std::to_string(level_);
+        } else {
+            return "Zstd" + std::to_string(level_) + "_b" + std::to_string(BlockSize);
+        }
+    }
+
+    EncodingProperties properties() const override {
+        EncodingProperties props = EncodingProperty::Lossless;
+        if constexpr (BlockSize != 0) {
+            props.add(EncodingProperty::RandomAccess);
+        }
+        return props;
+    }
+
+    size_t estimateEncodedSize(size_t elementCount) const override {
+        return ZSTD_compressBound(elementCount * sizeof(T));
+    }
+
+private:
+
+    std::vector<uint8_t> compressBlock(std::span<const T> data) const {
+        const size_t bytesSize = core::dataTypeSize(this->dataType()) * data.size();
         const size_t bound = ZSTD_compressBound(bytesSize);
         std::vector<uint8_t> output(bound);
 
@@ -48,88 +277,48 @@ public:
         );
 
         if (ZSTD_isError(csize)) {
-            // Handle compression error (e.g., log or throw)
-            return {};
+            throw std::runtime_error("ZstdEncoder: block compress failed");
         }
 
         output.resize(csize);
-        result.data() = std::move(output);
-        
-        // Set metadata
-        result.metadata().encodingName = name();
-        result.metadata().dataType = this->dataType();
-        result.metadata().elementCount = data.size();
-        result.metadata().compressedSize = output.size();
-        result.metadata().uncompressedSize = bytesSize;
-        result.metadata().supportsRandomAccess = false;
-        
-        return result;
+        return output;
     }
 
-    std::vector<T> decodeAll(const EncodedData& encoded) override {
-        if (encoded.size() == 0) {
-            return {};
-        }
-        
-        const size_t expectedByteSize = encoded.metadata().uncompressedSize;
-        const size_t expectedElemCount = expectedByteSize / sizeof(T);
-        
+    std::vector<T> decompressSingle(const uint8_t* data, size_t size, size_t elemCount) const {
+        const size_t expectedByteSize = elemCount * sizeof(T);
         std::vector<uint8_t> decompressed(expectedByteSize);
-        size_t dsize = ZSTD_decompress(
-            decompressed.data(), expectedByteSize, 
-            encoded.data().data(), encoded.size()
-        );
-        
+        size_t dsize = ZSTD_decompress(decompressed.data(), expectedByteSize, data, size);
+
         if (ZSTD_isError(dsize) || dsize != expectedByteSize) {
-            return {};
+            throw std::runtime_error("ZstdEncoder: block decompress failed");
         }
-        
-        // Convert bytes back to T
-        std::vector<T> result(expectedElemCount);
+
+        std::vector<T> result(elemCount);
         std::memcpy(result.data(), decompressed.data(), expectedByteSize);
-        
         return result;
     }
-    
-    std::optional<T> decodeAt(const EncodedData& encoded, size_t index) override {
-        // Zstd doesn't support random access - must decompress all
-        auto all = decodeAll(encoded);
-        if (all.empty() || index >= all.size()) {
-            return std::nullopt;
-        }
-        return all[index];
+
+    static void appendUint64(std::vector<uint8_t>& buf, uint64_t v) {
+        uint8_t tmp[sizeof(uint64_t)];
+        std::memcpy(tmp, &v, sizeof(uint64_t));
+        buf.insert(buf.end(), tmp, tmp + sizeof(uint64_t));
     }
 
-    std::vector<T> decodeRange(const EncodedData& encoded, size_t start, size_t end) override {
-        // Zstd doesn't support efficient range decoding - must decompress all
-        auto all = decodeAll(encoded);
-        if (all.empty() || start >= all.size()) {
-            return {};
-        }
-        size_t actualEnd = std::min(end, all.size());
-        return std::vector<T>(all.begin() + start, all.begin() + actualEnd);
+    static uint64_t readUint64(const uint8_t*& p) {
+        uint64_t v;
+        std::memcpy(&v, p, sizeof(uint64_t));
+        p += sizeof(uint64_t);
+        return v;
     }
-    
-    EncodingType encodingType() const override {
-        return EncodingType::Zstd;
-    }
-    
-    std::string name() const override {
-        return "Zstd" + std::to_string(level_);
-    }
-    
-    EncodingProperties properties() const override {
-        return EncodingProperty::Lossless;
-    }
-    
-    size_t estimateEncodedSize(size_t elementCount) const override {
-        return ZSTD_compressBound(elementCount * sizeof(T));
-    }
-    
-private:
 
     int32_t level_;
 };
+
+// Convenience factory
+template <typename T, size_t BlockSize = 0>
+std::shared_ptr<ZstdEncoder<T, BlockSize>> makeZstdEncoder(int32_t level = ZSTD_CLEVEL_DEFAULT) {
+    return std::make_shared<ZstdEncoder<T, BlockSize>>(level);
+}
 
 /**
  * @brief ZstdEncoder for Vector32Type (e.g., std::vector<float>)
