@@ -9,6 +9,7 @@
 #include "EncodedData.hpp"
 #include "EncodingProperty.hpp"
 #include "EncodingType.hpp"
+#include "RowRange.hpp"
 
 namespace encodings {
 
@@ -172,6 +173,39 @@ public:
     }
 
     /**
+     * @brief Decode a gather-style ordered list of row ranges ("selective read").
+     *
+     * Models a TableScan-style selective read: an ascending, non-overlapping
+     * list of surviving contiguous row ranges, with gaps between them that
+     * are skipped rather than materialized. Writes all selected values
+     * contiguously into dst, in range order.
+     *
+     * @param encoded  The encoded data
+     * @param ranges   Ascending, non-overlapping row ranges to decode
+     * @param dst      Pre-allocated output buffer of at least n elements
+     * @param n        Expected total element count (sum of range sizes)
+     *
+     * Default: falls back to one decodeRangeInto() call per range, which is
+     * exactly today's benchmarkRangeAccess behaviour applied range-by-range —
+     * every existing codec supports this immediately with zero changes.
+     * Override in stateful/sequential codecs to implement a genuine
+     * skip-then-materialize fast path.
+     */
+    virtual void decodeGatherInto(const EncodedBuffer<TOut>& encoded,
+                                   const RowRangeList& ranges,
+                                   TIn* dst, size_t n) {
+        size_t off = 0;
+        for (const auto& r : ranges) {
+            const size_t count = r.size();
+            if (count == 0) continue;
+            decodeRangeInto(encoded, r.begin, r.end, dst + off, count);
+            off += count;
+        }
+        if (off != n) [[unlikely]]
+            throw std::runtime_error("Decoder::decodeGatherInto: decoded size mismatch");
+    }
+
+    /**
      * @brief Get the encoding type of this decoding scheme (should match encoder)
      */
     virtual EncodingType encodingType() const = 0;
@@ -273,6 +307,23 @@ public:
 
     /// Zero the reordering-layer accumulators before each benchmark loop.
     virtual void    resetReorderingProfilingAccum()   {}
+
+    // Gather (selective row-range) profiling — overridden by codecs that
+    // implement a genuine skip-then-materialize fast path in decodeGatherInto().
+    // Default: -1 = "not measured / codec has no distinct skip phase" (e.g. it
+    // falls back to independent decodeRangeInto calls with no skip concept).
+
+    /// Nanoseconds spent skipping (advancing past gap rows without materializing)
+    /// during the most recent decodeGatherInto() call, accumulated over all gaps.
+    virtual int64_t gatherSkipTimeNs() const { return -1; }
+
+    /// Nanoseconds spent materializing the surviving contiguous runs during the
+    /// most recent decodeGatherInto() call.
+    virtual int64_t gatherMaterializeTimeNs() const { return -1; }
+
+    /// Zero the gather-phase accumulators — call before each selective-access
+    /// benchmark loop.
+    virtual void resetGatherProfilingAccum() {}
 
     // Single encodingType() implementation for both interfaces
     EncodingType encodingType() const override = 0;

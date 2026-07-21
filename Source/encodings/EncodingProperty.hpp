@@ -20,7 +20,10 @@ enum class EncodingProperty : uint32_t {
     // Access patterns
     RandomAccess       = 1 << 0,  // Supports O(1) random access to elements
     SequentialOnly     = 1 << 1,  // Requires sequential decoding
-    FastSkip           = 1 << 2,  // Can skip elements efficiently without full decode
+    FastSkip           = 1 << 2,  // Codec provides a genuine Codec::decodeGatherInto()
+                                   // override that skips gap rows more cheaply than the
+                                   // default per-range decodeRangeInto() fallback loop
+                                   // (see Codec::gatherSkipTimeNs()/gatherMaterializeTimeNs()).
     
     // Data preservation
     Lossless           = 1 << 3,  // Preserves exact data

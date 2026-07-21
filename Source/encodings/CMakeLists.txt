@@ -9,6 +9,7 @@ target_sources(encodings_encodings INTERFACE
         EncodedData.hpp
         EncodingProperty.hpp
         EncodingType.hpp
+        RowRange.hpp
         Encoder.hpp
         ComposedEncoder.hpp
 )
