@@ -242,6 +242,60 @@ public:
     }
 
     // =========================================================================
+    //  decodeGatherInto — single forward pass over the whole RowRangeList
+    // =========================================================================
+    //
+    //  Same rationale as VarIntEncoder: the default fallback restarts the
+    //  delta-accumulation scan from the anchor for every range. A single
+    //  forward pass carries the running accumulator (`current`), the byte
+    //  cursor, and the logical-index cursor as locals across the whole list.
+
+    void decodeGatherInto(const EncodedData& encoded,
+                         const RowRangeList& ranges,
+                         T* dst, size_t n) override {
+        if (ranges.empty()) {
+            if (n != 0) throw std::runtime_error("DeltaVarIntEncoder::decodeGatherInto: decoded size mismatch");
+            return;
+        }
+        const auto [numElements, anchor, streamPtr] = readHeader(encoded);
+        if (!streamPtr) {
+            if (n != 0) throw std::runtime_error("DeltaVarIntEncoder::decodeGatherInto: empty stream, n!=0");
+            return;
+        }
+
+        const uint8_t* p = streamPtr;
+        T current = anchor;
+        size_t lastIdx = 0;   // next element index not yet produced/skipped (0 == anchor position)
+        size_t off = 0;
+
+        for (const auto& r : ranges) {
+            const size_t count = r.size();
+            if (count == 0) continue;
+            const size_t begin = r.begin;
+            const size_t end   = std::min(r.end, static_cast<size_t>(numElements));
+            if (begin >= end) continue;
+
+            // Skip forward to `begin`, accumulating (discarding) deltas. Index 0
+            // is the anchor (no delta consumed); indices >= 1 each consume one.
+            while (lastIdx < begin) {
+                if (lastIdx > 0) current += decodeDelta(p);
+                ++lastIdx;
+            }
+            // Emit [begin, end).
+            while (lastIdx < end) {
+                if (lastIdx == 0) {
+                    dst[off++] = anchor;
+                } else {
+                    current += decodeDelta(p);
+                    dst[off++] = current;
+                }
+                ++lastIdx;
+            }
+        }
+        if (off != n) throw std::runtime_error("DeltaVarIntEncoder::decodeGatherInto: decoded size mismatch");
+    }
+
+    // =========================================================================
     //  Metadata
     // =========================================================================
 
@@ -264,7 +318,8 @@ public:
             | EncodingProperty::ImmutableOnly
             | EncodingProperty::Composable
             | EncodingProperty::RandomAccess
-             /* We support random access via skip-scan, but it's O(n) — consider removing this if we want to be strict about it. */;
+             /* We support random access via skip-scan, but it's O(n) — consider removing this if we want to be strict about it. */
+            | EncodingProperty::FastSkip;
     }
 
     size_t estimateEncodedSize(size_t elementCount) const override {
