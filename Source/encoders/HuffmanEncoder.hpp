@@ -482,13 +482,18 @@ public:
     std::string name() const override { return "Huffman"; }
 
     EncodingProperties properties() const override {
+        // RandomAccess deliberately NOT claimed here (previously claimed
+        // despite decodeAt/decodeRange calling decodeAll() fresh on every
+        // invocation, with no caching -- see FSEEncoder::properties() for the
+        // identical issue and why it matters for correctness once this
+        // encoder is composed as another codec's leaf, e.g.
+        // CascadingFOREncoder's decodeLeafAt trusts this flag to decide
+        // whether it's safe to skip its own caching).
         return EncodingProperties(EncodingProperty::Lossless)
              | EncodingProperty::PreservesOrder
-            //  | EncodingProperty::SequentialOnly
              | EncodingProperty::RequiresFullData
              | EncodingProperty::EntropyCoding
-             | EncodingProperty::VariableSize
-             | EncodingProperty::RandomAccess; // Note: RandomAccess is technically false since we don't support decodeAt/decodeRange efficiently, but it signals that the encoding can represent any sequence without restrictions, and that the entire data is needed to decode any part of it.
+             | EncodingProperty::VariableSize;
     }
 };
 
