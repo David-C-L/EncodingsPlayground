@@ -60,15 +60,169 @@ public:
     // numElements(8) + tableLog(1) + numSymbols(4) + initialState(4) = 17 bytes.
     static constexpr size_t kHeaderFixed = 8 + 1 + 4 + 4;
 
-private:
     // -------------------------------------------------------------------------
     // Decode table entry: one entry per state slot in [0, L).
+    // Public so BlockFSEEncoder can cache and reuse the built decode table.
     // -------------------------------------------------------------------------
     struct DecodeEntry {
         T        symbol;
         uint8_t  nbBits;   // number of bits to read from the stream
         uint32_t newState; // base for the next state: final = newState + readBits(nbBits)
     };
+
+    // -------------------------------------------------------------------------
+    // Decode-table cache for BlockFSEEncoder (and any other block-oriented
+    // caller that repeatedly decodes blocks with the same symbol distribution).
+    //
+    // Keyed by (tableLog, numSymbols, 64-bit FNV hash of raw symbol-table bytes).
+    // A LRU-1 cache: if the next block's symbol table matches, buildSpread and
+    // buildDecodeTable are skipped entirely.
+    // -------------------------------------------------------------------------
+    struct BlockDecodeContext {
+        uint64_t symTableHash{0};
+        uint32_t numSymbols{0};
+        int      tableLog{0};
+        std::vector<DecodeEntry> dt; // L = 2^tableLog entries; empty means uncached
+    };
+
+    // -------------------------------------------------------------------------
+    // Decode a single self-contained FSE block from raw bytes into dst[0..maxDst).
+    //
+    // Parses the FSE wire format in-place (no copy of the block bytes).
+    // If ctx is non-null and the block's symbol table matches ctx (same hash,
+    // tableLog, numSymbols), the cached decode table is reused and
+    // buildSpread/buildDecodeTable are skipped entirely.
+    // On a cache miss, ctx->dt is rebuilt and ctx is updated.
+    //
+    // Writes exactly min(numElements_from_header, maxDst) elements to dst.
+    // Returns the number of elements written.
+    // -------------------------------------------------------------------------
+    size_t decodeBlockInto(const uint8_t* data, size_t size,
+                           T* dst, size_t maxDst,
+                           BlockDecodeContext* ctx) const
+    {
+        if (size < kHeaderFixed) return 0;
+        const uint8_t* p = data;
+
+        uint64_t numElements;
+        uint8_t  tableLog8;
+        uint32_t numSymbols32;
+        uint32_t initState;
+        std::memcpy(&numElements,  p, 8); p += 8;
+        tableLog8 = *p++;
+        std::memcpy(&numSymbols32, p, 4); p += 4;
+        std::memcpy(&initState,    p, 4); p += 4;
+
+        if (numElements == 0) return 0;
+        const int    tableLog   = static_cast<int>(tableLog8);
+        if (tableLog < kMinTableLog || tableLog > kMaxTableLog)
+            throw std::runtime_error("FSEEncoder::decodeBlockInto: invalid tableLog");
+        const size_t numSymbols = static_cast<size_t>(numSymbols32);
+        if (numSymbols == 0)
+            throw std::runtime_error("FSEEncoder::decodeBlockInto: empty symbol table");
+        const uint32_t L = 1u << tableLog;
+        if (initState < L || initState >= (2u * L))
+            throw std::runtime_error("FSEEncoder::decodeBlockInto: invalid initial state");
+
+        const size_t symTableBytes = numSymbols * (sizeof(T) + 2);
+        if (kHeaderFixed + symTableBytes > size)
+            throw std::runtime_error("FSEEncoder::decodeBlockInto: symbol table exceeds buffer");
+
+        // Determine whether the cached decode table is still valid.
+        const bool useCachedDt = [&]() -> bool {
+            if (!ctx || ctx->dt.empty()) return false;
+            if (ctx->tableLog != tableLog || ctx->numSymbols != numSymbols) return false;
+            const uint64_t h = fnv64(p, symTableBytes);
+            if (ctx->symTableHash != h) return false;
+            return true;
+        }();
+
+        // Parse symbol table and (re)build decode table on cache miss.
+        const std::vector<DecodeEntry>* dtPtr = nullptr;
+        if (useCachedDt) {
+            dtPtr = &ctx->dt;
+            p += symTableBytes; // advance past symbol table
+        } else {
+            std::vector<std::pair<T, uint32_t>> norm;
+            norm.reserve(numSymbols);
+            uint32_t normSum = 0;
+            const uint8_t* symStart = p;
+            for (size_t i = 0; i < numSymbols; ++i) {
+                T        sym;
+                uint16_t nf16;
+                std::memcpy(&sym,  p, sizeof(T)); p += sizeof(T);
+                std::memcpy(&nf16, p, 2);         p += 2;
+                if (nf16 == 0)
+                    throw std::runtime_error("FSEEncoder::decodeBlockInto: normFreq == 0");
+                norm.push_back({sym, static_cast<uint32_t>(nf16)});
+                normSum += static_cast<uint32_t>(nf16);
+            }
+            if (normSum != L)
+                throw std::runtime_error("FSEEncoder::decodeBlockInto: normFreq sum != L");
+
+            const auto spread = buildSpread(norm, tableLog);
+            auto       newDt  = buildDecodeTable(spread, norm, tableLog);
+
+            if (ctx) {
+                ctx->symTableHash = fnv64(symStart, symTableBytes);
+                ctx->numSymbols   = static_cast<uint32_t>(numSymbols);
+                ctx->tableLog     = tableLog;
+                ctx->dt           = std::move(newDt);
+            } else {
+                // No cache — store locally and use a pointer to it.
+                // Avoid a second allocation by temporarily storing in a local var.
+                // We'll handle this via the non-cached code path below.
+                ctx = nullptr; // handled after the branch
+                // Re-assign: we need to keep newDt alive through runDecodeLoop.
+                // Use a static thread_local would be UB; use a scope-local instead.
+                const uint8_t* payloadStart2 = p;
+                const uint8_t* payloadEnd2   = data + size;
+                const size_t   toWrite       = static_cast<size_t>(std::min<uint64_t>(numElements, maxDst));
+                runDecodeLoop(newDt, L, initState, payloadStart2, payloadEnd2, toWrite, dst);
+                return toWrite;
+            }
+            dtPtr = &ctx->dt;
+        }
+
+        const uint8_t* payloadStart = p;
+        const uint8_t* payloadEnd   = data + size;
+        const size_t   toWrite      = static_cast<size_t>(std::min<uint64_t>(numElements, maxDst));
+        runDecodeLoop(*dtPtr, L, initState, payloadStart, payloadEnd, toWrite, dst);
+        return toWrite;
+    }
+
+private:
+    // -------------------------------------------------------------------------
+    // FNV-64 hash of raw bytes — used to key the BlockDecodeContext cache.
+    // -------------------------------------------------------------------------
+    static uint64_t fnv64(const uint8_t* data, size_t size) noexcept {
+        uint64_t h = 14695981039346656037ULL;
+        for (size_t i = 0; i < size; ++i)
+            h = (h ^ static_cast<uint64_t>(data[i])) * 1099511628211ULL;
+        return h;
+    }
+
+    // -------------------------------------------------------------------------
+    // ANS decode inner loop — writes numElements symbols into dst[0..n).
+    // Extracted so both decodeAll and decodeBlockInto share the same kernel.
+    // -------------------------------------------------------------------------
+    static void runDecodeLoop(
+        const std::vector<DecodeEntry>& dt,
+        uint32_t L, uint32_t initState,
+        const uint8_t* payloadStart, const uint8_t* payloadEnd,
+        size_t numElements,
+        T* dst)
+    {
+        LSBBitReader br{payloadStart, payloadEnd};
+        uint32_t state = initState;
+        for (size_t i = 0; i < numElements; ++i) {
+            if (state < L || state >= (2u * L)) [[unlikely]]
+                throw std::runtime_error("FSEEncoder: state out of bounds during decode");
+            const DecodeEntry& e = dt[state - L];
+            dst[i] = e.symbol;
+            state  = e.newState + br.read(static_cast<int>(e.nbBits));
+        }
+    }
 
     // -------------------------------------------------------------------------
     // Per-symbol encoding info (precomputed before encoding).
@@ -340,12 +494,17 @@ public:
     std::string name() const override { return "FSE"; }
 
     EncodingProperties properties() const override {
+        // RandomAccess deliberately NOT claimed: decodeAt/decodeRange (below)
+        // call decodeAll() fresh on every invocation, with no caching -- any
+        // code that branches on this flag to decide whether it's safe to skip
+        // its own caching (e.g. FOREncoder::decodeAt, CascadingFOREncoder's
+        // decodeLeafAt, RangePackSectionCodec, RunLengthEncoder's ComposedView)
+        // would otherwise be silently misled into O(N)-per-query behaviour.
         return EncodingProperties(EncodingProperty::Lossless)
              | EncodingProperty::PreservesOrder
              | EncodingProperty::RequiresFullData
              | EncodingProperty::EntropyCoding
-             | EncodingProperty::VariableSize
-             | EncodingProperty::RandomAccess; // For Benchmarking purposes only
+             | EncodingProperty::VariableSize;
     }
 
     // -------------------------------------------------------------------------
@@ -499,22 +658,10 @@ public:
         // --- Decode ---
         const uint8_t* payloadStart = p;
         const uint8_t* payloadEnd   = encoded.data().data() + total;
-        LSBBitReader br{payloadStart, payloadEnd};
 
-        std::vector<T> result;
-        result.reserve(static_cast<size_t>(numElements));
-
-        uint32_t state = initState;
-        for (uint64_t i = 0; i < numElements; ++i) {
-            if (state < L || state >= (2u * L)) {
-                throw std::runtime_error("FSEEncoder::decodeAll: state out of bounds");
-            }
-            const DecodeEntry& e = dt[state - L];
-            result.push_back(e.symbol);
-            const uint32_t bits = br.read(static_cast<int>(e.nbBits));
-            state = e.newState + bits;
-        }
-
+        std::vector<T> result(static_cast<size_t>(numElements));
+        runDecodeLoop(dt, L, initState, payloadStart, payloadEnd,
+                      static_cast<size_t>(numElements), result.data());
         return result;
     }
 
