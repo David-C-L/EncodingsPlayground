@@ -1,2 +1,4 @@
 matplotlib>=3.5.0
 numpy>=1.20.0
+networkx>=2.8.0
+mplcursors>=0.5.2
