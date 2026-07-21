@@ -113,11 +113,13 @@ target_sources(encodings_encoders INTERFACE
         VarIntEncoder.hpp
         DeltaVarIntEncoder.hpp
         FOREncoder.hpp
+        CascadingFOREncoder.hpp
         OpenZLEncoder.hpp
         LZ4Encoder.hpp
         FSEEncoder.hpp
         BWTSectionEncoder.hpp
         selectors/SubStreamReordererType.hpp
+        analysis/CascadeCardinalityAnalyzer.hpp
 )
 
 target_include_directories(encodings_encoders INTERFACE
