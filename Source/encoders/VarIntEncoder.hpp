@@ -299,6 +299,44 @@ public:
     }
 
     // =========================================================================
+    //  decodeGatherInto — single forward pass over the whole RowRangeList
+    // =========================================================================
+    //
+    //  The default fallback (independent decodeRangeInto() per range) restarts
+    //  the skip-scan from byte 0 for every range. Since ranges arrive here as
+    //  one ascending, non-overlapping list, a single forward pass (local byte
+    //  cursor + local logical-index cursor) visits each byte at most once.
+
+    void decodeGatherInto(const EncodedData& encoded,
+                         const RowRangeList& ranges,
+                         T* dst, size_t n) override {
+        if (ranges.empty()) {
+            if (n != 0) throw std::runtime_error("VarIntEncoder::decodeGatherInto: decoded size mismatch");
+            return;
+        }
+        const auto [numElements, streamPtr] = readHeader(encoded);
+        if (!streamPtr) {
+            if (n != 0) throw std::runtime_error("VarIntEncoder::decodeGatherInto: empty stream, n!=0");
+            return;
+        }
+
+        const uint8_t* p = streamPtr;
+        size_t lastIdx = 0;
+        size_t off = 0;
+        for (const auto& r : ranges) {
+            const size_t count = r.size();
+            if (count == 0) continue;
+            const size_t begin = r.begin;
+            const size_t end   = std::min(r.end, static_cast<size_t>(numElements));
+            if (begin >= end) continue;
+
+            while (lastIdx < begin) { skipOne(p); ++lastIdx; }
+            while (lastIdx < end)   { dst[off++] = decodeOne(p); ++lastIdx; }
+        }
+        if (off != n) throw std::runtime_error("VarIntEncoder::decodeGatherInto: decoded size mismatch");
+    }
+
+    // =========================================================================
     //  Metadata
     // =========================================================================
 
@@ -323,7 +361,8 @@ public:
             | EncodingProperty::ImmutableOnly
             | EncodingProperty::Composable
             | EncodingProperty::RandomAccess
-             /* We support random access via skip-scan, but it's O(n) — consider removing this if we want to be strict about it. */;
+             /* We support random access via skip-scan, but it's O(n) — consider removing this if we want to be strict about it. */
+            | EncodingProperty::FastSkip;
     }
 
     /// Estimate: assumes values are small enough to fit in ceil(bits/7)/2 bytes
