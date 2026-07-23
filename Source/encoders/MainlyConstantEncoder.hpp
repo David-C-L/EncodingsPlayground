@@ -20,6 +20,7 @@
 #include "encodings/EncodingProperty.hpp"
 #include "encodings/EncodingType.hpp"
 #include "core/DataType.hpp"
+#include "exceptions/BitmapRank.hpp"
 
 namespace encodings::encoders {
 
@@ -305,10 +306,11 @@ private:
     // Unaligned 8-byte load — compiles to a single movq on x86.
     // The bitmap starts at offset 12 and otherValues at offset 20+bitmapByteCount,
     // neither of which is guaranteed to be 8-byte aligned, so we must use memcpy.
+    // Delegates to the shared BitmapRank utility (exceptions/BitmapRank.hpp) —
+    // see the popcount helpers below for why this is a thin wrapper rather
+    // than a second copy of the bit-twiddling.
     static uint64_t loadWord(const uint8_t* p) noexcept {
-        uint64_t w;
-        std::memcpy(&w, p, 8);
-        return w;
+        return encodings::exceptions::BitmapRank::loadWord(p);
     }
 
     static ParsedHeader parseHeader(const uint8_t* base) noexcept {
@@ -333,79 +335,27 @@ private:
 
     // -------------------------------------------------------------------------
     // Bitmap popcount helpers
+    //
+    // This bitmap's convention is 1 = common, so a "non-common count" is the
+    // complement of BitmapRank's literal set-bit count. The actual popcount
+    // bit-twiddling lives once in exceptions/BitmapRank.hpp (shared with the
+    // new ExceptionEncoder) — these are thin polarity-inverting wrappers so
+    // every existing call site below (decodeAt/scatterAll/scatterRange/
+    // decodeGatherInto) is unchanged.
     // -------------------------------------------------------------------------
 
     // Count non-common positions in [0, limit).
-    // 4-way independent accumulator breaks the serial RAW dependency on `count`.
     static uint32_t prefixNonCommonCount(const uint8_t* bitmapStart,
                                          size_t limit) noexcept {
-        if (limit == 0) return 0;
-        const uint32_t fullWords = static_cast<uint32_t>(limit / 64);
-        uint32_t w = 0, c0 = 0, c1 = 0, c2 = 0, c3 = 0;
-        for (; w + 4 <= fullWords; w += 4) {
-            c0 += static_cast<uint32_t>(
-                __builtin_popcountll(~loadWord(bitmapStart + (w+0) * 8)));
-            c1 += static_cast<uint32_t>(
-                __builtin_popcountll(~loadWord(bitmapStart + (w+1) * 8)));
-            c2 += static_cast<uint32_t>(
-                __builtin_popcountll(~loadWord(bitmapStart + (w+2) * 8)));
-            c3 += static_cast<uint32_t>(
-                __builtin_popcountll(~loadWord(bitmapStart + (w+3) * 8)));
-        }
-        uint32_t count = c0 + c1 + c2 + c3;
-        for (; w < fullWords; ++w)
-            count += static_cast<uint32_t>(
-                __builtin_popcountll(~loadWord(bitmapStart + w * 8)));
-        const uint32_t rem = static_cast<uint32_t>(limit % 64);
-        if (rem > 0) {
-            const uint64_t mask = (uint64_t{1} << rem) - 1;
-            count += static_cast<uint32_t>(
-                __builtin_popcountll(~loadWord(bitmapStart + fullWords * 8) & mask));
-        }
-        return count;
+        return static_cast<uint32_t>(limit) - encodings::exceptions::BitmapRank::prefixSetCount(bitmapStart, limit);
     }
 
     // Count non-common positions in [limitA, limitB).
-    // Starts at word limitA/64, skipping the prefix already counted by prefixNonCommonCount.
     static uint32_t rangeNonCommonCount(const uint8_t* bitmapStart,
                                         size_t limitA, size_t limitB) noexcept {
         if (limitA >= limitB) return 0;
-        const uint32_t wA = limitA / 64, remA = limitA % 64;
-        const uint32_t wB = limitB / 64, remB = limitB % 64;
-        uint32_t count = 0;
-        if (wA == wB) {
-            uint64_t word = ~loadWord(bitmapStart + wA * 8);
-            if (remA) word &= ~((uint64_t{1} << remA) - 1);
-            if (remB) word &=  (uint64_t{1} << remB) - 1;
-            return static_cast<uint32_t>(__builtin_popcountll(word));
-        }
-        {
-            uint64_t word = ~loadWord(bitmapStart + wA * 8);
-            if (remA) word &= ~((uint64_t{1} << remA) - 1);
-            count += static_cast<uint32_t>(__builtin_popcountll(word));
-        }
-        uint32_t w = wA + 1;
-        uint32_t c0 = 0, c1 = 0, c2 = 0, c3 = 0;
-        for (; w + 4 <= wB; w += 4) {
-            c0 += static_cast<uint32_t>(
-                __builtin_popcountll(~loadWord(bitmapStart + (w+0) * 8)));
-            c1 += static_cast<uint32_t>(
-                __builtin_popcountll(~loadWord(bitmapStart + (w+1) * 8)));
-            c2 += static_cast<uint32_t>(
-                __builtin_popcountll(~loadWord(bitmapStart + (w+2) * 8)));
-            c3 += static_cast<uint32_t>(
-                __builtin_popcountll(~loadWord(bitmapStart + (w+3) * 8)));
-        }
-        count += c0 + c1 + c2 + c3;
-        for (; w < wB; ++w)
-            count += static_cast<uint32_t>(
-                __builtin_popcountll(~loadWord(bitmapStart + w * 8)));
-        if (remB) {
-            const uint64_t mask = (uint64_t{1} << remB) - 1;
-            count += static_cast<uint32_t>(
-                __builtin_popcountll(~loadWord(bitmapStart + wB * 8) & mask));
-        }
-        return count;
+        return static_cast<uint32_t>(limitB - limitA)
+             - encodings::exceptions::BitmapRank::rangeSetCount(bitmapStart, limitA, limitB);
     }
 
     // -------------------------------------------------------------------------

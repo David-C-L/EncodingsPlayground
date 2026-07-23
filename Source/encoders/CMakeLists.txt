@@ -127,9 +127,10 @@ target_include_directories(encodings_encoders INTERFACE
     $<INSTALL_INTERFACE:include>
 )
 
-target_link_libraries(encodings_encoders INTERFACE 
+target_link_libraries(encodings_encoders INTERFACE
     encodings_core
     encodings_encodings
+    encodings_exceptions
     ZSTD::libzstd
     LZ4::lz4
     OpenZL::openzl

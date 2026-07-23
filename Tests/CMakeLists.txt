@@ -19,6 +19,7 @@ add_test(NAME test_range_pack_encoder COMMAND test_range_pack_encoder)
 add_test(NAME test_delta_prepass_encoder COMMAND test_delta_prepass_encoder)
 add_test(NAME test_cascading_for_encoder COMMAND test_cascading_for_encoder)
 add_test(NAME test_run_length_encoder COMMAND test_run_length_encoder)
+add_test(NAME test_exception_encoder COMMAND test_exception_encoder)
 add_test(NAME test_prev_reference_policy COMMAND test_prev_reference_policy)
 
 # Simple test for DeltaRunLengthEncoder
@@ -134,6 +135,12 @@ add_executable(test_run_length_encoder test_run_length_encoder.cpp)
 target_include_directories(test_run_length_encoder PRIVATE ${CMAKE_SOURCE_DIR}/Source)
 target_link_libraries(test_run_length_encoder PRIVATE encodings_core encodings_encodings encodings_encoders)
 set_target_properties(test_run_length_encoder PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+# Test for ExceptionEncoder (Phase 1: FORExceptionDetector + RawBitPackedEncoder)
+add_executable(test_exception_encoder test_exception_encoder.cpp)
+target_include_directories(test_exception_encoder PRIVATE ${CMAKE_SOURCE_DIR}/Source)
+target_link_libraries(test_exception_encoder PRIVATE encodings_core encodings_encodings encodings_encoders encodings_exceptions encodings_benchmark)
+set_target_properties(test_exception_encoder PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
 add_executable(test_block_frequency_partition_encoder test_block_frequency_partition_encoder.cpp)
 target_include_directories(test_block_frequency_partition_encoder PRIVATE ${CMAKE_SOURCE_DIR}/Source)

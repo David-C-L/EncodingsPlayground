@@ -53,7 +53,8 @@ namespace encodings {
         CascadingFORPrevFSEEncoding,                   // CascadingFOR with FORReferencePolicy::PREV residual schedule + FSEEncoder leaf (NOT random-access safe)
         CascadingFORPrevBlockFSEEncoding,               // CascadingFOR with FORReferencePolicy::PREV residual schedule + BlockFSEEncoder leaf (random-access safe)
         CascadingFORPrevFrequencyPartitionEncoding,      // CascadingFOR with FORReferencePolicy::PREV residual schedule + FrequencyPartitionEncoder leaf
-        CascadingFORPrevBlockFrequencyPartitionEncoding  // CascadingFOR with FORReferencePolicy::PREV residual schedule + BlockFrequencyPartitionEncoder leaf
+        CascadingFORPrevBlockFrequencyPartitionEncoding, // CascadingFOR with FORReferencePolicy::PREV residual schedule + BlockFrequencyPartitionEncoder leaf
+        ExceptionWrappedEncoding                         // Patched/exception pre-pass wrapping any inner codec; non-conforming values pulled into a side stream
     };
 
     /** Convert EncodingType enum to human-readable string */
@@ -101,6 +102,7 @@ namespace encodings {
             case EncodingType::CascadingFORPrevBlockFSEEncoding: return "CascadingFORPrevBlockFSEEncoding";
             case EncodingType::CascadingFORPrevFrequencyPartitionEncoding: return "CascadingFORPrevFrequencyPartitionEncoding";
             case EncodingType::CascadingFORPrevBlockFrequencyPartitionEncoding: return "CascadingFORPrevBlockFrequencyPartitionEncoding";
+            case EncodingType::ExceptionWrappedEncoding:      return "ExceptionWrappedEncoding";
         }
         return "Unknown";
     }
