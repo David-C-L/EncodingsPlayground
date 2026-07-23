@@ -6,12 +6,27 @@
 // doc calls out as relevant to which BitmapRank representation wins
 // (Dense here; Phase 2 adds RLE).
 //
+// This is an ablation, not just a two-way comparison: RawBitPackedEncoder
+// alone is a weak "no exceptions" baseline (one global reference + one
+// global bit width for the whole array), so it can't tell us how much of
+// the win is specifically attributable to exception handling versus
+// something this codebase's more sophisticated non-exception encoders
+// already provide. AdaptiveFOREncoder (per-frame *reference*) and
+// AdaptiveFramedBitPrefixEncoder (per-frame prefix framing) are the
+// existing "framed" alternatives that partially localize an outlier's
+// damage without any exception mechanism -- both are included, unwrapped,
+// as additional arms so the benefit of exception-wrapping can be read off
+// against the best already-available non-exception options, not just the
+// naive one.
+//
 // Deliberately self-contained rather than built on BenchmarkRunner/
 // BenchmarkConfig: this needs its own outlier-fraction-parameterized
 // dataset generation loop, not another row in the general encoder/dataset
 // matrix -- exactly the same reasoning that keeps reordering_benchmarks.cpp
 // a separate file from run_benchmarks.cpp.
 
+#include "encoders/AdaptiveFOREncoder.hpp"
+#include "encoders/AdaptiveFramedBitPrefixEncoder.hpp"
 #include "encoders/RawBitPackedEncoder.hpp"
 #include "exceptions/ExceptionEncoder.hpp"
 #include "exceptions/FORExceptionDetector.hpp"
@@ -91,32 +106,19 @@ struct Result {
     bool roundTripOk{};
 };
 
-Result benchmarkRawBitPacked(const std::string& label, const std::vector<int64_t>& data) {
-    RawBitPackedEncoder<int64_t> encoder;
+// Generic benchmark over any Codec<int64_t,uint8_t> -- every arm below
+// (plain and exception-wrapped alike) shares this one measurement path so
+// the comparison is apples-to-apples on timing methodology.
+Result benchmarkCodec(const std::string& datasetLabel, const std::string& encoderLabel,
+                       encodings::Codec<int64_t, uint8_t>& codec,
+                       const std::vector<int64_t>& data) {
     Result r;
-    r.datasetLabel = label;
-    r.encoderLabel = "RawBitPacked (plain)";
+    r.datasetLabel = datasetLabel;
+    r.encoderLabel = encoderLabel;
     encodings::EncodedBuffer<uint8_t> encoded;
-    r.encodeNs = timedNs([&] { encoded = encoder.encode(std::span<const int64_t>(data)); });
+    r.encodeNs = timedNs([&] { encoded = codec.encode(std::span<const int64_t>(data)); });
     std::vector<int64_t> decoded;
-    r.decodeNs = timedNs([&] { decoded = encoder.decodeAll(encoded); });
-    r.compressedBytes = encoded.metadata().compressedSize;
-    r.uncompressedBytes = encoded.metadata().uncompressedSize;
-    r.roundTripOk = (decoded == data);
-    return r;
-}
-
-Result benchmarkExceptionWrapped(const std::string& label, const std::vector<int64_t>& data) {
-    auto encoder = std::make_shared<ExceptionEncoder<int64_t>>(
-        std::make_shared<FORExceptionDetector<int64_t>>(),
-        std::make_shared<RawBitPackedEncoder<int64_t>>());
-    Result r;
-    r.datasetLabel = label;
-    r.encoderLabel = "ExceptionWrapped(FOR|RawBitPacked)";
-    encodings::EncodedBuffer<uint8_t> encoded;
-    r.encodeNs = timedNs([&] { encoded = encoder->encode(std::span<const int64_t>(data)); });
-    std::vector<int64_t> decoded;
-    r.decodeNs = timedNs([&] { decoded = encoder->decodeAll(encoded); });
+    r.decodeNs = timedNs([&] { decoded = codec.decodeAll(encoded); });
     r.compressedBytes = encoded.metadata().compressedSize;
     r.uncompressedBytes = encoded.metadata().uncompressedSize;
     r.roundTripOk = (decoded == data);
@@ -175,11 +177,22 @@ int main() {
     unsigned seed = 1000;
     for (const auto& sc : scenarios) {
         auto data = makeOutlierData(kN, sc.outlierFraction, sc.pattern, seed++);
-        auto plain = benchmarkRawBitPacked(sc.label, data);
-        auto wrapped = benchmarkExceptionWrapped(sc.label, data);
-        anyRoundTripFailed |= !plain.roundTripOk || !wrapped.roundTripOk;
-        results.push_back(plain);
-        results.push_back(wrapped);
+
+        RawBitPackedEncoder<int64_t> rawBitPacked;
+        ExceptionEncoder<int64_t> exceptionWrapped(
+            std::make_shared<FORExceptionDetector<int64_t>>(),
+            std::make_shared<RawBitPackedEncoder<int64_t>>());
+        encodings::encoders::AdaptiveFOREncoder<int64_t> adaptiveFor;
+        encodings::encoders::AdaptiveFramedBitPrefixEncoder<int64_t> adaptiveFramedBitPrefix;
+
+        std::vector<Result> arms = {
+            benchmarkCodec(sc.label, "RawBitPacked (plain)", rawBitPacked, data),
+            benchmarkCodec(sc.label, "ExceptionWrapped(FOR|RawBitPacked)", exceptionWrapped, data),
+            benchmarkCodec(sc.label, "AdaptiveFOR (plain)", adaptiveFor, data),
+            benchmarkCodec(sc.label, "AdaptiveFramedBitPrefix (plain)", adaptiveFramedBitPrefix, data),
+        };
+        for (const auto& a : arms) anyRoundTripFailed |= !a.roundTripOk;
+        results.insert(results.end(), arms.begin(), arms.end());
     }
 
     printResults(results);
