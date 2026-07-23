@@ -106,6 +106,17 @@ struct Result {
     bool roundTripOk{};
 };
 
+// Throughput in MB/s against the UNCOMPRESSED size (matches this codebase's
+// TimingMetrics::encodeThroughputMBps/decodeBulkThroughputMBps convention in
+// Source/benchmark/BenchmarkMetrics.hpp) -- i.e. "how fast can this encoder
+// get through a megabyte of *input* data", the number that's comparable
+// across encoders regardless of how well each one happens to compress.
+double throughputMBps(size_t uncompressedBytes, int64_t ns) {
+    if (ns <= 0) return 0.0;
+    constexpr double kBytesPerMB = 1024.0 * 1024.0;
+    return static_cast<double>(uncompressedBytes) / kBytesPerMB / (static_cast<double>(ns) / 1e9);
+}
+
 // Generic benchmark over any Codec<int64_t,uint8_t> -- every arm below
 // (plain and exception-wrapped alike) shares this one measurement path so
 // the comparison is apples-to-apples on timing methodology.
@@ -133,9 +144,11 @@ void printResults(const std::vector<Result>& results) {
               << std::setw(10) << "Ratio"
               << std::setw(14) << "Encode(us)"
               << std::setw(14) << "Decode(us)"
+              << std::setw(12) << "Enc MB/s"
+              << std::setw(12) << "Dec MB/s"
               << std::setw(8) << "OK"
               << '\n'
-              << std::string(124, '-') << '\n';
+              << std::string(148, '-') << '\n';
     for (const auto& r : results) {
         const double ratio = r.uncompressedBytes > 0
             ? static_cast<double>(r.compressedBytes) / static_cast<double>(r.uncompressedBytes)
@@ -147,6 +160,10 @@ void printResults(const std::vector<Result>& results) {
                   << std::setw(10) << std::fixed << std::setprecision(4) << ratio
                   << std::setw(14) << (r.encodeNs / 1000)
                   << std::setw(14) << (r.decodeNs / 1000)
+                  << std::setw(12) << std::fixed << std::setprecision(1)
+                  << throughputMBps(r.uncompressedBytes, r.encodeNs)
+                  << std::setw(12) << std::fixed << std::setprecision(1)
+                  << throughputMBps(r.uncompressedBytes, r.decodeNs)
                   << std::setw(8) << (r.roundTripOk ? "yes" : "NO")
                   << '\n';
     }
