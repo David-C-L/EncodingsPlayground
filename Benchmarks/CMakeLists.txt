@@ -190,11 +190,29 @@ target_include_directories(reordering_benchmarks
         ${CMAKE_SOURCE_DIR}/Source
 )
 
+# Exception-handling benchmarks (see Source/exceptions/)
+add_executable(exception_benchmarks
+    exception_benchmarks.cpp
+)
+
+target_link_libraries(exception_benchmarks
+    PRIVATE
+        encodings_core
+        encodings_encodings
+        encodings_encoders
+        encodings_exceptions
+)
+
+target_include_directories(exception_benchmarks
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/Source
+)
+
 # Create results directory
 file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/benchmark_results)
 
 # Set output directory for the executables
-set_target_properties(run_benchmarks sweep_subint_samples map_benchmarks map_benchmarks_refactored vector_benchmarks reordering_benchmarks explore_best_encoding heatmap_benchmark PROPERTIES
+set_target_properties(run_benchmarks sweep_subint_samples map_benchmarks map_benchmarks_refactored vector_benchmarks reordering_benchmarks explore_best_encoding heatmap_benchmark exception_benchmarks PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 
