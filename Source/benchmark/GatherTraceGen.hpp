@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include "benchmark/SelectiveTraceGen.hpp"
 #include "encodings/RowRange.hpp"
@@ -74,6 +75,27 @@ struct GatherTrace {
     bool   clamped{false};         ///< maxRanges bound was hit: the uniform model coarsened to
                                    ///< longer runs at the same selectivity, while the geometric
                                    ///< model stopped early and left the tail of the span uncovered
+
+    /**
+     * @brief Expand `ranges` into the flat ascending row list some APIs require.
+     *
+     * Ranges are the right representation for *building* a trace and for
+     * reporting its structure (rangeCount, runLengthActual), but not every
+     * consumer takes them: nimble's read path expresses a selective read as
+     * RowSet = folly::Range<const vector_size_t*>, a sorted array of row
+     * numbers.  Keeping this conversion here means a driver body can serve both
+     * representations without the trace generator itself knowing about either.
+     *
+     * `out` is cleared and filled with exactly `selectedRows` ascending indices.
+     * Call it OUTSIDE any timed region — it allocates and costs one pass.
+     */
+    void expandToRows(std::vector<int32_t>& out) const {
+        out.clear();
+        out.reserve(selectedRows);
+        for (const auto& r : ranges)
+            for (size_t i = r.begin; i < r.end; ++i)
+                out.push_back(static_cast<int32_t>(i));
+    }
 };
 
 /// Range count implied by a (span, selectivity, runLength) triple, before any

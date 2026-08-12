@@ -1,3 +1,4 @@
+#include "benchmark/TimingStats.hpp"
 #include "generators/ParquetColumnGenerator.hpp"
 #include "encoders/RawEncoder.hpp"
 #include "encoders/RawBitPackedEncoder.hpp"
@@ -26,11 +27,7 @@ using namespace encodings::encoders;
 
 namespace {
 
-int64_t medianOf(std::vector<int64_t>& v) {
-    auto mid = v.begin() + v.size() / 2;
-    std::nth_element(v.begin(), mid, v.end());
-    return *mid;
-}
+using encodings::benchmark::medianOf;
 
 struct EncoderEntry {
     std::string name;

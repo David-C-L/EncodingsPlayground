@@ -29,6 +29,7 @@
 // disappears for codecs that override decodeRangeInto (RawBitPacked, BlockFPE,
 // BlockFORFPE, FPE, SubIntSplit).
 
+#include "benchmark/Axes.hpp"
 #include "benchmark/GatherTraceGen.hpp"
 #include "benchmark/TimingStats.hpp"
 #include "generators/CommonGenerators.hpp"
@@ -68,6 +69,8 @@ using encodings::benchmark::GatherAccessParams;
 using encodings::benchmark::GatherTrace;
 using encodings::benchmark::buildGatherTrace;
 using encodings::benchmark::impliedRangeCount;
+using encodings::benchmark::linSpaced;
+using encodings::benchmark::logSpaced;
 
 namespace {
 
@@ -219,34 +222,6 @@ bool parseArgs(int argc, char** argv, SweepConfig& cfg, bool& ok) {
     cfg.iterations = std::max<size_t>(1, cfg.iterations);
     cfg.sigmaMin   = std::clamp(cfg.sigmaMin, 1e-6, 1.0);
     return true;
-}
-
-// ─── Sweep axes ──────────────────────────────────────────────────────────────
-
-std::vector<size_t> logSpaced(size_t lo, size_t hi, size_t steps) {
-    std::vector<size_t> out;
-    out.reserve(steps);
-    if (steps == 1 || lo >= hi) { out.push_back(lo); return out; }
-    const double lgLo = std::log2(static_cast<double>(lo));
-    const double lgHi = std::log2(static_cast<double>(hi));
-    for (size_t i = 0; i < steps; ++i) {
-        const double f = static_cast<double>(i) / static_cast<double>(steps - 1);
-        out.push_back(static_cast<size_t>(std::llround(std::exp2(lgLo + f * (lgHi - lgLo)))));
-    }
-    // Log spacing can collide after rounding at small values; keep it strictly increasing.
-    out.erase(std::unique(out.begin(), out.end()), out.end());
-    return out;
-}
-
-std::vector<double> linSpaced(double lo, double hi, size_t steps) {
-    std::vector<double> out;
-    out.reserve(steps);
-    if (steps == 1) { out.push_back(hi); return out; }
-    for (size_t i = 0; i < steps; ++i) {
-        const double f = static_cast<double>(i) / static_cast<double>(steps - 1);
-        out.push_back(lo + f * (hi - lo));
-    }
-    return out;
 }
 
 // ─── Measurement primitives ──────────────────────────────────────────────────

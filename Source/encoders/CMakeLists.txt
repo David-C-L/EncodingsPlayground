@@ -79,21 +79,69 @@ if(NOT ZSTD_FOUND)
     endif()
 endif()
 
-# Assumes a prebuilt openzl lib is available and provided
-if (NOT DEFINED OPENZL_REPO)
-    set(OPENZL_REPO "/home/david/Documents/PhD/symbol-store/openzl")
-endif()
-set(OPENZL_INCLUDE_DIR "${OPENZL_REPO}/include")
-set(OPENZL_LIB_DIR "${OPENZL_REPO}")
-
+# ---------------------------------------------------------------------------
+# OpenZL (prebuilt; state-of-the-art baseline and a SubIntSplit section codec)
+#
+# HAVE_OPENZL is defined here, at the build level, and NOT by OpenZLEncoder.hpp.
+# It used to be #defined inside that header behind a __has_include probe, which
+# made it depend on include order: a translation unit that reached its own
+# `#ifdef HAVE_OPENZL` before transitively including OpenZLEncoder.hpp silently
+# compiled with OpenZL disabled.  Defining it on the interface target makes it
+# uniform across every TU, so reordering includes can no longer change which
+# encoders a driver registers.
+# ---------------------------------------------------------------------------
+option(ENCODINGS_ENABLE_OPENZL "Build with the OpenZL codec and baselines" ON)
 
 add_library(encodings_encoders INTERFACE)
 
-add_library(OpenZL::openzl SHARED IMPORTED)
-set_target_properties(OpenZL::openzl PROPERTIES
-    IMPORTED_LOCATION "${OPENZL_LIB_DIR}/libopenzl${CMAKE_SHARED_LIBRARY_SUFFIX}"
-    INTERFACE_INCLUDE_DIRECTORIES "${OPENZL_INCLUDE_DIR}"
-)
+if(ENCODINGS_ENABLE_OPENZL)
+    # Resolution order: -DOPENZL_REPO, then $OPENZL_REPO, then a search of
+    # locations relative to this repo.  The relative probe replaces what used to
+    # be a hardcoded absolute path under a specific home directory, which was
+    # invisible until the build failed to link on any other machine.
+    if(NOT DEFINED OPENZL_REPO OR NOT OPENZL_REPO)
+        set(OPENZL_REPO "$ENV{OPENZL_REPO}")
+    endif()
+    if(NOT OPENZL_REPO)
+        foreach(_candidate
+                "${PROJECT_SOURCE_DIR}/../openzl"
+                "${PROJECT_SOURCE_DIR}/../../openzl"
+                "${PROJECT_SOURCE_DIR}/../../../openzl")
+            if(EXISTS "${_candidate}/include/openzl/openzl.h")
+                get_filename_component(OPENZL_REPO "${_candidate}" ABSOLUTE)
+                message(STATUS "OpenZL found relative to the repo: ${OPENZL_REPO}")
+                break()
+            endif()
+        endforeach()
+    endif()
+    if(NOT OPENZL_REPO)
+        message(FATAL_ERROR
+            "ENCODINGS_ENABLE_OPENZL is ON but no OpenZL checkout was found.  Point "
+            "OPENZL_REPO at a prebuilt checkout containing include/openzl/openzl.h and "
+            "libopenzl${CMAKE_SHARED_LIBRARY_SUFFIX}, e.g. -DOPENZL_REPO=/path/to/openzl "
+            "(or export OPENZL_REPO), or configure with -DENCODINGS_ENABLE_OPENZL=OFF.")
+    endif()
+
+    set(OPENZL_INCLUDE_DIR "${OPENZL_REPO}/include")
+    set(OPENZL_LIBRARY "${OPENZL_REPO}/libopenzl${CMAKE_SHARED_LIBRARY_SUFFIX}")
+    if(NOT EXISTS "${OPENZL_INCLUDE_DIR}/openzl/openzl.h")
+        message(FATAL_ERROR "OPENZL_REPO=${OPENZL_REPO} has no include/openzl/openzl.h")
+    endif()
+    if(NOT EXISTS "${OPENZL_LIBRARY}")
+        message(FATAL_ERROR "OPENZL_REPO=${OPENZL_REPO} has no libopenzl${CMAKE_SHARED_LIBRARY_SUFFIX}")
+    endif()
+
+    add_library(OpenZL::openzl SHARED IMPORTED)
+    set_target_properties(OpenZL::openzl PROPERTIES
+        IMPORTED_LOCATION "${OPENZL_LIBRARY}"
+        INTERFACE_INCLUDE_DIRECTORIES "${OPENZL_INCLUDE_DIR}"
+    )
+    target_link_libraries(encodings_encoders INTERFACE OpenZL::openzl)
+    target_compile_definitions(encodings_encoders INTERFACE HAVE_OPENZL)
+    message(STATUS "OpenZL enabled: ${OPENZL_REPO}")
+else()
+    message(STATUS "OpenZL disabled (ENCODINGS_ENABLE_OPENZL=OFF); OpenZLCodec will throw if used")
+endif()
 
 target_sources(encodings_encoders INTERFACE
     FILE_SET HEADERS
@@ -127,12 +175,11 @@ target_include_directories(encodings_encoders INTERFACE
     $<INSTALL_INTERFACE:include>
 )
 
-target_link_libraries(encodings_encoders INTERFACE 
+target_link_libraries(encodings_encoders INTERFACE
     encodings_core
     encodings_encodings
     ZSTD::libzstd
     LZ4::lz4
-    OpenZL::openzl
     unordered_dense
 )
 

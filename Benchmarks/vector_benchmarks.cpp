@@ -8,6 +8,7 @@
 #include <numeric>
 #include <algorithm>
 
+#include "benchmark/TimingStats.hpp"
 #include "encoders/SphericalEncoder.hpp"
 #include "encoders/RawEncoder.hpp"
 #include "encoders/ZstdEncoder.hpp"
@@ -17,32 +18,8 @@ using namespace encodings;
 using namespace encodings::encoders;
 using namespace encodings::datagen;  // VectorGenerator is in datagen namespace
 
-// Statistics helper
-struct Stats {
-    double mean = 0.0;
-    double stddev = 0.0;
-    double min = 0.0;
-    double max = 0.0;
-    
-    static Stats compute(const std::vector<double>& values) {
-        Stats s;
-        if (values.empty()) return s;
-        
-        s.mean = std::accumulate(values.begin(), values.end(), 0.0) / values.size();
-        s.min = *std::min_element(values.begin(), values.end());
-        s.max = *std::max_element(values.begin(), values.end());
-        
-        if (values.size() > 1) {
-            double sq_sum = 0.0;
-            for (double v : values) {
-                sq_sum += (v - s.mean) * (v - s.mean);
-            }
-            s.stddev = std::sqrt(sq_sum / (values.size() - 1));
-        }
-        
-        return s;
-    }
-};
+// Statistics helper: mean/stddev/min/max over doubles, shared with the other drivers.
+using Stats = encodings::benchmark::MomentSummary;
 
 // Error metrics for reconstruction quality
 struct ErrorMetrics {
