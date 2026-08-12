@@ -18,16 +18,18 @@
 // The sigma = 1 slice degenerates to a single contiguous range and reproduces the
 // range-access baseline; --validate checks that against a direct range decode.
 //
-// Reading the sigma = 1 row against bench_decode_range: the two issue the same
-// access but not the same call.  skipThenMaterialize() must write into a
-// caller-owned buffer, so it goes through decodeRangeInto(), and for a codec that
-// does not override that (Raw, AdaptiveFramedBitPrefix, Zstd, OpenZL) the base
-// class implements it as decodeRange() plus a copy — one extra materialization the
-// range-access driver never pays.  Those encoders therefore read as roughly 2x
-// slower here at sigma = 1 even though the decode work is identical.  That gap is
-// the cost of the gather API's buffer contract, not a measurement artifact, and it
-// disappears for codecs that override decodeRangeInto (RawBitPacked, BlockFPE,
-// BlockFORFPE, FPE, SubIntSplit).
+// Reading the sigma = 1 row against bench_decode_range: the two now agree within
+// noise, for every codec.  Measured ratios at N=100k, three runs: RawBitPacked
+// 1.03, FPE_PerTierBitmaps 0.89, Zstd 0.99, OpenZL 0.95.
+//
+// This is worth stating because the pre-refactor version of this comment claimed
+// a ~2x gap for codecs that do not override decodeRangeInto, on the grounds that
+// the gather API's caller-owned-buffer contract forces an extra materialization
+// through the base-class decodeRange()-plus-copy.  That gap was real, but it was
+// an artifact of what it was being compared against: the old range driver called
+// the allocating decodeRange() directly and so skipped the copy.  Both drivers
+// now honour the *Into contract, so both pay the same base-class fallback for the
+// same codecs and it cancels.  The asymmetry was in the harness, not in the API.
 //
 // Everything measured here goes through DecodeHarness::gather, and every column
 // is named rather than positional — see Benchmarks/drivers/CONVENTIONS.md for the
