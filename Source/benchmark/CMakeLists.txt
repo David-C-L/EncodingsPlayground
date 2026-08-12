@@ -10,6 +10,8 @@ target_sources(encodings_benchmark INTERFACE
         BenchmarkRunner.hpp
         BenchmarkOutput.hpp
         SelectiveTraceGen.hpp
+        GatherTraceGen.hpp
+        TimingStats.hpp
 )
 
 target_include_directories(encodings_benchmark INTERFACE
