@@ -22,6 +22,7 @@ set(encodings_benchmark_drivers
     gather_heatmap_benchmark
     explore_best_encoding
     reordering_benchmarks
+    bench_decode_gather
 )
 
 # Drivers needing libraries beyond the common set, as "<driver>:<lib>;<lib>".
@@ -30,8 +31,19 @@ set(encodings_benchmark_extra_libs
 )
 
 function(encodings_add_benchmark_driver name)
+    # A driver's source is either beside this CMakeLists (the pre-refactor
+    # drivers) or under drivers/ (the refactored ones).  An explicit second
+    # argument wins, so a driver can live anywhere without a convention change.
+    if(ARGV1)
+        set(_src "${ARGV1}")
+    elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${name}.cpp")
+        set(_src "${name}.cpp")
+    else()
+        set(_src "drivers/${name}.cpp")
+    endif()
+
     add_executable(${name}
-        ${name}.cpp
+        ${_src}
         allocation_hooks.cpp
     )
 

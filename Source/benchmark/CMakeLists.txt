@@ -15,6 +15,7 @@ target_sources(encodings_benchmark INTERFACE
         CachePolicy.hpp
         Cli.hpp
         DatasetCache.hpp
+        DecodeHarness.hpp
         GatherTraceGen.hpp
         MeasureLoop.hpp
         MemoryTracker.hpp
