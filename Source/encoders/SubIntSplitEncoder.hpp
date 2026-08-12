@@ -573,7 +573,7 @@ public:
 private:
     static bool verboseEnabled() {
         static bool v = (std::getenv("SUBINTSPLIT_VERBOSE") != nullptr);
-        return v || true;
+        return v;
     }
 
     struct ParsedHeader {
@@ -1716,6 +1716,19 @@ makeAutoSubIntSplitCostModelsFromTypes(const std::vector<encodings::EncodingType
     return models;
 }
 
+/// Optional per-encoding cost-grid dump path, from $SUBINTSPLIT_COST_GRID_CSV.
+///
+/// This used to be hardcoded to a repo-relative path in every
+/// makeDefaultAutoSubIntSplit* helper, and the selector THROWS when it cannot
+/// open the file for writing (IDSubStreamEncodingSelector.hpp) -- so an AutoSIS
+/// encoder only worked in a process whose working directory happened to sit
+/// exactly one level below the repo root.  A debugging artifact must not decide
+/// whether encoding succeeds, so it is opt-in and absent by default.
+inline std::optional<std::string> costGridCsvPathFromEnv() {
+    if (const char* p = std::getenv("SUBINTSPLIT_COST_GRID_CSV"); p && *p) return std::string{p};
+    return std::nullopt;
+}
+
 template <typename T>
 inline typename SubIntSplitAutoEncoder<T>::Config makeDefaultAutoSubIntSplitConfig(BitSplitOrder order = BitSplitOrder::LSB_TO_MSB,
                                                                          bool enableSelectionTiming = false,
@@ -1724,7 +1737,7 @@ inline typename SubIntSplitAutoEncoder<T>::Config makeDefaultAutoSubIntSplitConf
                                                                          bool allowReorderers = true) {
     typename SubIntSplitAutoEncoder<T>::Config cfg;
     cfg.selectorConfig = selectors::IDSubStreamEncodingSelector::Config{}; // defaults
-    cfg.selectorConfig.verboseLevel = 1; // leave quiet by default; enable when debugging
+    cfg.selectorConfig.verboseLevel = 0; // quiet by default; raise when debugging
     cfg.selectorConfig.minSegmentWidth = 1; // avoid tiny slices that inflate headers/rounding
     cfg.selectorConfig.splitPenalty = 100.0; // discourage excessive splitting (heavier for MSB)
     cfg.selectorConfig.enableMergePhase = false; // merge adjacent in MSB mode to reduce fragmentation
@@ -1764,7 +1777,7 @@ inline typename SubIntSplitAutoEncoder<T>::Config makeDefaultAutoSubIntSplitConf
 {
     typename SubIntSplitAutoEncoder<T>::Config cfg;
     cfg.selectorConfig = selectors::IDSubStreamEncodingSelector::Config{};
-    cfg.selectorConfig.verboseLevel = 1;
+    cfg.selectorConfig.verboseLevel = 0;
     cfg.selectorConfig.minSegmentWidth = 1;
     cfg.selectorConfig.enableMergePhase = false;
     cfg.samplerConfig.maxSamples = 10'000;
@@ -1796,7 +1809,7 @@ inline std::shared_ptr<SubIntSplitAutoEncoder<T>> makeDefaultAutoSubIntSplitEnco
     cfg.selectorConfig.orderHint = order;
     cfg.selectorConfig.useExhaustiveSearch = exhaustiveSearch;
     cfg.selectorConfig.enablePrune = enablePrune;
-    cfg.selectorConfig.costGridCsvPath = "../Source/encoders/auto_subintsplit_cost_grid_twitter_snowflake_64.csv"; // for debugging/analysis; selector will log evaluated candidates and their costs
+    cfg.selectorConfig.costGridCsvPath = costGridCsvPathFromEnv(); // opt-in via $SUBINTSPLIT_COST_GRID_CSV
     return makeAutoSubIntSplitEncoder<T>(std::move(cfg));
 }
 
@@ -1813,7 +1826,7 @@ inline std::shared_ptr<SubIntSplitAutoEncoder<T>> makeDefaultAutoSubIntSplitEnco
     cfg.selectorConfig.orderHint          = order;
     cfg.selectorConfig.useExhaustiveSearch = exhaustiveSearch;
     cfg.selectorConfig.enablePrune         = enablePrune;
-    cfg.selectorConfig.costGridCsvPath     = "../Source/encoders/auto_subintsplit_cost_grid_twitter_snowflake_64.csv";
+    cfg.selectorConfig.costGridCsvPath     = costGridCsvPathFromEnv();
     return makeAutoSubIntSplitEncoder<T>(std::move(cfg));
 }
 
@@ -1849,7 +1862,7 @@ inline std::shared_ptr<SubIntSplitAutoEncoderProf<T>> makeDefaultAutoSubIntSplit
     cfg.selectorConfig.orderHint          = order;
     cfg.selectorConfig.useExhaustiveSearch = exhaustiveSearch;
     cfg.selectorConfig.enablePrune         = enablePrune;
-    cfg.selectorConfig.costGridCsvPath     = "../Source/encoders/auto_subintsplit_cost_grid_twitter_snowflake_64.csv";
+    cfg.selectorConfig.costGridCsvPath     = costGridCsvPathFromEnv();
     cfg.parallelism                        = parallelism;
     return makeAutoSubIntSplitEncoderProf<T>(std::move(cfg));
 }
@@ -1868,7 +1881,7 @@ inline std::shared_ptr<SubIntSplitAutoEncoderProf<T>> makeDefaultAutoSubIntSplit
     cfg.selectorConfig.orderHint          = order;
     cfg.selectorConfig.useExhaustiveSearch = exhaustiveSearch;
     cfg.selectorConfig.enablePrune         = enablePrune;
-    cfg.selectorConfig.costGridCsvPath     = "../Source/encoders/auto_subintsplit_cost_grid_twitter_snowflake_64.csv";
+    cfg.selectorConfig.costGridCsvPath     = costGridCsvPathFromEnv();
     cfg.parallelism                        = parallelism;
     return makeAutoSubIntSplitEncoderProf<T>(std::move(cfg));
 }
