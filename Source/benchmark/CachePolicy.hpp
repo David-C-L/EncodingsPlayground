@@ -49,7 +49,15 @@ namespace encodings::benchmark {
 
 /// What the caches are expected to hold when the timed region starts.
 ///
-/// Hot is an *active* state, not the absence of one — see CacheController::warm.
+/// Hot means "steady state of repeating this access": the warmup iterations run
+/// the real access and nothing is perturbed afterwards.  That is a well-defined
+/// state rather than an accident of iteration order, and it warms exactly the
+/// region the measured access reads — the whole payload for a bulk decode, one
+/// window for a narrow gather — which no explicit warm can do without being told
+/// the access pattern.  Set CachePolicy::activeWarm to additionally stream the
+/// whole payload first; see CacheController::warm for why that is opt-in and why
+/// it makes narrow-window accesses read *slower*.
+///
 /// ColdPayload cools only the encoded bytes; ColdAll additionally cools the
 /// output sink and whatever codec-internal structures the codec is willing to
 /// expose through Decoder::internalBuffers().
@@ -191,6 +199,12 @@ private:
 struct CachePolicy {
     CacheState  state{CacheState::Hot};
     EvictMethod method{EvictMethod::Auto};
+    /// Hot only: also stream the whole payload before each timed iteration.
+    /// Off by default because it is wrong for any access narrower than the
+    /// payload — see CacheController::warm.  Turn it on to measure the
+    /// payload-resident state deliberately, and record it, because it is a
+    /// different quantity from the default hot state.
+    bool activeWarm{false};
     /// Payload size above which Auto stops using clflush.  0 => derive from the
     /// detected LLC.  clflush costs one instruction per 64 bytes of payload and
     /// its cost is charged to evict_ns, not to the measurement; but past a few
@@ -246,12 +260,18 @@ public:
 
     /// Read-touch every target into a volatile accumulator.
     ///
-    /// This is why Hot is an active state: without it, "hot" means "whatever the
-    /// previous iteration happened to leave behind", which depends on the
-    /// iteration order and on the *previous cell's* footprint, and makes the
-    /// first timed iteration of every cell a different measurement from the
-    /// rest.  Touching at line granularity is enough — the point is residency,
-    /// not reading every byte.
+    /// OPT-IN ONLY (CachePolicy::activeWarm).  This streams the WHOLE payload,
+    /// which is the right warm for an access that reads the whole payload and the
+    /// wrong one for an access that reads a narrow window: once the payload
+    /// exceeds L2, touching all of it evicts the window's own lines to LLC, so
+    /// "hot" ends up *colder for the region being measured* than doing nothing.
+    /// Measured on a gather sweep: forcing this made a 1.6 MB-payload FPE cell
+    /// 1.66x slower than the passive state, tracking payload-vs-L2 rather than
+    /// anything about the access.  See the CacheState::Hot comment for what
+    /// replaced it as the default.
+    ///
+    /// Touching at line granularity is enough — the point is residency, not
+    /// reading every byte.
     void warm(const EvictionTargets& t) {
         const auto t0 = Clock::now();
         uint64_t acc = 0;
@@ -266,7 +286,17 @@ public:
     /// t0/t1 window; its own cost is available as lastEvictNs().
     void prepare(const EvictionTargets& t) {
         latchSizeDependentMethod(t.payload.size());
-        if (policy_.state == CacheState::Hot) { warm(t); return; }
+        if (policy_.state == CacheState::Hot) {
+            // Passive by default.  The warmup iterations of the measured access
+            // are what define the hot state, and they are self-correcting in a
+            // way an explicit warm cannot be: a bulk decode's warmup touches the
+            // whole payload, a narrow gather's touches exactly its window, and a
+            // point trace's touches exactly the lines it probes.  Each warms the
+            // region that access will actually read, with no knob to get wrong.
+            if (policy_.activeWarm) { warm(t); return; }
+            lastEvictNs_ = 0;
+            return;
+        }
 
         const auto t0 = Clock::now();
         switch (policy_.method) {

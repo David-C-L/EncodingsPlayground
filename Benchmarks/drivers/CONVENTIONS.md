@@ -67,6 +67,32 @@ All timed work goes through `benchmark::measure()` (`benchmark/MeasureLoop.hpp`)
   `high_resolution_clock::now()` calls around a single ~50 ns call measure mostly
   the clock.
 
+## 3a. Measurement hygiene — read before believing a number
+
+Measured on this box while porting the gather driver: with the default
+`--iterations 5` and no pinning, the run-to-run spread of a per-cell median was
+**13–46%**. At that precision almost any comparison between two drivers, two
+cache states or two codecs is unfalsifiable, and it is entirely possible to
+"confirm" a 1.5x effect that is not there — this happened during the port and
+cost a round of investigation.
+
+So, before reporting a comparison:
+
+- **Pin the process** (`taskset -c N`). This alone took one comparison from a
+  46% spread to 5%.
+- **Raise `--iterations`** to at least ~21 for anything whose per-cell time is
+  in the microseconds.
+- **Repeat the whole sweep** at least three times and look at the spread of the
+  medians, not one median. A single sweep cannot tell you its own error bar.
+- **Check the governor.** The manifest records it; on `powersave` with SMT
+  enabled, frequency drift is the dominant term. `performance` plus SMT off is
+  the configuration a paper number should come from.
+- **Distrust the first run of a freshly built binary** — first-touch page faults
+  and a cold instruction cache show up as one elevated outlier.
+
+None of this is optional politeness: a driver that reports three significant
+figures from five unpinned iterations is reporting noise with a decimal point.
+
 ## 4. CLI
 
 Built with `benchmark/Cli.hpp`. Flags bind to variables, and `--help` prints
