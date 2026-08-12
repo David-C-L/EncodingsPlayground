@@ -120,6 +120,26 @@ target_include_directories(heatmap_benchmark
         ${CMAKE_SOURCE_DIR}/Source
 )
 
+# Gather-access (selective row-range) throughput heatmap
+add_executable(gather_heatmap_benchmark
+    gather_heatmap_benchmark.cpp
+    allocation_hooks.cpp
+)
+
+target_link_libraries(gather_heatmap_benchmark
+    PRIVATE
+        encodings_core
+        encodings_encodings
+        encodings_generators
+        encodings_encoders
+        encodings_benchmark
+)
+
+target_include_directories(gather_heatmap_benchmark
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/Source
+)
+
 # Oracle vs AutoSIS comparison benchmark
 add_executable(explore_best_encoding
     explore_best_encoding.cpp
@@ -194,7 +214,7 @@ target_include_directories(reordering_benchmarks
 file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/benchmark_results)
 
 # Set output directory for the executables
-set_target_properties(run_benchmarks sweep_subint_samples map_benchmarks map_benchmarks_refactored vector_benchmarks reordering_benchmarks explore_best_encoding heatmap_benchmark PROPERTIES
+set_target_properties(run_benchmarks sweep_subint_samples map_benchmarks map_benchmarks_refactored vector_benchmarks reordering_benchmarks explore_best_encoding heatmap_benchmark gather_heatmap_benchmark PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 
@@ -208,6 +228,7 @@ if(NOT MSVC)
     target_compile_options(vector_benchmarks      PRIVATE -march=native -O3)
     target_compile_options(explore_best_encoding  PRIVATE -march=native -O3)
     target_compile_options(heatmap_benchmark      PRIVATE -march=native -O3)
+    target_compile_options(gather_heatmap_benchmark PRIVATE -march=native -O3)
 endif()
 
 # Add as tests (optional)
