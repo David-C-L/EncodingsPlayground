@@ -1,6 +1,7 @@
 #pragma once
 
 #include "generators/DataGenerator.hpp"
+#include <cstdint>
 #include <random>
 #include <algorithm>
 #include <cmath>
@@ -12,14 +13,26 @@ using core::PrimitiveType;
 using core::IntegralType;
 using core::FloatingPointType;
 
+/// Default seed for every generated dataset.
+///
+/// These generators used to seed from std::random_device in BOTH the constructor
+/// and reset(), which broke reproducibility twice over: two processes produced
+/// different streams, so a repeated sweep could not be compared against itself,
+/// and reset() *changed the stream mid-process*, so a harness that reset between
+/// encoders handed each encoder different data and then compared their sizes.
+/// A benchmark generator must be a pure function of its seed, and reset() must
+/// rewind rather than reroll.  Pass an explicit seed to vary the stream
+/// deliberately; nothing varies it by accident.
+inline constexpr uint64_t kDefaultGeneratorSeed = 42;
+
 /**
  * @brief Uniform random distribution
  */
 template<PrimitiveType T>
 class UniformRandomGenerator : public DataGenerator<T> {
 public:
-    UniformRandomGenerator(T min = T{}, T max = T{})
-        : min_(min), max_(max), rng_(std::random_device{}()) {}
+    UniformRandomGenerator(T min = T{}, T max = T{}, uint64_t seed = kDefaultGeneratorSeed)
+        : min_(min), max_(max), seed_(seed), rng_(seed) {}
     
     std::vector<T> generate(size_t count) override {
         std::vector<T> data;
@@ -41,7 +54,7 @@ public:
     }
     
     void reset() override {
-        rng_.seed(std::random_device{}());
+        rng_.seed(seed_);
     }
     
     std::string name() const override {
@@ -51,6 +64,7 @@ public:
 private:
     T min_;
     T max_;
+    uint64_t seed_;
     std::mt19937_64 rng_;
 };
 
@@ -93,9 +107,10 @@ private:
 template<PrimitiveType T>
 class RepetitiveGenerator : public DataGenerator<T> {
 public:
-    RepetitiveGenerator(size_t runLength = 10, T minValue = T{0}, T maxValue = T{100})
+    RepetitiveGenerator(size_t runLength = 10, T minValue = T{0}, T maxValue = T{100},
+                        uint64_t seed = kDefaultGeneratorSeed)
         : runLength_(runLength), minValue_(minValue), maxValue_(maxValue),
-          rng_(std::random_device{}()) {}
+          seed_(seed), rng_(seed) {}
     
     std::vector<T> generate(size_t count) override {
         std::vector<T> data;
@@ -127,7 +142,7 @@ public:
     }
     
     void reset() override {
-        rng_.seed(std::random_device{}());
+        rng_.seed(seed_);
     }
     
     std::string name() const override {
@@ -138,6 +153,7 @@ private:
     size_t runLength_;
     T minValue_;
     T maxValue_;
+    uint64_t seed_;
     std::mt19937_64 rng_;
 };
 
@@ -147,8 +163,9 @@ private:
 template<IntegralType T>
 class ZipfianGenerator : public DataGenerator<T> {
 public:
-    ZipfianGenerator(size_t cardinality = 100, double exponent = 1.0)
-        : cardinality_(cardinality), exponent_(exponent), rng_(std::random_device{}()) {
+    ZipfianGenerator(size_t cardinality = 100, double exponent = 1.0,
+                     uint64_t seed = kDefaultGeneratorSeed)
+        : cardinality_(cardinality), exponent_(exponent), seed_(seed), rng_(seed) {
         
         // Precompute cumulative probabilities
         cumulativeProbs_.reserve(cardinality);
@@ -184,7 +201,7 @@ public:
     }
     
     void reset() override {
-        rng_.seed(std::random_device{}());
+        rng_.seed(seed_);
     }
     
     std::string name() const override {
@@ -194,6 +211,7 @@ public:
 private:
     size_t cardinality_;
     double exponent_;
+    uint64_t seed_;
     std::mt19937_64 rng_;
     std::vector<double> cumulativeProbs_;
 };
@@ -227,9 +245,10 @@ private:
 template<PrimitiveType T>
 class NearlySortedGenerator : public DataGenerator<T> {
 public:
-    NearlySortedGenerator(T start = T{0}, T step = T{1}, double noiseFraction = 0.1)
+    NearlySortedGenerator(T start = T{0}, T step = T{1}, double noiseFraction = 0.1,
+                          uint64_t seed = kDefaultGeneratorSeed)
         : start_(start), step_(step), noiseFraction_(noiseFraction),
-          rng_(std::random_device{}()) {}
+          seed_(seed), rng_(seed) {}
     
     std::vector<T> generate(size_t count) override {
         std::vector<T> data;
@@ -256,7 +275,7 @@ public:
     }
     
     void reset() override {
-        rng_.seed(std::random_device{}());
+        rng_.seed(seed_);
     }
     
     std::string name() const override {
@@ -267,6 +286,7 @@ private:
     T start_;
     T step_;
     double noiseFraction_;
+    uint64_t seed_;
     std::mt19937_64 rng_;
 };
 
@@ -276,8 +296,8 @@ private:
 template<FloatingPointType T>
 class NormalGenerator : public DataGenerator<T> {
 public:
-    NormalGenerator(T mean = T{0}, T stddev = T{1})
-        : mean_(mean), stddev_(stddev), rng_(std::random_device{}()) {}
+    NormalGenerator(T mean = T{0}, T stddev = T{1}, uint64_t seed = kDefaultGeneratorSeed)
+        : mean_(mean), stddev_(stddev), seed_(seed), rng_(seed) {}
     
     std::vector<T> generate(size_t count) override {
         std::vector<T> data;
@@ -292,7 +312,7 @@ public:
     }
     
     void reset() override {
-        rng_.seed(std::random_device{}());
+        rng_.seed(seed_);
     }
     
     std::string name() const override {
@@ -302,6 +322,7 @@ public:
 private:
     T mean_;
     T stddev_;
+    uint64_t seed_;
     std::mt19937_64 rng_;
 };
 

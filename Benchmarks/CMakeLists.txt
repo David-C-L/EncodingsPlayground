@@ -23,6 +23,9 @@ set(encodings_benchmark_drivers
     explore_best_encoding
     reordering_benchmarks
     bench_decode_gather
+    bench_decode_bulk
+    bench_decode_range
+    bench_decode_point
 )
 
 # Drivers needing libraries beyond the common set, as "<driver>:<lib>;<lib>".
