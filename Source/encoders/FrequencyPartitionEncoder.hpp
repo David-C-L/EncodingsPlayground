@@ -541,6 +541,43 @@ public:
         return std::min(workUnits, cap);
     }
 
+    /// The positional index, as it exists at decode time.
+    ///
+    /// Everything listed here is *decoded* state held in headerCache_, not a view
+    /// into the encoded payload, so flushing the payload leaves all of it hot —
+    /// which for this encoder would defeat the point of a cold-all row, since the
+    /// index is precisely the structure whose access cost the index-type
+    /// comparison is measuring.  What is reachable depends on the active index
+    /// type: bitmaps and the Rank9 superblocks for PerTierBitmaps, materialized
+    /// positions for EliasFano, the sampled per-tier rank tables for
+    /// TierTagArray.  The packed tag array itself is not included: it lives at an
+    /// offset inside the encoded buffer and is therefore already covered when the
+    /// payload is evicted.  Empty before the first decode, because the header
+    /// cache is populated lazily.
+    std::vector<std::span<const std::byte>> internalBuffers() const override {
+        std::vector<std::span<const std::byte>> out;
+        if (!headerCache_.valid) return out;
+        const ParsedHeader& h = headerCache_.header;
+
+        const auto push = [&out](const auto& vec) {
+            if (!vec.empty())
+                out.emplace_back(reinterpret_cast<const std::byte*>(vec.data()),
+                                 vec.size() * sizeof(typename std::decay_t<decltype(vec)>::value_type));
+        };
+
+        for (const auto& td : h.tiers) {
+            push(td.dict);
+            push(td.bitmap);
+            push(td.rankIndex);
+            push(td.positions);
+        }
+        push(h.coveredBitmap);
+        push(h.fallbackPrefixPop);
+        push(h.tierPrefix);
+        for (const auto& samples : h.tierRankSamples) push(samples);
+        return out;
+    }
+
 private:
     FrequencyPartitionConfig cfg_{};
 

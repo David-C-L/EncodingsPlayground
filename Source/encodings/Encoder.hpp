@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <span>
 #include <vector>
 #include <memory>
@@ -233,6 +234,27 @@ public:
             return DataType::Array; // Default for composite types
         }
     }
+
+    /**
+     * @brief Decoder-owned memory that is not part of the encoded buffer.
+     *
+     * Exists for the benchmark harness's cold-all cache state.  Evicting the
+     * encoded payload cools only what the driver can address; a decoder that
+     * keeps a *decoded* auxiliary structure alive across calls — a positional
+     * index (FPE per-tier bitmaps, tag array, Elias-Fano positions), a
+     * dictionary, a rank sample table, a parsed header — leaves that structure
+     * hot no matter how thoroughly the payload was flushed.  For the
+     * reordering-index work that index *is* the object of study, so a cold-all
+     * row that silently kept it in L2 measures the wrong thing.
+     *
+     * Returning {} is correct and is the default: the harness then falls back to
+     * an LLC thrash, which is coarser (it also disturbs the TLB and the branch
+     * predictors) but never overstates coldness.  Buffers returned must stay
+     * valid and unowned-by-the-caller for the duration of the decode they
+     * precede — typically members of the decoder that a prior decode populated,
+     * so a caller should invoke this after at least one decode.
+     */
+    virtual std::vector<std::span<const std::byte>> internalBuffers() const { return {}; }
 
     /**
      * @brief Get the data type this decoder expects as input (encoded type)

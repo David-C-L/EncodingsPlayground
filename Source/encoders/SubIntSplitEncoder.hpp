@@ -867,6 +867,41 @@ public:
         if constexpr (kProfileSections) { gatherSkipNs_ = 0; gatherMatNs_ = 0; }
     }
 
+    /// Per-section buffers held by the cached parsed header.
+    ///
+    /// These matter more here than for most codecs: parseHeader()'s slice() does
+    /// not hand out views into the encoded buffer, it *copies* each section's
+    /// bytes into a per-section EncodedBuffer that then survives across decodes.
+    /// The section codecs read those copies, not the payload, so a cold-payload
+    /// flush of the outer buffer cools memory nothing subsequently touches while
+    /// the bytes actually decoded stay resident — a SubIntSplit "cold" row would
+    /// otherwise be a hot row with extra steps.
+    ///
+    /// Section codecs are reached through ISectionCodecIntegral, which has no
+    /// internalBuffers() of its own, so any decoded state a section codec caches
+    /// (e.g. an inner FPE's index) is NOT enumerated here.  That is a deliberate
+    /// under-report rather than an over-report: the driver's fallback is an LLC
+    /// thrash, which cools those too, at the cost of also disturbing the TLB.
+    std::vector<std::span<const std::byte>> internalBuffers() const override {
+        std::vector<std::span<const std::byte>> out;
+        if (cachedOuterPtr_ == nullptr) return out;  // no decode yet: nothing cached
+        out.reserve(cachedHeader_.views.size() + 3);
+        for (const auto& v : cachedHeader_.views) {
+            const auto& bytes = v.data();
+            if (!bytes.empty())
+                out.emplace_back(reinterpret_cast<const std::byte*>(bytes.data()), bytes.size());
+        }
+        const auto push = [&out](const auto& vec) {
+            if (!vec.empty())
+                out.emplace_back(reinterpret_cast<const std::byte*>(vec.data()),
+                                 vec.size() * sizeof(typename std::decay_t<decltype(vec)>::value_type));
+        };
+        push(cachedHeader_.bits);
+        push(cachedHeader_.shifts);
+        push(cachedHeader_.bytes);
+        return out;
+    }
+
     // Returns the number of threads to use, capped by both workUnits and the
     // configured maxThreads (or hardware_concurrency() when maxThreads==0).
     size_t effectiveThreadCount(size_t workUnits) const {
@@ -1352,6 +1387,14 @@ public:
         return impl_ ? impl_->gatherMaterializeTimeNs() : -1;
     }
     void resetGatherProfilingAccum() override { if (impl_) impl_->resetGatherProfilingAccum(); }
+
+    /// Forwarded, not defaulted: the auto wrapper owns no buffers of its own, but
+    /// leaving the base's empty implementation in place would silently downgrade
+    /// every AutoSIS cold-all row to an LLC thrash while the resolved inner
+    /// encoder was perfectly able to enumerate its sections.
+    std::vector<std::span<const std::byte>> internalBuffers() const override {
+        return impl_ ? impl_->internalBuffers() : std::vector<std::span<const std::byte>>{};
+    }
 
     void reset() override {
         impl_.reset();
