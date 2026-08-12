@@ -7,15 +7,27 @@ target_sources(encodings_benchmark INTERFACE
     BASE_DIRS ${PROJECT_SOURCE_DIR}/Source
     FILES
         AllocationTracker.hpp
+        ArtifactCache.hpp
         Axes.hpp
         BenchmarkMetrics.hpp
         BenchmarkOutput.hpp
         BenchmarkRunner.hpp
+        CachePolicy.hpp
+        Cli.hpp
+        DatasetCache.hpp
         GatherTraceGen.hpp
+        MeasureLoop.hpp
         MemoryTracker.hpp
         OperatorGraphJson.hpp
+        PointTraceGen.hpp
+        ResultWriter.hpp
+        RunManifest.hpp
         SelectiveTraceGen.hpp
         TimingStats.hpp
+        registry/DatasetRegistry.hpp
+        registry/EncoderRegistry.hpp
+        targets/BenchTarget.hpp
+        targets/PlaygroundTarget.hpp
 )
 
 target_include_directories(encodings_benchmark INTERFACE
@@ -23,7 +35,17 @@ target_include_directories(encodings_benchmark INTERFACE
     $<INSTALL_INTERFACE:include>
 )
 
-target_link_libraries(encodings_benchmark INTERFACE encodings_core)
+# ResultWriter.hpp builds Arrow arrays and writes Parquet, and the registries
+# construct encoders and parquet-backed generators.  Parquet arrives transitively
+# via encodings_generators today, but this target now owns headers that need it,
+# so it declares the dependency itself rather than relying on a sibling.
+target_link_libraries(encodings_benchmark INTERFACE
+    encodings_core
+    encodings_encodings
+    encodings_encoders
+    encodings_generators
+    Parquet::parquet_shared
+)
 
 target_compile_features(encodings_benchmark INTERFACE cxx_std_23)
 
