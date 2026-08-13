@@ -166,7 +166,54 @@ The calibration also drifted 45 → 80 ns between processes on its own, which is
 the governor/SMT effect CONVENTIONS 3a warns about, caught by the apparatus
 measuring itself.
 
-## 8. Reproducibility defects found in existing code
+## 8. Cost-model accuracy, first numbers from the harness
+
+TwitterSnowflake, N=200000, 2000 samples, the default seven-encoding set. The
+model ranks well and estimates within about 7%, but picks the true best encoding
+for a bit range only about two thirds of the time:
+
+| profile | top-1 | Spearman ρ | mean abs rel err | regret (sample) | regret (extrapolated) |
+|---|---|---|---|---|---|
+| random | 0.64 | 0.87 | 6.6% | 487 B | 48.7 KB |
+| consecutive | 0.71 | 0.86 | 7.0% | 352 B | 45.8 KB |
+
+Building the oracle grid cost 6.6 s against 0.5 s of selection, which is why the
+oracle lives in its own driver and not on any measurement path.
+
+The memoization in `CostModelGrid` is confirmed by the driver's own counter:
+`metric_compute_calls` is 14 for 14 cells — exactly one `MetricCollector::compute`
+per bit range, where the pre-refactor code ran it per segment per caller.
+
+## 9. The codec-set ladder: the DP declined every sequential codec — but see the caveat
+
+Ladder 1 (RA-only, then one sequential codec admitted per rung) on
+TwitterSnowflake, N=100000, 3000 samples, no reorderer:
+
+| rung | admitted | payload bytes | sis_fast_skip | admitted selected? | segments |
+|---|---|---|---|---|---|
+| 0 | — (23 RA codecs) | 709055 | yes | — | 1 |
+| 1 | HuffmanEncoding | 709055 | yes | no | 1 |
+| 2 | FSEEncoding | 709055 | yes | no | 1 |
+| 3 | CascadingFORFSEEncoding | 709055 | yes | no | 1 |
+| 4 | CascadingFORHuffmanEncoding | 709055 | yes | no | 1 |
+| 5 | CascadingFORPrevHuffmanEncoding | 709055 | yes | no | 1 |
+| 6 | CascadingFORPrevFSEEncoding | 709055 | yes | no | 1 |
+
+`sis_fast_skip` never flips: the DP declined all six sequential codecs, so on this
+configuration SubIntSplit keeps its random-access property at no cost in bytes.
+
+**The caveat matters more than the result.** `segment_count` is 1 at every rung —
+the DP chose a single-segment plan, which is close to the degenerate case. A
+one-segment plan has the least reason to want a specialised sequential codec for
+part of the word, so this run does not really exercise the question the ladder
+was built to ask. The driver's design pays off here precisely because it records
+the plan: "compression did not improve" and "the DP declined the codec" are
+distinguishable, and this is the latter.
+
+Before quoting this in the paper, re-run at a sample size and N large enough that
+the DP produces a multi-segment plan (the plans table from
+`bench_costmodel_oracle` shows where that happens), and across more than one
+dataset. The BWT512 arm of the same ladder had not finished at time of writing.
 
 - Five generators in `CommonGenerators.hpp` seeded from `std::random_device` in
   **both** the constructor and `reset()`. Two processes produced different
