@@ -61,7 +61,7 @@ except ImportError:
     griddata = None
     HAVE_SCIPY = False
 
-DEFAULT_CSV    = Path("Benchmarks/results/heatmap_benchmark.csv")
+DEFAULT_CSV    = Path("Benchmarks/results/bench_decode_range.csv")
 OUT_DIR        = Path("plots/motivational_heatmaps")
 INTERP_RES     = 500   # pixels on each axis for the interpolated grid
 HEATMAP_NCOLS  = 4     # subplots per row in grid layout
@@ -733,7 +733,7 @@ def main() -> None:
         description="Plot range-access heatmaps, CDF, and strip plots for the "
                      "SubIntSplit motivation figure.")
     parser.add_argument("--input", type=Path, default=DEFAULT_CSV,
-                        help="Path to heatmap_benchmark.csv (default: %(default)s)")
+                        help="Path to bench_decode_range output (default: %(default)s)")
     parser.add_argument("--output", type=Path, default=OUT_DIR,
                         help="Directory to write plot files into (default: %(default)s)")
     parser.add_argument("--skip-interp", action="store_true",

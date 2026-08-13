@@ -14,14 +14,10 @@ cmake_minimum_required(VERSION 3.28)
 
 set(encodings_benchmark_drivers
     run_benchmarks
-    sweep_subint_samples
     map_benchmarks
     map_benchmarks_refactored
     vector_benchmarks
-    heatmap_benchmark
-    gather_heatmap_benchmark
     explore_best_encoding
-    reordering_benchmarks
     bench_decode_gather
     bench_decode_bulk
     bench_decode_range
@@ -35,7 +31,6 @@ set(encodings_benchmark_drivers
 
 # Drivers needing libraries beyond the common set, as "<driver>:<lib>;<lib>".
 set(encodings_benchmark_extra_libs
-    "reordering_benchmarks:encodings_reorderers"
     "bench_reordering:encodings_reorderers"
 )
 

@@ -2,7 +2,7 @@
 """
 Plot gather-access (selective row-range) throughput heatmaps.
 
-Consumes Benchmarks/results/gather_heatmap_benchmark.csv, the output of
+Consumes Benchmarks/results/bench_decode_gather.csv, the output of
 Benchmarks/gather_heatmap_benchmark.cpp, which sweeps sparse reads over
 (s0_frac, l, sigma, run_length) and drives them through Codec::decodeGatherInto().
 
@@ -56,7 +56,7 @@ try:  # matplotlib >= 3.9 removed matplotlib.cm.get_cmap
 except AttributeError:
     from matplotlib.cm import get_cmap as _get_cmap
 
-DEFAULT_CSV = Path("Benchmarks/results/gather_heatmap_benchmark.csv")
+DEFAULT_CSV = Path("Benchmarks/results/bench_decode_gather.csv")
 BASELINE_CSV = Path("Benchmarks/results/heatmap_benchmark.csv")
 OUT_ROOT = Path("plots/gather_heatmaps")
 NCOLS = 4
