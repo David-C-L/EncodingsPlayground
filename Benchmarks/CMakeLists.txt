@@ -28,11 +28,15 @@ set(encodings_benchmark_drivers
     bench_decode_point
     bench_compression
     bench_encode
+    bench_costmodel_oracle
+    bench_reordering
+    bench_ablation
 )
 
 # Drivers needing libraries beyond the common set, as "<driver>:<lib>;<lib>".
 set(encodings_benchmark_extra_libs
     "reordering_benchmarks:encodings_reorderers"
+    "bench_reordering:encodings_reorderers"
 )
 
 function(encodings_add_benchmark_driver name)
