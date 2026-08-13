@@ -51,34 +51,52 @@ materialize correctly-ordered output while answering positional queries in its
 internal order. A bulk round-trip does not catch that; the per-probe check added
 in W8 does.
 
-## 1a. TierTagArray is Pareto-dominated by EliasFano
+## 1a. RETRACTED, then corrected: no index type wins everywhere
 
-With `index_bytes` now published as metadata (it was previously computed only
-inside the encoder's verbose-logging block, so the one number this comparison
-needs was unavailable unless the encoder was also writing to stderr), the space
-side can be put next to finding 1's latency side. Zipfian, N=100000:
+**The table that stood here was invalid and the conclusion drawn from it was
+wrong.** It combined `payload_bytes` and `index_bytes` measured by
+`bench_compression` on **Zipfian at N=100000** with ns/probe taken from finding 1,
+which was measured on **TwitterSnowflake at N=10M** — two different datasets at
+two different sizes, presented as one Pareto table. On that basis it concluded
+TierTagArray was dominated by EliasFano. It is not, and the error was mine in
+composing the table rather than in either measurement.
 
-| index type | payload bytes | vs NoIndex | index bytes | index % | hot uniform ns/probe |
+`bench_index_oracle` exists precisely to avoid this: it measures both axes on the
+same cell. At N=200000, `--validate`, both axes measured together:
+
+| dataset | index type | payload | index bytes | ns/probe (uniform) | on frontier |
 |---|---|---|---|---|---|
-| NoIndex | 353231 | — | 0 | 0.0% | 50 (no positional index to pay for) |
-| TierTagArray | 403183 | +14.1% | 50000 | 12.4% | 723 |
-| EliasFano | 406361 | +15.0% | 53178 | 13.1% | 79 |
-| PerTierBitmaps | 503231 | +42.5% | 150048 | 29.8% | 73 |
+| Zipfian1.0 | PerTierBitmaps | 970579 | 300000 | 167.6 | **yes** |
+| Zipfian1.0 | TierTagArray | 770579 | 100000 | 1596.4 | **yes** |
+| Zipfian1.0 | EliasFano | 774198 | 103619 | 2725.7 | no |
+| Zipfian1.0 | NoIndex | 670627 | 0 | — | not viable |
+| TwitterSnowflake | PerTierBitmaps | 1600014 | 0 | 28.4 | no |
+| TwitterSnowflake | TierTagArray | 1625014 | 25000 | 1142.6 | no |
+| TwitterSnowflake | EliasFano | 1600014 | 0 | 33.8 | no |
+| TwitterSnowflake | NoIndex | 1600014 | 0 | 22.2 | **yes** |
 
-**TierTagArray is dominated on both axes**: it costs essentially the same index
-space as EliasFano (12.4% vs 13.1% of payload) and is 9x slower per probe. There
-is no λ in a `bytes + λ·time` objective at which it wins, so it should not appear
-on the Pareto frontier the index-oracle driver reports.
+On Zipfian, **EliasFano is the dominated one** — larger payload *and* 1.7x the
+latency of TierTagArray — the exact reverse of the retracted claim.
 
-The genuine trade-off is the other pair: PerTierBitmaps buys 1.08x the point
-latency of EliasFano for 2.8x the index bytes (29.8% vs 13.1% of payload). That is
-the choice a cost model for this dimension would have to make, and it is a narrow
-one — which is itself worth reporting, since it bounds how much such a model could
-possibly gain.
+**The real finding is that the ranking does not generalise.** The scalarised
+oracle picks TierTagArray at every lambda from 1e-6 to 1e2 on Zipfian, and NoIndex
+at every lambda on TwitterSnowflake. No single index type wins across datasets,
+which is the argument *for* giving this dimension a cost model rather than a
+default — and it is a stronger argument than the one the retracted table made.
 
-Caveat: these are single-dataset, single-size numbers taken under the conditions
-at the top of this file. The ranking is robust (9x is far outside any observed
-spread); the percentages are not final.
+Two caveats that matter for how this is used:
+
+- **TwitterSnowflake is degenerate for this dimension.** Three of the four types
+  report `index_bytes = 0`: every row lands in fallback, so no tiers exist and no
+  index is built. NoIndex therefore wins trivially, and TierTagArray's 25000 bytes
+  are pure overhead. Conclusions about index structures should not be drawn from
+  this dataset.
+- **NoIndex fails validation on Zipfian1.0** (`materializeAll mismatch at row 0`)
+  because it reorders rows by tier. It is recorded as non-viable rather than
+  winning on bytes, which it otherwise would have.
+- The lambda ladder never changes the pick within either dataset, so the
+  space-versus-time crossover it was built to locate does not appear here. It
+  needs a dataset where two types are genuinely close on both axes.
 
 ## 2. FPE's full-range decode is ~1.8x its bulk decode
 
