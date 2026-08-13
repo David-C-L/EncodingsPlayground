@@ -144,3 +144,15 @@ add_executable(test_delta_prepass_encoder test_delta_prepass_encoder.cpp)
 target_include_directories(test_delta_prepass_encoder PRIVATE ${CMAKE_SOURCE_DIR}/Source)
 target_link_libraries(test_delta_prepass_encoder PRIVATE encodings_core encodings_encodings encodings_encoders encodings_reorderers)
 set_target_properties(test_delta_prepass_encoder PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+# ReorderingCodec's decodeAllInto / decodeRangeInto / decodeGatherInto overrides.
+# Before those existed the reordering layer inherited the base-class
+# allocate-and-copy fallback, so every reordering measurement timed the fallback
+# rather than the reordering.  These check the overrides round-trip across the
+# trace shapes in GatherTestHelpers, including the permutation formats that need
+# a full unpack to answer a positional query.
+add_executable(test_reordering_codec_into test_reordering_codec_into.cpp)
+target_include_directories(test_reordering_codec_into PRIVATE ${CMAKE_SOURCE_DIR}/Source)
+target_link_libraries(test_reordering_codec_into PRIVATE encodings_core encodings_encodings encodings_encoders encodings_reorderers encodings_benchmark)
+set_target_properties(test_reordering_codec_into PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_test(NAME test_reordering_codec_into COMMAND test_reordering_codec_into)
