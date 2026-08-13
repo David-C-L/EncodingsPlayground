@@ -2,8 +2,6 @@
 
 #include <cstddef>
 #include <atomic>
-#include <thread>
-#include <chrono>
 
 #ifdef __linux__
 #include <malloc.h>
@@ -30,66 +28,13 @@ inline size_t currentHeapBytes() {
 #endif
 }
 
-/**
- * @brief RAII helper that tracks the peak heap allocation above a baseline in
- *        a background thread.
- *
- * Construct just before the operation you want to measure; call stop() (or let
- * the destructor run) once the operation is complete. The returned value is the
- * highest number of bytes above the construction-time heap level observed
- * during the operation.
- *
- * The sampling interval (default 1 ms) is a trade-off:
- *   - Too small  → mallinfo2 lock contention slows the measured operation.
- *   - Too large  → short allocation spikes may be missed.
- * At 1 ms, encode/decode operations on 10 M elements (which typically take
- * tens to hundreds of ms) receive ≥ 50 samples, giving good peak coverage with
- * negligible overhead.
- */
-class PeakHeapTracker {
-public:
-    explicit PeakHeapTracker(
-            std::chrono::microseconds interval = std::chrono::microseconds{1000})
-        : interval_(interval)
-        , running_(true)
-        , baseline_(currentHeapBytes())
-        , peak_(baseline_)
-    {
-        thread_ = std::thread([this] {
-            while (running_.load(std::memory_order_acquire)) {
-                size_t cur  = currentHeapBytes();
-                size_t prev = peak_.load(std::memory_order_relaxed);
-                while (cur > prev &&
-                       !peak_.compare_exchange_weak(
-                           prev, cur, std::memory_order_relaxed)) {}
-                std::this_thread::sleep_for(interval_);
-            }
-        });
-    }
+// PeakHeapTracker was removed: it sampled mallinfo2 from a background thread and
+// was documented as the mechanism behind the "peak" memory fields, but it was
+// never instantiated anywhere. The memory pass is entirely ScopedAllocationTrack
+// (see AllocationTracker.hpp), which intercepts operator new/delete and so also
+// catches transient buffers freed before the call returns -- something a sampling
+// thread would miss. Keeping a dead alternative implementation next to the real
+// one only invited reading the wrong one.
 
-    ~PeakHeapTracker() { stop(); }
-
-    // Non-copyable, non-movable.
-    PeakHeapTracker(const PeakHeapTracker&)            = delete;
-    PeakHeapTracker& operator=(const PeakHeapTracker&) = delete;
-
-    /**
-     * @brief Stop sampling and return the peak heap bytes above the baseline
-     *        observed since construction. Safe to call multiple times.
-     */
-    size_t stop() {
-        bool was = running_.exchange(false, std::memory_order_acq_rel);
-        if (was) thread_.join();
-        size_t p = peak_.load(std::memory_order_acquire);
-        return p > baseline_ ? p - baseline_ : 0;
-    }
-
-private:
-    std::chrono::microseconds interval_;
-    std::atomic<bool>         running_;
-    size_t                    baseline_;
-    std::atomic<size_t>       peak_;
-    std::thread               thread_;
-};
 
 } // namespace encodings::benchmark

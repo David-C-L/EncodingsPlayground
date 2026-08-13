@@ -14,6 +14,7 @@ cmake_minimum_required(VERSION 3.28)
 
 set(encodings_benchmark_drivers
     run_benchmarks
+    bench_smoke
     map_benchmarks
     map_benchmarks_refactored
     vector_benchmarks
@@ -127,6 +128,10 @@ file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/benchmark_results)
 
 # Add as tests (optional)
 if(BUILD_TESTS)
-    add_test(NAME BenchmarkSuite COMMAND run_benchmarks)
+    # bench_smoke replaces run_benchmarks as the CI check.  run_benchmarks times
+    # six phases over three dataset sizes, which is minutes of unpinned numbers
+    # nobody reads, and it passes whether or not a codec round-trips.  bench_smoke
+    # checks correctness across every registered encoder and reports no timings.
+    add_test(NAME BenchmarkSmoke COMMAND bench_smoke)
     add_test(NAME MapBenchmarkSuite COMMAND map_benchmarks)
 endif()
