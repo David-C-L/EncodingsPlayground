@@ -51,6 +51,35 @@ materialize correctly-ordered output while answering positional queries in its
 internal order. A bulk round-trip does not catch that; the per-probe check added
 in W8 does.
 
+## 1a. TierTagArray is Pareto-dominated by EliasFano
+
+With `index_bytes` now published as metadata (it was previously computed only
+inside the encoder's verbose-logging block, so the one number this comparison
+needs was unavailable unless the encoder was also writing to stderr), the space
+side can be put next to finding 1's latency side. Zipfian, N=100000:
+
+| index type | payload bytes | vs NoIndex | index bytes | index % | hot uniform ns/probe |
+|---|---|---|---|---|---|
+| NoIndex | 353231 | — | 0 | 0.0% | 50 (no positional index to pay for) |
+| TierTagArray | 403183 | +14.1% | 50000 | 12.4% | 723 |
+| EliasFano | 406361 | +15.0% | 53178 | 13.1% | 79 |
+| PerTierBitmaps | 503231 | +42.5% | 150048 | 29.8% | 73 |
+
+**TierTagArray is dominated on both axes**: it costs essentially the same index
+space as EliasFano (12.4% vs 13.1% of payload) and is 9x slower per probe. There
+is no λ in a `bytes + λ·time` objective at which it wins, so it should not appear
+on the Pareto frontier the index-oracle driver reports.
+
+The genuine trade-off is the other pair: PerTierBitmaps buys 1.08x the point
+latency of EliasFano for 2.8x the index bytes (29.8% vs 13.1% of payload). That is
+the choice a cost model for this dimension would have to make, and it is a narrow
+one — which is itself worth reporting, since it bounds how much such a model could
+possibly gain.
+
+Caveat: these are single-dataset, single-size numbers taken under the conditions
+at the top of this file. The ranking is robust (9x is far outside any observed
+spread); the percentages are not final.
+
 ## 2. FPE's full-range decode is ~1.8x its bulk decode
 
 `bench_decode_bulk` and `bench_decode_range` at `(A_frac=0, B_frac=1)` issue the

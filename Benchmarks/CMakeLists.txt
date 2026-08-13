@@ -26,6 +26,8 @@ set(encodings_benchmark_drivers
     bench_decode_bulk
     bench_decode_range
     bench_decode_point
+    bench_compression
+    bench_encode
 )
 
 # Drivers needing libraries beyond the common set, as "<driver>:<lib>;<lib>".

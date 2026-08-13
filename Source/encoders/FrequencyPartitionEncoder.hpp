@@ -470,6 +470,23 @@ public:
         result.metadata().uncompressedSize     = N * sizeof(T);
         result.data() = std::move(out);
 
+        // The positional index is the thing this encoding family exists to study,
+        // so its size is published as metadata rather than only printed. It used
+        // to be computed solely inside the verbose block below, which meant the
+        // one number the reordering-index comparison needs was unavailable to any
+        // caller unless the encoder was also logging to stderr.
+        {
+            size_t indexBytes = 0;
+            if constexpr (IndexType == FreqPartIndexType::PerTierBitmaps) {
+                indexBytes = numTiersWithData * numWords * sizeof(uint64_t);
+            } else if constexpr (IndexType == FreqPartIndexType::TierTagArray) {
+                indexBytes = tagBytes;
+            } else if constexpr (IndexType == FreqPartIndexType::EliasFano) {
+                for (const auto& tl : tierLogs) indexBytes += tl.indexBytes;
+            }
+            result.metadata().customMetadata["index_bytes"] = std::to_string(indexBytes);
+        }
+
         if (verboseEnabled()) {
             const size_t rawBytes = N * sizeof(T);
             const size_t headerBytes = 8 + 1 + 1;
