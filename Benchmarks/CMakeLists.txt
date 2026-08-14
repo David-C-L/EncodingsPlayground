@@ -29,6 +29,7 @@ set(encodings_benchmark_drivers
     bench_reordering
     bench_ablation
     bench_index_oracle
+    bench_openzl_graph
 )
 
 # Drivers needing libraries beyond the common set, as "<driver>:<lib>;<lib>".
