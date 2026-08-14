@@ -202,36 +202,43 @@ The memoization in `CostModelGrid` is confirmed by the driver's own counter:
 `metric_compute_calls` is 14 for 14 cells — exactly one `MetricCollector::compute`
 per bit range, where the pre-refactor code ran it per segment per caller.
 
-## 9. The codec-set ladder: the DP declined every sequential codec — but see the caveat
+## 9. The codec-set ladder: inconclusive, and one driver caught a bug in another
 
 Ladder 1 (RA-only, then one sequential codec admitted per rung) on
-TwitterSnowflake, N=100000, 3000 samples, no reorderer:
+TwitterSnowflake reports the same payload at every rung with `sis_fast_skip`
+never flipping and `admitted_selected = 0` throughout — at N=100000 with 3000
+samples (709055 B) and again at N=1000000 with 20000 samples (6987103 B). Read
+naively that says the DP declined all six sequential codecs and SubIntSplit kept
+its random-access property for free.
 
-| rung | admitted | payload bytes | sis_fast_skip | admitted selected? | segments |
-|---|---|---|---|---|---|
-| 0 | — (23 RA codecs) | 709055 | yes | — | 1 |
-| 1 | HuffmanEncoding | 709055 | yes | no | 1 |
-| 2 | FSEEncoding | 709055 | yes | no | 1 |
-| 3 | CascadingFORFSEEncoding | 709055 | yes | no | 1 |
-| 4 | CascadingFORHuffmanEncoding | 709055 | yes | no | 1 |
-| 5 | CascadingFORPrevHuffmanEncoding | 709055 | yes | no | 1 |
-| 6 | CascadingFORPrevFSEEncoding | 709055 | yes | no | 1 |
+**Do not read it that way yet.** `bench_ablation` also reports
+`segment_count = 1` at every rung, while `bench_costmodel_oracle` reports the
+AutoSIS plan on the same dataset as **6 segments**:
 
-`sis_fast_skip` never flips: the DP declined all six sequential codecs, so on this
-configuration SubIntSplit keeps its random-access property at no cost in bytes.
+```
+autosis:       [0..11] FrequencyPartition, [12..13] BitPacking,
+               [14..21] FrequencyPartition, [22..53] FrequencyPartition, ...  (6)
+oracle_random: [0..5] FrequencyPartition, [6..21] Dictionary,
+               [22..50] BitPacking, [51..63] AdaptiveDictionary               (4)
+oracle_consec: 7 segments;   oracle_merged: 5 segments
+```
 
-**The caveat matters more than the result.** `segment_count` is 1 at every rung —
-the DP chose a single-segment plan, which is close to the degenerate case. A
-one-segment plan has the least reason to want a specialised sequential codec for
-part of the word, so this run does not really exercise the question the ladder
-was built to ask. The driver's design pays off here precisely because it records
-the plan: "compression did not improve" and "the DP declined the codec" are
-distinguishable, and this is the latter.
+The two drivers disagree about the same quantity on the same input, so
+`bench_ablation`'s plan-fact columns (`segment_count`, and by extension
+`admitted_selected`) cannot be trusted until that is resolved. The constant
+payload across rungs may well be real, but "the DP declined the codec" cannot be
+claimed while the driver's account of what the DP chose is demonstrably wrong.
 
-Before quoting this in the paper, re-run at a sample size and N large enough that
-the DP produces a multi-segment plan (the plans table from
-`bench_costmodel_oracle` shows where that happens), and across more than one
-dataset. The BWT512 arm of the same ladder had not finished at time of writing.
+This supersedes the earlier note here, which took `segment_count = 1` at face
+value and concluded the plan was near-degenerate. It is not: AutoSIS splits into
+six segments on this dataset.
+
+That the contradiction is visible at all is the decomposition working as
+intended. Two drivers computing the same quantity by different routes is a
+cross-check the monolith could not offer, and it caught a reporting defect before
+it became a paper claim. Fix `bench_ablation`'s plan extraction, then re-run.
+
+## 10. Reproducibility defects found in existing code
 
 - Five generators in `CommonGenerators.hpp` seeded from `std::random_device` in
   **both** the constructor and `reset()`. Two processes produced different
