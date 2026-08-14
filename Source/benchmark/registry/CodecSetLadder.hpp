@@ -338,7 +338,20 @@ buildRungCostModels(const std::vector<EncodingType>& allowed,
     const bool compressionOnly =
         dims.size() == 1 && dims.front().dim == CostModelDimension::Compression;
     if (compressionOnly) {
-        return encodings::encoders::makeAutoSubIntSplitCostModelsFromTypes(allowed);
+        // Attribute drops here too.  This path used to return before touching
+        // `dropped`, so models_dropped was "-" by construction and the column was
+        // evidence of nothing -- on the DEFAULT run, which is the one people read.
+        // It happens to be empty today because the factory throws on an unmodelled
+        // type rather than dropping it, but a column that cannot report a drop must
+        // not look like a column that found none.
+        auto models = encodings::encoders::makeAutoSubIntSplitCostModelsFromTypes(allowed);
+        std::vector<EncodingType> built;
+        built.reserve(models.size());
+        for (const auto& m : models) built.push_back(m->encodingType());
+        for (const EncodingType et : allowed) {
+            if (std::find(built.begin(), built.end(), et) == built.end()) dropped.push_back(et);
+        }
+        return models;
     }
 
     CostModelSet set;

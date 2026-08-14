@@ -120,6 +120,12 @@ struct SweepConfig {
     /// order of magnitude smaller.  It is the first flag to raise when a rung's
     /// plan looks unstable, and the first to lower when a sweep is too slow.
     size_t sampleSize{10'000};
+    /// Pruning is a speed heuristic that must not change the DP's answer.  It used
+    /// to: an unscaled entropy threshold collapsed every plan to one full-width
+    /// section.  Exposed so "what does pruning cost the plan?" stays measurable
+    /// rather than compiled in, and recorded per row so a result can never be read
+    /// without knowing which it was.
+    bool noPrune{false};
     size_t sampleBlock{16};
     UniverseChoice universe{UniverseChoice::All};
     ReordererChoice reorderers{ReordererChoice::Both};
@@ -164,6 +170,7 @@ void bindArgs(ArgParser& args, SweepConfig& cfg) {
 
     args.group("Plan selection:")
         .opt("sample-size", cfg.sampleSize, "samples per DP run (cost scales with this)")
+        .flag("--no-prune", cfg.noPrune, "disable DP entropy pruning (slower; must give the same plan)")
         .opt("sample-block", cfg.sampleBlock, "contiguous block size within the sample");
 
     args.group("Access patterns:")
@@ -372,7 +379,7 @@ std::optional<PlannedRung> planRung(const LadderRung& rung, SubStreamReordererTy
     encoders::selectors::IDSubStreamEncodingSelector::Config sel;
     sel.minSegmentWidth     = 1;
     sel.splitPenalty        = recommendedSplitPenalty(dims, cfg.sampleSize);
-    sel.enablePrune         = true;
+    sel.enablePrune         = !cfg.noPrune;
     sel.enableMergePhase    = false;
     sel.useExhaustiveSearch = false;
     sel.verboseLevel        = 0;
@@ -426,7 +433,9 @@ std::vector<Variant> buildLadderGroup(Ladder ladder, SubStreamReordererType reor
     const std::string reordererTag =
         encoders::selectors::subStreamReordererTypeToString(reorderer);
 
-    for (const LadderRung& rung : buildLadder(ladder, universe)) {
+    const auto rungs = buildLadder(ladder, universe);
+    for (size_t rungIndex = 0; rungIndex < rungs.size(); ++rungIndex) {
+        const LadderRung& rung = rungs[rungIndex];
         std::string whyNot;
         auto planned = planRung(rung, reorderer, sample, fullCount, cfg, whyNot);
         if (!planned) {
@@ -442,7 +451,10 @@ std::vector<Variant> buildLadderGroup(Ladder ladder, SubStreamReordererType reor
         v.variantTag    = rung.name;
         v.codec         = planned->codec;
         v.ladder        = ladderName(ladder);
-        v.rungIndex     = out.size();
+        // From the ladder's own numbering, not the kept count: a rung that fails
+        // to plan would otherwise renumber every rung after it and silently shift
+        // what rel_bytes_vs_rung0 normalises against.
+        v.rungIndex     = rungIndex;
         v.rungName      = rung.name;
         v.admitted      = rung.admitted.empty() ? "-" : rung.admitted;
         v.allowedCodecs = describeCodecSet(rung.allowed);
@@ -537,6 +549,7 @@ std::vector<ColumnSpec> ablationColumns() {
         stringCol("segment_plan"),
         intCol("plan_has_sequential_codec"),
         intCol("sis_fast_skip"),
+        boolCol("dp_prune_enabled"),
         doubleCol("est_bits"),
         doubleCol("actual_bits"),
         doubleCol("est_over_actual"),
@@ -953,6 +966,7 @@ void emitGroup(ResultWriter& writer, const SweepConfig& cfg, const std::string& 
 
                 row.setIf(vr.encoded, "payload_bytes", vr.payloadBytes)
                     .setIf(vr.encoded, "compression_ratio", vr.compressionRatio)
+                    .set("dp_prune_enabled", !cfg.noPrune)
                     .setIf(vr.encoded, "sis_fast_skip", vr.fastSkip)
                     .setIf(vr.selectionNs >= 0, "selection_time_ns", vr.selectionNs)
                     .setIf(vr.indexBytes.has_value(), "index_bytes",
