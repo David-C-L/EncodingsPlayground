@@ -202,41 +202,87 @@ The memoization in `CostModelGrid` is confirmed by the driver's own counter:
 `metric_compute_calls` is 14 for 14 cells — exactly one `MetricCollector::compute`
 per bit range, where the pre-refactor code ran it per segment per caller.
 
-## 9. The codec-set ladder: inconclusive, and one driver caught a bug in another
+## 9. AutoSIS was not splitting at all, and still degrades with more information
 
-Ladder 1 (RA-only, then one sequential codec admitted per rung) on
-TwitterSnowflake reports the same payload at every rung with `sis_fast_skip`
-never flipping and `admitted_selected = 0` throughout — at N=100000 with 3000
-samples (709055 B) and again at N=1000000 with 20000 samples (6987103 B). Read
-naively that says the DP declined all six sequential codecs and SubIntSplit kept
-its random-access property for free.
+Two defects, one fixed and one open. Together they are why the codec-set ladder
+could not produce a result.
 
-**Do not read it that way yet.** `bench_ablation` also reports
-`segment_count = 1` at every rung, while `bench_costmodel_oracle` reports the
-AutoSIS plan on the same dataset as **6 segments**:
+### 9a. The entropy prune scale (FIXED)
 
-```
-autosis:       [0..11] FrequencyPartition, [12..13] BitPacking,
-               [14..21] FrequencyPartition, [22..53] FrequencyPartition, ...  (6)
-oracle_random: [0..5] FrequencyPartition, [6..21] Dictionary,
-               [22..50] BitPacking, [51..63] AdaptiveDictionary               (4)
-oracle_consec: 7 segments;   oracle_merged: 5 segments
-```
+`entropyPruneThreshold` was compared directly against `MetricCollector`'s
+`entropyEstimate`, which is Shannon entropy in **bits per value** -- unbounded, up
+to the range's bit width -- while the threshold defaulted to a bare `1.0`. Every
+bit range carrying more than one bit of information per value was pruned, which
+on real data is nearly all of them.
 
-The two drivers disagree about the same quantity on the same input, so
-`bench_ablation`'s plan-fact columns (`segment_count`, and by extension
-`admitted_selected`) cannot be trusted until that is resolved. The constant
-payload across rungs may well be real, but "the DP declined the codec" cannot be
-claimed while the driver's account of what the DP chose is demonstrably wrong.
+It failed silently. The full `[0..63]` range is exempt from both prune tests, so
+it always survived, `dp[kBits]` was always finite, and the retry gated on
+`!isfinite(total_cost)` could never fire. The DP returned a valid single-section
+plan and SubIntSplit stopped splitting. `enablePrune` defaults true in all eight
+`makeDefaultAutoSubIntSplit*` overloads, so this was AutoSIS as shipped, not a
+benchmark artifact.
 
-This supersedes the earlier note here, which took `segment_count = 1` at face
-value and concluded the plan was near-degenerate. It is not: AutoSIS splits into
-six segments on this dataset.
+Fixed by scaling the threshold to the segment width (`entropy > threshold *
+bitWidth`, default 0.95) and by firing the retry when pruning leaves only the
+full-width segment. **Measured cost of the bug on TwitterSnowflake at N=100000:
+709055 to 587598 bytes, 17.1% compression lost.** Pruning is now answer-neutral --
+prune on and prune off give byte-identical output and identical plans -- which is
+asserted by `Tests/test_subint_plan_agreement.cpp`.
 
-That the contradiction is visible at all is the decomposition working as
-intended. Two drivers computing the same quantity by different routes is a
-cross-check the monolith could not offer, and it caught a reporting defect before
-it became a paper claim. Fix `bench_ablation`'s plan extraction, then re-run.
+### 9b. Plan quality degrades as the sample grows (OPEN)
+
+With pruning fixed and *held constant*, the DP's plan gets worse the more of the
+data it looks at. TwitterSnowflake, N=200000, prune on and off agreeing exactly at
+every row:
+
+| samples | segments | bytes | plan |
+|---|---|---|---|
+| 10000 | 3 | **1177554** | `[0..20]` Dictionary, `[21..52]` FreqPartition, `[53..63]` RunLength |
+| 50000 | 3 | 1672038 | `[0..20]` FreqPartition, `[21..53]` BitPacking, `[54..63]` RunLength |
+| 100000 | **1** | 1603171 | `[0..63]` FreqPartition |
+
+100000 samples is the default in `makeDefaultAutoSubIntSplitConfig`, so **the
+registry's AutoSIS entries produce a single full-width section at 64.13
+bits/element** -- worse than raw, and against 40.09 bits/element for the
+hand-written `SIS_Snowflake6` plan on the same data. More samples should tighten
+an estimate, never invert a decision.
+
+The same inversion appears along a second axis. The ladder allows 23-24 candidate
+codecs and collapses to one segment, while the same encoder with the default
+seven-codec set splits into three. So a *wider* candidate set also produces a
+worse plan.
+
+One mechanism is identified but does not explain everything: `kUniqueCountCap`
+= 1<<16 = 65536 (`MetricCollector.hpp:108`) makes `computeEntropy` switch to a
+binary lower-bound formula once unique values exceed the cap, so at 100000
+samples of near-unique Snowflake IDs the entropy estimate silently becomes a
+small number. That covers the 100000-sample collapse. It does not cover the
+50000-sample degradation (50000 < 65536), so at least one cost model is
+mis-ranking independently of the cap.
+
+**Consequence: AutoSIS figures at the registry default are not usable**, and the
+codec-set ladder still cannot express its intended result -- not because the
+ladder is wrong, but because the plan it varies does not respond correctly to the
+variation. Fixing this is a cost-model investigation, not a benchmark one.
+
+### What the ladder was built to show, and why it needs 9b fixed first
+
+The result being sought is that admitting more random-access codecs improves
+compression while keeping gather and point throughput far better than OpenZL and
+than admitting all sequential codecs. That rests on an asymmetry:
+
+- **Compression is a sum over sections** -- a codec that wins one bit range reduces
+  total size regardless of the rest.
+- **Random access is a `min` over sections** -- SubIntSplit advertises `FastSkip`
+  only when `allSectionsRandomAccess()` holds, so one sequential section costs the
+  whole encoding its gather fast path.
+
+Admitting an RA codec is therefore monotonically safe, while admitting a
+sequential one is a trade: it may win a high-entropy section and in exchange the
+entire encoding loses random access. That discontinuity is the finding, and it
+lives at the **per-section assignment** level. It is invisible while every plan is
+a single 64-bit section, because there is then no per-section specialisation and
+no meaningful `min` -- which is exactly the state 9a and 9b leave the DP in.
 
 ## 10. Reproducibility defects found in existing code
 
