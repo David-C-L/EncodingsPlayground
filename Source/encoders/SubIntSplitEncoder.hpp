@@ -1292,6 +1292,21 @@ class SubIntSplitAutoEncoder final : public Codec<T, uint8_t> {
 public:
     using Config = SubIntSplitAutoEncoderConfig<T>;
 
+    /// The plan this encoder actually used, valid after encode().
+    ///
+    /// Exposed because the alternative -- a caller re-running selection with its own
+    /// Config to find out what the encoder chose -- is not equivalent, and silently
+    /// so.  Two benchmark drivers did exactly that and disagreed about the segment
+    /// count of "the same" plan, because one of them set enablePrune and the other
+    /// did not.  Reading the resolved plan removes the opportunity for the question
+    /// and the answer to come from different selectors.
+    ///
+    /// Empty segments before the first encode, or when a preserved boundary list was
+    /// supplied instead of being selected.
+    const selectors::IDSubStreamEncodingSelector::Result& lastPlan() const noexcept {
+        return lastSelection_;
+    }
+
     explicit SubIntSplitAutoEncoder(Config cfg)
         : selector_(cfg.selectorConfig), samplerCfg_(cfg.samplerConfig), orderHint_(cfg.orderHint), debugLogging_(cfg.debugLogging),
           selectionTimingEnabled_(cfg.enableSelectionTiming), parallelism_(cfg.parallelism),

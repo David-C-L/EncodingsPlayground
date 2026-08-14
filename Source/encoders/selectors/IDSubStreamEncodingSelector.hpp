@@ -69,7 +69,19 @@ public:
 		int minSegmentWidth{1};
 		double splitPenalty{0.0};
 		bool enablePrune{false};
-		double entropyPruneThreshold{1.0};
+		/// Entropy above which a bit range is skipped, as a FRACTION of the maximum
+		/// entropy that range could carry (i.e. of its bit width).  1.0 means
+		/// "incompressible"; 0.95 skips ranges within 5% of incompressible.
+		///
+		/// This is a fraction, not an absolute bits-per-value figure, and the
+		/// distinction is not cosmetic: MetricCollector::computeEntropy returns
+		/// Shannon entropy in bits per value, which is unbounded up to the range's
+		/// width.  Compared against a bare 1.0, every range carrying more than one
+		/// bit of information per value was pruned -- which on real data is very
+		/// nearly all of them -- leaving only the full 64-bit range, which is
+		/// exempt.  The DP then returned a single-section plan and SubIntSplit did
+		/// not split at all.
+		double entropyPruneThreshold{0.95};
 		int verboseLevel{0}; // 0=off, 1=final DP choices, 2=full trace
 		bool enableMergePhase{false}; // optional post-pass to merge adjacent segments
 		std::optional<encodings::encoders::BitSplitOrder> orderHint{}; // optional downstream bit-order preference
@@ -183,7 +195,13 @@ public:
 
 					if (pruneEnabled) {
 						const bool isFullRange = (l == 0 && r == kBits - 1);
-						if (!isFullRange && metrics.entropyEstimate > config_.entropyPruneThreshold) {
+						// Scaled by bitWidth: the threshold is a fraction of the most
+						// entropy this range could hold.  Comparing an unbounded
+						// bits-per-value figure against a bare constant pruned almost
+						// every range and silently collapsed the plan to one section.
+						const double maxEntropyBits = static_cast<double>(bitWidth);
+						if (!isFullRange &&
+						    metrics.entropyEstimate > config_.entropyPruneThreshold * maxEntropyBits) {
 							continue;
 						}
 						if (bitWidth < 64) {
@@ -273,9 +291,24 @@ public:
 		// Pruning can make a K-segment partition infeasible even when one exists without
 		// pruning (e.g. high-entropy fields that must still be encoded).  Fall back to a
 		// full re-evaluation without any pruning so we always return a valid plan.
-		if (!std::isfinite(result.total_cost) && config_.enablePrune) {
+		// Retry unpruned when pruning either made the problem infeasible OR left only
+		// the degenerate answer.
+		//
+		// Infeasibility was the only condition checked, and it could never fire: the
+		// full [0..kBits-1] range is explicitly exempt from both prune tests, so
+		// dp[kBits] was always finite via j = 0 and the fallback was dead code.  Over-
+		// pruning therefore did not fail, it quietly returned a single full-width
+		// segment -- a plan that is valid, cheap to produce, and not what the DP was
+		// asked for.  A heuristic that is allowed to change the answer rather than
+		// the runtime has to notice when it has.
+		const bool degenerate = result.segments.size() == 1
+		                     && result.segments.front().bitStart == 0
+		                     && result.segments.front().bitEnd == kBits - 1;
+		if (config_.enablePrune && (!std::isfinite(result.total_cost) || degenerate)) {
 			if (config_.verboseLevel >= 1)
-				std::cout << "[Selector] Pruning yielded no feasible plan; retrying without pruning\n";
+				std::cout << "[Selector] Pruning yielded "
+				          << (degenerate ? "only the full-width segment" : "no feasible plan")
+				          << "; retrying without pruning\n";
 			fillBestCosts(false);
 			result = runSearch();
 		}
