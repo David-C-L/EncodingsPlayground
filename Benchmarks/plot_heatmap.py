@@ -36,10 +36,32 @@ import matplotlib.colors as mcolors
 import matplotlib.ticker as mticker
 from matplotlib.lines import Line2D
 from matplotlib.offsetbox import TextArea, HPacker, VPacker, AnnotationBbox
-from matplotlib.cm import ScalarMappable, get_cmap
-from scipy.interpolate import griddata
+from matplotlib.cm import ScalarMappable
 
-DEFAULT_CSV    = Path("Benchmarks/results/heatmap_benchmark.csv")
+# matplotlib >= 3.9 removed matplotlib.cm.get_cmap.  Same shim as
+# plot_gather_heatmap.py so both plotters run on current matplotlib.
+try:
+    import matplotlib
+    _get_cmap = matplotlib.colormaps.__getitem__
+except AttributeError:  # matplotlib < 3.9
+    from matplotlib.cm import get_cmap as _get_cmap
+
+
+def get_cmap(name):
+    return _get_cmap(name)
+
+
+# scipy is only needed by the interpolated figures.  It is not a hard dependency
+# of this script and is absent from the project venv, so a missing scipy skips
+# those figures rather than failing the whole run before any figure is written.
+try:
+    from scipy.interpolate import griddata
+    HAVE_SCIPY = True
+except ImportError:
+    griddata = None
+    HAVE_SCIPY = False
+
+DEFAULT_CSV    = Path("Benchmarks/results/bench_decode_range.csv")
 OUT_DIR        = Path("plots/motivational_heatmaps")
 INTERP_RES     = 500   # pixels on each axis for the interpolated grid
 HEATMAP_NCOLS  = 4     # subplots per row in grid layout
@@ -202,6 +224,10 @@ def _make_interp_figure(
     shared_legend: bool,
 ) -> None:
     """Grid of subplots ordered left-to-right, top-to-bottom by ascending compression ratio."""
+    if not HAVE_SCIPY:
+        print(f"  skipping interpolated figure {out_stem}: scipy is not installed",
+              file=sys.stderr)
+        return
     global_norm = _global_norm(df, encoders, metric) if shared_legend else None
     n     = len(encoders)
     ncols = min(n, HEATMAP_NCOLS)
@@ -707,7 +733,7 @@ def main() -> None:
         description="Plot range-access heatmaps, CDF, and strip plots for the "
                      "SubIntSplit motivation figure.")
     parser.add_argument("--input", type=Path, default=DEFAULT_CSV,
-                        help="Path to heatmap_benchmark.csv (default: %(default)s)")
+                        help="Path to bench_decode_range output (default: %(default)s)")
     parser.add_argument("--output", type=Path, default=OUT_DIR,
                         help="Directory to write plot files into (default: %(default)s)")
     parser.add_argument("--skip-interp", action="store_true",

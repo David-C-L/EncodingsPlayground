@@ -573,7 +573,7 @@ public:
 private:
     static bool verboseEnabled() {
         static bool v = (std::getenv("SUBINTSPLIT_VERBOSE") != nullptr);
-        return v || true;
+        return v;
     }
 
     struct ParsedHeader {
@@ -865,6 +865,41 @@ public:
     }
     void resetGatherProfilingAccum() override {
         if constexpr (kProfileSections) { gatherSkipNs_ = 0; gatherMatNs_ = 0; }
+    }
+
+    /// Per-section buffers held by the cached parsed header.
+    ///
+    /// These matter more here than for most codecs: parseHeader()'s slice() does
+    /// not hand out views into the encoded buffer, it *copies* each section's
+    /// bytes into a per-section EncodedBuffer that then survives across decodes.
+    /// The section codecs read those copies, not the payload, so a cold-payload
+    /// flush of the outer buffer cools memory nothing subsequently touches while
+    /// the bytes actually decoded stay resident — a SubIntSplit "cold" row would
+    /// otherwise be a hot row with extra steps.
+    ///
+    /// Section codecs are reached through ISectionCodecIntegral, which has no
+    /// internalBuffers() of its own, so any decoded state a section codec caches
+    /// (e.g. an inner FPE's index) is NOT enumerated here.  That is a deliberate
+    /// under-report rather than an over-report: the driver's fallback is an LLC
+    /// thrash, which cools those too, at the cost of also disturbing the TLB.
+    std::vector<std::span<const std::byte>> internalBuffers() const override {
+        std::vector<std::span<const std::byte>> out;
+        if (cachedOuterPtr_ == nullptr) return out;  // no decode yet: nothing cached
+        out.reserve(cachedHeader_.views.size() + 3);
+        for (const auto& v : cachedHeader_.views) {
+            const auto& bytes = v.data();
+            if (!bytes.empty())
+                out.emplace_back(reinterpret_cast<const std::byte*>(bytes.data()), bytes.size());
+        }
+        const auto push = [&out](const auto& vec) {
+            if (!vec.empty())
+                out.emplace_back(reinterpret_cast<const std::byte*>(vec.data()),
+                                 vec.size() * sizeof(typename std::decay_t<decltype(vec)>::value_type));
+        };
+        push(cachedHeader_.bits);
+        push(cachedHeader_.shifts);
+        push(cachedHeader_.bytes);
+        return out;
     }
 
     // Returns the number of threads to use, capped by both workUnits and the
@@ -1257,6 +1292,21 @@ class SubIntSplitAutoEncoder final : public Codec<T, uint8_t> {
 public:
     using Config = SubIntSplitAutoEncoderConfig<T>;
 
+    /// The plan this encoder actually used, valid after encode().
+    ///
+    /// Exposed because the alternative -- a caller re-running selection with its own
+    /// Config to find out what the encoder chose -- is not equivalent, and silently
+    /// so.  Two benchmark drivers did exactly that and disagreed about the segment
+    /// count of "the same" plan, because one of them set enablePrune and the other
+    /// did not.  Reading the resolved plan removes the opportunity for the question
+    /// and the answer to come from different selectors.
+    ///
+    /// Empty segments before the first encode, or when a preserved boundary list was
+    /// supplied instead of being selected.
+    const selectors::IDSubStreamEncodingSelector::Result& lastPlan() const noexcept {
+        return lastSelection_;
+    }
+
     explicit SubIntSplitAutoEncoder(Config cfg)
         : selector_(cfg.selectorConfig), samplerCfg_(cfg.samplerConfig), orderHint_(cfg.orderHint), debugLogging_(cfg.debugLogging),
           selectionTimingEnabled_(cfg.enableSelectionTiming), parallelism_(cfg.parallelism),
@@ -1352,6 +1402,14 @@ public:
         return impl_ ? impl_->gatherMaterializeTimeNs() : -1;
     }
     void resetGatherProfilingAccum() override { if (impl_) impl_->resetGatherProfilingAccum(); }
+
+    /// Forwarded, not defaulted: the auto wrapper owns no buffers of its own, but
+    /// leaving the base's empty implementation in place would silently downgrade
+    /// every AutoSIS cold-all row to an LLC thrash while the resolved inner
+    /// encoder was perfectly able to enumerate its sections.
+    std::vector<std::span<const std::byte>> internalBuffers() const override {
+        return impl_ ? impl_->internalBuffers() : std::vector<std::span<const std::byte>>{};
+    }
 
     void reset() override {
         impl_.reset();
@@ -1673,6 +1731,19 @@ makeAutoSubIntSplitCostModelsFromTypes(const std::vector<encodings::EncodingType
     return models;
 }
 
+/// Optional per-encoding cost-grid dump path, from $SUBINTSPLIT_COST_GRID_CSV.
+///
+/// This used to be hardcoded to a repo-relative path in every
+/// makeDefaultAutoSubIntSplit* helper, and the selector THROWS when it cannot
+/// open the file for writing (IDSubStreamEncodingSelector.hpp) -- so an AutoSIS
+/// encoder only worked in a process whose working directory happened to sit
+/// exactly one level below the repo root.  A debugging artifact must not decide
+/// whether encoding succeeds, so it is opt-in and absent by default.
+inline std::optional<std::string> costGridCsvPathFromEnv() {
+    if (const char* p = std::getenv("SUBINTSPLIT_COST_GRID_CSV"); p && *p) return std::string{p};
+    return std::nullopt;
+}
+
 template <typename T>
 inline typename SubIntSplitAutoEncoder<T>::Config makeDefaultAutoSubIntSplitConfig(BitSplitOrder order = BitSplitOrder::LSB_TO_MSB,
                                                                          bool enableSelectionTiming = false,
@@ -1681,7 +1752,7 @@ inline typename SubIntSplitAutoEncoder<T>::Config makeDefaultAutoSubIntSplitConf
                                                                          bool allowReorderers = true) {
     typename SubIntSplitAutoEncoder<T>::Config cfg;
     cfg.selectorConfig = selectors::IDSubStreamEncodingSelector::Config{}; // defaults
-    cfg.selectorConfig.verboseLevel = 1; // leave quiet by default; enable when debugging
+    cfg.selectorConfig.verboseLevel = 0; // quiet by default; raise when debugging
     cfg.selectorConfig.minSegmentWidth = 1; // avoid tiny slices that inflate headers/rounding
     cfg.selectorConfig.splitPenalty = 100.0; // discourage excessive splitting (heavier for MSB)
     cfg.selectorConfig.enableMergePhase = false; // merge adjacent in MSB mode to reduce fragmentation
@@ -1721,7 +1792,7 @@ inline typename SubIntSplitAutoEncoder<T>::Config makeDefaultAutoSubIntSplitConf
 {
     typename SubIntSplitAutoEncoder<T>::Config cfg;
     cfg.selectorConfig = selectors::IDSubStreamEncodingSelector::Config{};
-    cfg.selectorConfig.verboseLevel = 1;
+    cfg.selectorConfig.verboseLevel = 0;
     cfg.selectorConfig.minSegmentWidth = 1;
     cfg.selectorConfig.enableMergePhase = false;
     cfg.samplerConfig.maxSamples = 10'000;
@@ -1753,7 +1824,7 @@ inline std::shared_ptr<SubIntSplitAutoEncoder<T>> makeDefaultAutoSubIntSplitEnco
     cfg.selectorConfig.orderHint = order;
     cfg.selectorConfig.useExhaustiveSearch = exhaustiveSearch;
     cfg.selectorConfig.enablePrune = enablePrune;
-    cfg.selectorConfig.costGridCsvPath = "../Source/encoders/auto_subintsplit_cost_grid_twitter_snowflake_64.csv"; // for debugging/analysis; selector will log evaluated candidates and their costs
+    cfg.selectorConfig.costGridCsvPath = costGridCsvPathFromEnv(); // opt-in via $SUBINTSPLIT_COST_GRID_CSV
     return makeAutoSubIntSplitEncoder<T>(std::move(cfg));
 }
 
@@ -1770,7 +1841,7 @@ inline std::shared_ptr<SubIntSplitAutoEncoder<T>> makeDefaultAutoSubIntSplitEnco
     cfg.selectorConfig.orderHint          = order;
     cfg.selectorConfig.useExhaustiveSearch = exhaustiveSearch;
     cfg.selectorConfig.enablePrune         = enablePrune;
-    cfg.selectorConfig.costGridCsvPath     = "../Source/encoders/auto_subintsplit_cost_grid_twitter_snowflake_64.csv";
+    cfg.selectorConfig.costGridCsvPath     = costGridCsvPathFromEnv();
     return makeAutoSubIntSplitEncoder<T>(std::move(cfg));
 }
 
@@ -1806,7 +1877,7 @@ inline std::shared_ptr<SubIntSplitAutoEncoderProf<T>> makeDefaultAutoSubIntSplit
     cfg.selectorConfig.orderHint          = order;
     cfg.selectorConfig.useExhaustiveSearch = exhaustiveSearch;
     cfg.selectorConfig.enablePrune         = enablePrune;
-    cfg.selectorConfig.costGridCsvPath     = "../Source/encoders/auto_subintsplit_cost_grid_twitter_snowflake_64.csv";
+    cfg.selectorConfig.costGridCsvPath     = costGridCsvPathFromEnv();
     cfg.parallelism                        = parallelism;
     return makeAutoSubIntSplitEncoderProf<T>(std::move(cfg));
 }
@@ -1825,7 +1896,7 @@ inline std::shared_ptr<SubIntSplitAutoEncoderProf<T>> makeDefaultAutoSubIntSplit
     cfg.selectorConfig.orderHint          = order;
     cfg.selectorConfig.useExhaustiveSearch = exhaustiveSearch;
     cfg.selectorConfig.enablePrune         = enablePrune;
-    cfg.selectorConfig.costGridCsvPath     = "../Source/encoders/auto_subintsplit_cost_grid_twitter_snowflake_64.csv";
+    cfg.selectorConfig.costGridCsvPath     = costGridCsvPathFromEnv();
     cfg.parallelism                        = parallelism;
     return makeAutoSubIntSplitEncoderProf<T>(std::move(cfg));
 }

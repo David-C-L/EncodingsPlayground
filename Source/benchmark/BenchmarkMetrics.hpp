@@ -51,7 +51,7 @@ struct TimingMetrics {
  *     BenchmarkConfig::measureMemory is true, in a pass separate from timing).
  *
  * "Peak" fields report the highest heap usage above the pre-operation baseline
- * as sampled by a background thread (see PeakHeapTracker).
+ * as sampled via ScopedAllocationTrack around the operation.
  * "NetDelta" fields report the net change in live heap bytes between the start
  * and the end of the operation (i.e. allocations that were not freed before
  * the operation returned, such as the output buffer itself).
@@ -318,9 +318,11 @@ struct BenchmarkConfig {
     /// When true, each benchmark is run a second time (after timing) to measure
     /// heap usage per phase. The extra pass does not affect timing results.
     bool measureMemory{true};
-    /// Sampling interval (µs) for the background peak-heap tracker. Smaller
-    /// values capture short-lived spikes but increase mallinfo2 lock contention.
-    size_t memorySampleIntervalMicros{1000};
+    /// Seed for every random choice this runner makes (random-access indices,
+    /// range starts).  It used to seed from std::random_device while the memory
+    /// pass used a hardcoded mt19937(42), so the timing pass and the memory pass
+    /// measured different ranges and no run could be reproduced.
+    uint64_t seed{42};
 
     // VTune instrumentation (only active when built with -DVTUNE_ENABLED=ON)
     VTuneConfig vtune{};

@@ -29,11 +29,18 @@ add_subdirectory(Source/reorderers)
 add_subdirectory(Source/benchmark)
 add_subdirectory(Source/experiments)
 
+# enable_testing() must precede every add_subdirectory that registers a test.
+# It used to sit inside the BUILD_TESTS block below, after Benchmarks was added,
+# so every add_test() in Benchmarks/CMakeLists.txt was silently ignored -- the
+# BenchmarkSuite and MapBenchmarkSuite entries had never actually run under ctest.
+if(BUILD_TESTS)
+    enable_testing()
+endif()
+
 if(BUILD_BENCHMARKS)
     add_subdirectory(Benchmarks)
 endif()
 
 if(BUILD_TESTS)
-    enable_testing()
     add_subdirectory(Tests)
 endif()

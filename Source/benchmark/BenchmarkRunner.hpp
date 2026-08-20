@@ -66,7 +66,7 @@ template<typename T>
 class BenchmarkRunner {
 public:
     explicit BenchmarkRunner(BenchmarkConfig config = BenchmarkConfig{})
-        : config_(config), rng_(std::random_device{}()) {}
+        : config_(config), rng_(config.seed) {}
     
     /**
      * @brief Register an encoder for benchmarking
@@ -564,10 +564,10 @@ private:
     /**
      * @brief Re-runs every workload (encode, bulk decode, random/strided/range
      *        access) in a dedicated pass, measuring heap usage with a background
-     *        PeakHeapTracker.  All results are written into result.metrics.memory.
+     *        ScopedAllocationTrack.  All results are written into result.metrics.memory.
      *
      * This method must be called *after* all timing measurements so that the
-     * PeakHeapTracker's background thread (and any malloc_trim calls) cannot
+     * the allocation hooks (and any malloc_trim calls) cannot
      * interfere with latency measurements.
      */
     void measureMemoryUsage(
@@ -648,7 +648,7 @@ private:
             } else {
                 indices.resize(n);
                 std::iota(indices.begin(), indices.end(), 0);
-                std::mt19937 fixedRng(42);
+                std::mt19937 fixedRng(static_cast<std::mt19937::result_type>(config_.seed));
                 std::shuffle(indices.begin(), indices.end(), fixedRng);
             }
             size_t samplesToTest = std::min({config_.randomAccessSamples,
@@ -712,7 +712,7 @@ private:
                     if (++queryCount >= config_.rangeQueryCount) break;
                 }
             } else {
-                std::mt19937 fixedRng(42);
+                std::mt19937 fixedRng(static_cast<std::mt19937::result_type>(config_.seed));
                 for (size_t rangeSize : config_.rangeSizes) {
                     if (rangeSize > n) continue;
                     for (size_t q = 0; q < config_.rangeQueryCount; ++q) {

@@ -18,13 +18,19 @@
 #include "encodings/EncodingType.hpp"
 #include "core/DataType.hpp"
 
-#if defined(__has_include)
-#if __has_include(<openzl/openzl.h>)
+// HAVE_OPENZL is defined by the build (ENCODINGS_ENABLE_OPENZL in
+// Source/encoders/CMakeLists.txt), never here.  Defining it in this header
+// behind a __has_include probe made it order-dependent: a translation unit
+// whose own `#ifdef HAVE_OPENZL` came before its transitive include of this
+// file compiled as though OpenZL were absent, silently dropping encoders.
+#ifdef HAVE_OPENZL
+#if defined(__has_include) && !__has_include(<openzl/openzl.h>)
+#error "HAVE_OPENZL is defined but <openzl/openzl.h> is not on the include path. \
+Check OPENZL_REPO, or configure with -DENCODINGS_ENABLE_OPENZL=OFF."
+#endif
 #include <openzl/openzl.h>
 #include <openzl/zl_reflection.h>
 #include <openzl/codecs/zl_generic.h>
-#define HAVE_OPENZL
-#endif
 #endif
 
 namespace encodings::encoders {
