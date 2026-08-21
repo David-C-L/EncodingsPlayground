@@ -287,6 +287,53 @@ Datasets: `XMarkPrePostElements`, `XMarkPrePostFull` (level:8|pre:28|post:28 bit
 | none | 27_plus_CascadingFORPrevHuffmanEncoding | CascadingFORPrevHuffmanEncoding | 28 | 356,360 | 4.49 | 0.223 | 1.0 |
 | none | 28_plus_CascadingFORPrevFSEEncoding | CascadingFORPrevFSEEncoding | 29 | 356,360 | 4.49 | 0.223 | 1.0 |
 
+## bench_openzl_graph: what OpenZL's internal codec-DAG selects
+
+Run with `--validate`, `--n 200000`, default level (0). Unlike every other driver here, OpenZL is not a single registered codec but a *graph selector* over its own internal transform/entropy-coder library -- this shows what it actually composed, as a concrete answer to "what does OpenZL have that we don't."
+
+### XMarkPrePostElements
+
+Selected graph: `zl.select_numeric` -- 3.40 bits/element (ratio 0.0531x, i.e. 18.8x compression).
+
+| step | codec | output_bytes | share_% |
+|---|---|---|---|
+| 0 | `zl.convert_num_to_struct_le` | 1,600,000 | 1882.2 |
+| 1 | `zl.field_lz` | 1,600,000 | 1882.2 |
+| 2 | `zl.transpose_split` | 1,600,000 | 1882.2 |
+| 3 | `zl.convert_serial_to_num8` | 1,400,000 | 1646.9 |
+| 4 | `zl.delta_int` | 1,399,993 | 1646.9 |
+| 5 | `zl.convert_num_to_serial_le` | 1,399,993 | 1646.9 |
+| 6 | `zl.private.zstd` | 84,850 | 99.8 |
+| 7 | `zl.private.constant_serial` | 1 | 0.0 |
+| 8 | `zl.convert_struct_to_serial` | 0 | 0.0 |
+
+### XMarkPrePostFull
+
+Selected graph: `zl.select_numeric` -- 2.89 bits/element (ratio 0.0451x, i.e. 22.2x compression).
+
+| step | codec | output_bytes | share_% |
+|---|---|---|---|
+| 0 | `zl.convert_num_to_struct_le` | 1,600,000 | 2217.6 |
+| 1 | `zl.field_lz` | 1,600,000 | 2217.6 |
+| 2 | `zl.transpose_split` | 1,600,000 | 2217.6 |
+| 3 | `zl.convert_serial_to_num8` | 1,400,000 | 1940.4 |
+| 4 | `zl.delta_int` | 1,399,993 | 1940.4 |
+| 5 | `zl.convert_num_to_serial_le` | 1,399,993 | 1940.4 |
+| 6 | `zl.private.zstd` | 71,991 | 99.8 |
+| 7 | `zl.private.constant_serial` | 1 | 0.0 |
+| 8 | `zl.convert_struct_to_serial` | 0 | 0.0 |
+
+**Techniques this repo's codec registry has no equivalent for, used in the pipeline above:**
+
+- **delta_int**: delta coding applied per byte-plane rather than on the raw element -- this repo's FrameOfReference/CascadingFOR family delta the whole element, not a single byte-plane of it
+
+- **field_lz**: a field-level LZ dedup pass ahead of the numeric pipeline -- no registered codec runs LZ-style dedup before its own transform
+
+- **transpose_split**: byte-plane transposition (split each element into its N byte-planes, treating byte position k across all elements as its own sub-array) -- no reorderer or section codec in this registry does this; SubStreamReordererType only offers None/BWT512, both of which operate on whole elements, never on a byte-plane slice
+
+
+The plain `Zstd` baseline in this sweep applies zstd directly to the raw interleaved 8-byte-per-element stream and gets only 1.31x-1.32x. OpenZL applies the same zstd *after* byte-plane transposition and per-plane delta coding and gets 18.8x-22.2x -- the entropy coder isn't the differentiator, the decorrelating transform ahead of it is. This is a more general, higher-leverage gap than the narrow "Sequence codec" idea above: a byte-plane transpose reorderer (offered to SubIntSplit's DP the same way BWT512 already is) would let *any* downstream section codec see per-byte-plane structure, not just a dedicated arithmetic-sequence codec for `pre` specifically.
+
 ## Best codec per metric per dataset (summary)
 
 | driver | dataset | metric | best_codec | value |
