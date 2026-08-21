@@ -44,17 +44,25 @@ DRIVER_METRICS = {
 }
 
 AUTOSIS_DEFAULT_SAMPLE_NOTE = (
-    "AutoSIS_LSB/AutoSIS_MSB use the registry's *default* 100,000-sample "
-    "AutoSIS config. `Benchmarks/drivers/FINDINGS.md` documents this default "
-    "collapsing to a degenerate single full-width section on near-unique "
-    "high-cardinality ids (measured on Twitter Snowflake: 64.13 bits/element, "
-    "worse than Raw) due to an open entropy-cost-model defect at that sample "
-    "size. XMark's `pre`/`post` fields are similarly high-cardinality across "
-    "16-32M rows, so a compression_ratio for AutoSIS_LSB/MSB at or worse than "
-    "Raw's is very likely this same known issue, not a real finding about SIS "
-    "on tree ids -- treat the bench_ablation numbers below (10,000-sample "
-    "fresh DP runs) as the more trustworthy signal for what SIS actually wants "
-    "to do here."
+    "**Fixed this session** (commit `0c5ef99`): AutoSIS_LSB/AutoSIS_MSB used to "
+    "use the registry's *default* 100,000-sample AutoSIS config. "
+    "`Benchmarks/drivers/FINDINGS.md` documents this collapsing to a "
+    "degenerate single full-width section on near-unique high-cardinality ids "
+    "(measured on Twitter Snowflake: 64.13 bits/element, worse than Raw) due "
+    "to an open entropy-cost-model defect at that sample size -- independently "
+    "reproduced on XMark's `pre`/`post` fields (16-32M rows, similarly "
+    "high-cardinality): the same degenerate `BWT<512>|Raw` single section, "
+    "0.998x. `makeDefaultAutoSubIntSplitConfig`'s compression-only overload "
+    "defaulted `maxSamples` to 100,000 while its CostModelSet-overload sibling "
+    "already defaulted to 10,000 for the same reason -- an inconsistency, not "
+    "an intentional choice. Lowering it to 10,000 (matching the sibling "
+    "overload and this session's own ablation runs) fixes it: **25.81-26.10 "
+    "bits/element, 2.45-2.48x**, a real 5-section plan (`RawBitPacked` + "
+    "`RunLength` + `BWT<512>|AdaptiveDictionary` + `BWT<512>|RunLength` + "
+    "`BWT<512>|BlockFSE`), `FastSkip` retained, validated round-trip. The "
+    "numbers throughout this report for `AutoSIS_LSB`/`AutoSIS_MSB` are all "
+    "**post-fix**, except where noted otherwise. bench_smoke (19/19) still "
+    "passes -- this only changes which plan the DP picks, not correctness."
 )
 
 AUTOSIS_ACCESS_LATENCY_NOTE = (
@@ -342,6 +350,24 @@ def build_oracle_section(results_dir: Path) -> str:
         "newly admitted codec's cost estimate mis-ranks against its true byte "
         "cost, exactly what this oracle comparison measures directly.\n")
 
+    lines.append(
+        "\n**Is the oracle's number just an artifact of a too-small (2,000-"
+        "element) sample?** Tested directly: reran with `--sample-sizes "
+        "10000` (same default 7-codec set). Sample size is *not* the "
+        "explanation -- if anything the larger sample made the oracle's own "
+        "best plan slightly *worse*: on `XMarkPrePostElements`, "
+        "`oracle_consec` went from 17.24 bits/elem (2,000-sample) to 20.83 "
+        "bits/elem (10,000-sample). The larger sample revealed a wider true "
+        "value range that some segments hadn't seen at 2,000 elements -- e.g. "
+        "bits `[0-7]` (`RawEncoding`) needed 6.14 bits/elem at 2,000 samples "
+        "but 7.78 at 10,000 (7 bits is enough to encode values up to 127; the "
+        "2,000-sample view of that bit range apparently never saw a value "
+        "needing the 8th bit, the 10,000-sample view did). The 2,000-sample "
+        "number was, if anything, a mild *underestimate* of the true cost, "
+        "not an artifact hiding a better answer. The gap between the oracle's "
+        "best (row 4 above, ~3.7x) and the ablation's best (row 3, 6.54x) is "
+        "the smaller 7-codec candidate set, not sample size.\n")
+
     return "\n".join(lines)
 
 
@@ -403,19 +429,21 @@ def build_full_choice_comparison(results_dir: Path) -> str:
                      f"-> delta-code each plane -> zstd each plane. (Full step table "
                      f"above, in bench_openzl_graph.)\n")
 
-        # SIS as shipped: the registered AutoSIS entry, default 100K-sample config.
+        # SIS as shipped: the registered AutoSIS entry, now the fixed 10K-sample
+        # config (commit 0c5ef99 -- see AUTOSIS_DEFAULT_SAMPLE_NOTE above).
         default_row = comp[(comp["dataset"] == dataset) & (comp["encoding"] == "AutoSIS_LSB")]
-        sec_row = sections[(sections["dataset"] == dataset) &
-                            (sections["encoding"] == "AutoSIS_LSB_Prof")]
-        if not default_row.empty and not sec_row.empty:
+        sec_rows = sections[(sections["dataset"] == dataset) &
+                            (sections["encoding"] == "AutoSIS_LSB_Prof")].sort_values("section_index")
+        if not default_row.empty and not sec_rows.empty:
             bpe = 64 / default_row["compression_ratio"].iloc[0]
-            enc = sec_row["section_encoding"].iloc[0]
+            plan_str = " + ".join(
+                f"[{int(r['bit_lo'])}-{int(r['bit_hi'])}]`{r['section_encoding']}`"
+                for _, r in sec_rows.iterrows())
             lines.append(f"**2. SIS as shipped today** (`AutoSIS_LSB`, registry's default "
-                         f"100,000-sample config, real, validated): **{bpe:.2f} bits/elem, "
-                         f"{default_row['compression_ratio'].iloc[0]:.3f}x**. Full plan: "
-                         f"one section, the whole column, `{enc}` -- BWT-reordered then left "
-                         f"**uncompressed** (`Raw`). This is the known FINDINGS.md "
-                         f"100K-sample collapse (see the note near the top).\n")
+                         f"config, **now 10,000 samples** -- fixed this session, see the note "
+                         f"near the top -- real, validated): **{bpe:.2f} bits/elem, "
+                         f"{default_row['compression_ratio'].iloc[0]:.3f}x**, `FastSkip` kept. "
+                         f"Full plan ({len(sec_rows)} sections): {plan_str}.\n")
 
         # SIS's best Auto: the best plan bench_ablation's DP actually found and validated.
         abl = ablation[ablation["dataset"] == dataset]
@@ -456,16 +484,23 @@ def build_full_choice_comparison(results_dir: Path) -> str:
     lines.append(
         "**In simple terms:** OpenZL wins mainly because it has a technique "
         "(byte-plane transpose) nothing here has. But look at rows 2-4 for SIS "
-        "itself: the version that actually ships today (row 2) gets essentially "
-        "*nothing* (a bug -- the default sample size collapses to giving up and "
-        "storing the data raw). Letting the same DP search a much bigger set of "
-        "codecs (row 3) recovers most of the usable gap on its own, no new "
-        "capability needed, while still preserving FastSkip. Row 4 (the oracle) "
-        "looks *worse* than row 3 only because it was restricted to a smaller "
-        "7-codec set for cost reasons -- it is not proof the oracle is weak, it "
-        "is more evidence that codec-set size and selection quality both matter, "
-        "separately, and both are currently costing real compression that has "
-        "nothing to do with missing a transpose.\n")
+        "itself. Row 2, what actually ships today, *used to* get essentially "
+        "*nothing* (a bug -- the default sample size collapsed to giving up and "
+        "storing the data raw); that bug is now fixed (this session, see the "
+        "note near the top), and row 2 gets a real 2.45-2.48x on its own, no "
+        "new capability needed. Row 3 -- letting the same kind of DP search a "
+        "much bigger set of codecs -- climbs further, to 6.54x, still keeping "
+        "FastSkip. Row 4 (the oracle) looks *worse* than both because it was "
+        "restricted to a smaller 7-codec set for cost reasons -- it is not "
+        "proof the oracle is weak (a larger, 10,000-element sample for the "
+        "oracle made its own answer slightly *worse*, not better, so sample "
+        "size isn't the explanation either -- see the oracle sample-size note "
+        "below). Codec-set size clearly matters a lot (row 2 to row 3); how "
+        "much selection accuracy alone is still costing, independent of set "
+        "size, is what `bench_costmodel_oracle`'s per-cell accuracy numbers "
+        "(not the row-4 full-plan comparison) actually measure, and none of "
+        "this has anything to do with the missing transpose that separates "
+        "SIS from OpenZL.\n")
 
     return "\n".join(lines)
 
@@ -546,6 +581,12 @@ def main() -> None:
             out_lines.append("_no results_\n")
             continue
         collapsed = collapse(df, ["dataset", "encoding"], metric_cols)
+        present = set(collapsed["dataset"].unique())
+        missing = {"XMarkPrePostElements", "XMarkPrePostFull"} - present
+        if missing:
+            out_lines.append(f"> _No data for {', '.join(sorted(missing))} in this "
+                             f"driver's latest run -- see the run log for why (e.g. "
+                             f"a slow cell was interrupted rather than waited out)._\n")
         for dataset in sorted(collapsed["dataset"].unique()):
             sub = collapsed[collapsed["dataset"] == dataset].sort_values("encoding")
             out_lines.append(f"### {dataset}\n")

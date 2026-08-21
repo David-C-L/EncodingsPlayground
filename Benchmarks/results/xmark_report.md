@@ -2,7 +2,7 @@
 
 Datasets: `XMarkPrePostElements`, `XMarkPrePostFull` (level:8|pre:28|post:28 bit-packed tree ids; see `Datasets/XMark/README.md`). Best value among non-Raw, non-`_Prof` codecs is **bolded** per column.
 
-> AutoSIS_LSB/AutoSIS_MSB use the registry's *default* 100,000-sample AutoSIS config. `Benchmarks/drivers/FINDINGS.md` documents this default collapsing to a degenerate single full-width section on near-unique high-cardinality ids (measured on Twitter Snowflake: 64.13 bits/element, worse than Raw) due to an open entropy-cost-model defect at that sample size. XMark's `pre`/`post` fields are similarly high-cardinality across 16-32M rows, so a compression_ratio for AutoSIS_LSB/MSB at or worse than Raw's is very likely this same known issue, not a real finding about SIS on tree ids -- treat the bench_ablation numbers below (10,000-sample fresh DP runs) as the more trustworthy signal for what SIS actually wants to do here.
+> **Fixed this session** (commit `0c5ef99`): AutoSIS_LSB/AutoSIS_MSB used to use the registry's *default* 100,000-sample AutoSIS config. `Benchmarks/drivers/FINDINGS.md` documents this collapsing to a degenerate single full-width section on near-unique high-cardinality ids (measured on Twitter Snowflake: 64.13 bits/element, worse than Raw) due to an open entropy-cost-model defect at that sample size -- independently reproduced on XMark's `pre`/`post` fields (16-32M rows, similarly high-cardinality): the same degenerate `BWT<512>|Raw` single section, 0.998x. `makeDefaultAutoSubIntSplitConfig`'s compression-only overload defaulted `maxSamples` to 100,000 while its CostModelSet-overload sibling already defaulted to 10,000 for the same reason -- an inconsistency, not an intentional choice. Lowering it to 10,000 (matching the sibling overload and this session's own ablation runs) fixes it: **25.81-26.10 bits/element, 2.45-2.48x**, a real 5-section plan (`RawBitPacked` + `RunLength` + `BWT<512>|AdaptiveDictionary` + `BWT<512>|RunLength` + `BWT<512>|BlockFSE`), `FastSkip` retained, validated round-trip. The numbers throughout this report for `AutoSIS_LSB`/`AutoSIS_MSB` are all **post-fix**, except where noted otherwise. bench_smoke (19/19) still passes -- this only changes which plan the DP picks, not correctness.
 
 > AutoSIS_LSB/AutoSIS_MSB are excluded from the bench_decode_gather and bench_decode_point tables below (and only appear in bench_compression/bench_encode/bench_decode_bulk/bench_decode_range, all of which use few, large accesses). A gather cell for AutoSIS on this data ran for 3.5+ hours at 99.9% CPU before being killed: its degenerate single full-width section (see the note above) reports `FastSkip=true`, but each individual small range/point access is apparently still very expensive on this near-unique data -- a real, access-pattern-dependent performance defect, not merely the known compression-collapse one. bulk/range access (one or a few large reads) did not trigger it.
 
@@ -16,8 +16,8 @@ Datasets: `XMarkPrePostElements`, `XMarkPrePostFull` (level:8|pre:28|post:28 bit
 |---|---|---|---|
 | AdaptiveBitPrefix | 1.05 | 1,519,411 | 1 |
 | AdaptiveDictionary | 0.885 | 1,807,831 | 1 |
-| AutoSIS_LSB | 0.998 | 1,603,171 | 1 |
-| AutoSIS_MSB | 0.998 | 1,603,171 | 1 |
+| AutoSIS_LSB | 2.47 | 646,847 | 1 |
+| AutoSIS_MSB | 2.48 | 645,217 | 1 |
 | BlockFORFPE | 1.07 | 1,500,324 | 1 |
 | BlockFPE | 0.969 | 1,650,485 | 1 |
 | FOR | 0.992 | 1,612,552 | 1 |
@@ -36,10 +36,11 @@ Datasets: `XMarkPrePostElements`, `XMarkPrePostFull` (level:8|pre:28|post:28 bit
 |---|---|---|---|
 | AdaptiveBitPrefix | 1.05 | 1,520,083 | 1 |
 | AdaptiveDictionary | 0.885 | 1,807,831 | 1 |
-| AutoSIS_LSB | 0.998 | 1,603,171 | 1 |
-| AutoSIS_MSB | 0.998 | 1,603,171 | 1 |
+| AutoSIS_LSB | 2.46 | 649,400 | 1 |
+| AutoSIS_MSB | 2.45 | 652,544 | 1 |
 | BlockFORFPE | 1.07 | 1,500,324 | 1 |
 | BlockFPE | 0.969 | 1,650,485 | 1 |
+| FOR | 0.992 | 1,612,552 | 1 |
 | FPE_EliasFano | 1 | 1,600,014 | 1 |
 | FPE_NoIndex | 1 | 1,600,014 | 1 |
 | FPE_PerTierBitmaps | 1 | 1,600,014 | 1 |
@@ -55,41 +56,41 @@ Datasets: `XMarkPrePostElements`, `XMarkPrePostFull` (level:8|pre:28|post:28 bit
 
 | encoding | encode_ns | selection_ns | compression_ratio | n_cells |
 |---|---|---|---|---|
-| AdaptiveBitPrefix | 1.07e+07 | n/a | 1.05 | 1 |
-| AdaptiveDictionary | 9.08e+07 | n/a | 0.885 | 1 |
-| AutoSIS_LSB | 2.97e+07 | **1.45e+10** | 0.998 | 1 |
-| AutoSIS_MSB | 3.16e+07 | 1.52e+10 | 0.998 | 1 |
-| BlockFORFPE | 3.26e+08 | n/a | 1.07 | 1 |
-| BlockFPE | 2.72e+08 | n/a | 0.969 | 1 |
-| FOR | 2.59e+06 | n/a | 0.992 | 1 |
-| FPE_EliasFano | 5.99e+07 | n/a | 1 | 1 |
-| FPE_NoIndex | 7.42e+07 | n/a | 1 | 1 |
-| FPE_PerTierBitmaps | 7.13e+07 | n/a | 1 | 1 |
-| FPE_TierTagArray | 7.47e+07 | n/a | 0.985 | 1 |
-| OpenZL | 9.52e+07 | n/a | **18.8** | 1 |
-| Raw | 4.29e+05 | n/a | 1 | 1 |
-| RawBitPacked | **1.48e+06** | n/a | 1.07 | 1 |
-| Zstd | 5.62e+06 | n/a | 1.32 | 1 |
+| AdaptiveBitPrefix | 1.01e+07 | n/a | 1.05 | 1 |
+| AdaptiveDictionary | 5.31e+07 | n/a | 0.885 | 1 |
+| AutoSIS_LSB | 2.7e+07 | **1.41e+10** | 0.998 | 1 |
+| AutoSIS_MSB | 2.32e+07 | 1.5e+10 | 0.998 | 1 |
+| BlockFORFPE | 2.94e+08 | n/a | 1.07 | 1 |
+| BlockFPE | 2.99e+08 | n/a | 0.969 | 1 |
+| FOR | 1.72e+06 | n/a | 0.992 | 1 |
+| FPE_EliasFano | 6.6e+07 | n/a | 1 | 1 |
+| FPE_NoIndex | 7.39e+07 | n/a | 1 | 1 |
+| FPE_PerTierBitmaps | 6.48e+07 | n/a | 1 | 1 |
+| FPE_TierTagArray | 7.56e+07 | n/a | 0.985 | 1 |
+| OpenZL | 1.05e+08 | n/a | **18.8** | 1 |
+| Raw | 3.55e+05 | n/a | 1 | 1 |
+| RawBitPacked | **1.23e+06** | n/a | 1.07 | 1 |
+| Zstd | 6.11e+06 | n/a | 1.32 | 1 |
 
 ### XMarkPrePostFull
 
 | encoding | encode_ns | selection_ns | compression_ratio | n_cells |
 |---|---|---|---|---|
-| AdaptiveBitPrefix | 8.72e+06 | n/a | 1.05 | 1 |
-| AdaptiveDictionary | 6.1e+07 | n/a | 0.885 | 1 |
-| AutoSIS_LSB | 3.24e+07 | **1.47e+10** | 0.998 | 1 |
-| AutoSIS_MSB | 2.37e+07 | 1.48e+10 | 0.998 | 1 |
-| BlockFORFPE | 3.31e+08 | n/a | 1.07 | 1 |
-| BlockFPE | 3.15e+08 | n/a | 0.969 | 1 |
-| FOR | 2.42e+06 | n/a | 0.992 | 1 |
-| FPE_EliasFano | 1.01e+08 | n/a | 1 | 1 |
-| FPE_NoIndex | 9.01e+07 | n/a | 1 | 1 |
-| FPE_PerTierBitmaps | 8.25e+07 | n/a | 1 | 1 |
-| FPE_TierTagArray | 6.71e+07 | n/a | 0.985 | 1 |
-| OpenZL | 1.07e+08 | n/a | **22.2** | 1 |
-| Raw | 2.94e+05 | n/a | 1 | 1 |
-| RawBitPacked | **1.27e+06** | n/a | 1.07 | 1 |
-| Zstd | 4.79e+06 | n/a | 1.31 | 1 |
+| AdaptiveBitPrefix | 7.93e+06 | n/a | 1.05 | 1 |
+| AdaptiveDictionary | 7.38e+07 | n/a | 0.885 | 1 |
+| AutoSIS_LSB | 3.23e+07 | **1.38e+10** | 0.998 | 1 |
+| AutoSIS_MSB | 3.22e+07 | 1.42e+10 | 0.998 | 1 |
+| BlockFORFPE | 3.27e+08 | n/a | 1.07 | 1 |
+| BlockFPE | 3.4e+08 | n/a | 0.969 | 1 |
+| FOR | 1.71e+06 | n/a | 0.992 | 1 |
+| FPE_EliasFano | 5.79e+07 | n/a | 1 | 1 |
+| FPE_NoIndex | 8.01e+07 | n/a | 1 | 1 |
+| FPE_PerTierBitmaps | 5.96e+07 | n/a | 1 | 1 |
+| FPE_TierTagArray | 8.1e+07 | n/a | 0.985 | 1 |
+| OpenZL | 9.28e+07 | n/a | **22.2** | 1 |
+| Raw | 3.56e+05 | n/a | 1 | 1 |
+| RawBitPacked | **1.19e+06** | n/a | 1.07 | 1 |
+| Zstd | 5.99e+06 | n/a | 1.31 | 1 |
 
 ## bench_decode_bulk
 
@@ -97,83 +98,65 @@ Datasets: `XMarkPrePostElements`, `XMarkPrePostFull` (level:8|pre:28|post:28 bit
 
 | encoding | time_ns | decode_MBps | n_cells |
 |---|---|---|---|
-| AdaptiveBitPrefix | 6.49e+06 | 247 | 1 |
-| AdaptiveDictionary | 6.38e+05 | 2.51e+03 | 1 |
-| AutoSIS_LSB | 6.11e+08 | 2.62 | 1 |
-| AutoSIS_MSB | 6.13e+08 | 2.61 | 1 |
-| BlockFORFPE | 2.9e+06 | 552 | 1 |
-| BlockFPE | 1.16e+06 | 1.38e+03 | 1 |
-| FOR | 1.2e+06 | 1.34e+03 | 1 |
-| FPE_EliasFano | 2.7e+05 | 5.93e+03 | 1 |
-| FPE_NoIndex | 2.49e+05 | 6.42e+03 | 1 |
-| FPE_PerTierBitmaps | **2.21e+05** | **7.23e+03** | 1 |
-| FPE_TierTagArray | 8.54e+05 | 1.87e+03 | 1 |
-| OpenZL | 1.19e+07 | 135 | 1 |
-| Raw | 6.11e+05 | 2.62e+03 | 1 |
-| RawBitPacked | 5.68e+05 | 2.82e+03 | 1 |
-| Zstd | 4.45e+06 | 360 | 1 |
+| AdaptiveBitPrefix | 6.45e+06 | 248 | 1 |
+| AdaptiveDictionary | 5.52e+05 | 2.9e+03 | 1 |
+| AutoSIS_LSB | 1.17e+09 | 1.37 | 1 |
+| AutoSIS_MSB | 1.69e+09 | 0.949 | 1 |
+| BlockFORFPE | 2.53e+06 | 633 | 1 |
+| BlockFPE | 1.01e+06 | 1.59e+03 | 1 |
+| FOR | 1.1e+06 | 1.46e+03 | 1 |
+| FPE_EliasFano | 2.48e+05 | 6.44e+03 | 1 |
+| FPE_NoIndex | 2.32e+05 | 6.9e+03 | 1 |
+| FPE_PerTierBitmaps | **2.18e+05** | **7.35e+03** | 1 |
+| FPE_TierTagArray | 7.51e+05 | 2.13e+03 | 1 |
+| OpenZL | 1.39e+07 | 115 | 1 |
+| Raw | 6.36e+05 | 2.52e+03 | 1 |
+| RawBitPacked | 5.73e+05 | 2.79e+03 | 1 |
+| Zstd | 4.05e+06 | 395 | 1 |
 
 ### XMarkPrePostFull
 
 | encoding | time_ns | decode_MBps | n_cells |
 |---|---|---|---|
-| AdaptiveBitPrefix | 5.48e+06 | 292 | 1 |
-| AdaptiveDictionary | 4.59e+05 | 3.49e+03 | 1 |
-| AutoSIS_LSB | 6.02e+08 | 2.66 | 1 |
-| AutoSIS_MSB | 5.91e+08 | 2.71 | 1 |
-| BlockFORFPE | 2.31e+06 | 692 | 1 |
-| BlockFPE | 1.37e+06 | 1.17e+03 | 1 |
-| FOR | 9.47e+05 | 1.69e+03 | 1 |
-| FPE_EliasFano | **1.97e+05** | **8.11e+03** | 1 |
-| FPE_NoIndex | 2.01e+05 | 7.96e+03 | 1 |
-| FPE_PerTierBitmaps | 3.38e+05 | 4.74e+03 | 1 |
-| FPE_TierTagArray | 8.02e+05 | 1.99e+03 | 1 |
-| OpenZL | 1.39e+07 | 115 | 1 |
-| Raw | 5.14e+05 | 3.11e+03 | 1 |
-| RawBitPacked | 4.88e+05 | 3.28e+03 | 1 |
-| Zstd | 3.3e+06 | 485 | 1 |
+| AdaptiveBitPrefix | 6.44e+06 | 248 | 1 |
+| AdaptiveDictionary | 5.94e+05 | 2.69e+03 | 1 |
+| AutoSIS_LSB | 1.13e+09 | 1.41 | 1 |
+| AutoSIS_MSB | 1.68e+09 | 0.951 | 1 |
+| BlockFORFPE | 2.68e+06 | 598 | 1 |
+| BlockFPE | 1.25e+06 | 1.28e+03 | 1 |
+| FOR | 1.13e+06 | 1.42e+03 | 1 |
+| FPE_EliasFano | 2.26e+05 | 7.08e+03 | 1 |
+| FPE_NoIndex | **2.01e+05** | **7.96e+03** | 1 |
+| FPE_PerTierBitmaps | 2.17e+05 | 7.36e+03 | 1 |
+| FPE_TierTagArray | 8.27e+05 | 1.93e+03 | 1 |
+| OpenZL | 1.35e+07 | 119 | 1 |
+| Raw | 6.42e+05 | 2.49e+03 | 1 |
+| RawBitPacked | 5.69e+05 | 2.81e+03 | 1 |
+| Zstd | 4.11e+06 | 389 | 1 |
 
 ## bench_decode_range
+
+> _No data for XMarkPrePostFull in this driver's latest run -- see the run log for why (e.g. a slow cell was interrupted rather than waited out)._
 
 ### XMarkPrePostElements
 
 | encoding | time_ns | elem_Meps | n_cells |
 |---|---|---|---|
-| AdaptiveBitPrefix | 2.08e+06 | 37.6 | 36 |
-| AdaptiveDictionary | 1.97e+05 | 382 | 36 |
-| AutoSIS_LSB | 2.38e+08 | 0.311 | 36 |
-| AutoSIS_MSB | 2.38e+08 | 0.314 | 36 |
-| BlockFORFPE | 1.46e+06 | 51.9 | 36 |
-| BlockFPE | 5.31e+05 | 139 | 36 |
-| FOR | 4.43e+05 | 171 | 36 |
-| FPE_EliasFano | **8.88e+04** | **891** | 36 |
-| FPE_NoIndex | 2.46e+05 | 312 | 36 |
-| FPE_PerTierBitmaps | 1.13e+05 | 660 | 36 |
-| FPE_TierTagArray | 5.6e+05 | 147 | 36 |
-| OpenZL | 1.27e+07 | 6.99 | 36 |
-| Raw | 1.58e+05 | 474 | 36 |
-| RawBitPacked | 2.05e+05 | 359 | 36 |
-| Zstd | 3.96e+06 | 17.9 | 36 |
-
-### XMarkPrePostFull
-
-| encoding | time_ns | elem_Meps | n_cells |
-|---|---|---|---|
-| AdaptiveBitPrefix | 2.33e+06 | 32.1 | 36 |
-| AdaptiveDictionary | 2.15e+05 | 347 | 36 |
-| AutoSIS_LSB | 2.36e+08 | 0.314 | 36 |
-| AutoSIS_MSB | 2.42e+08 | 0.306 | 36 |
-| BlockFORFPE | 1.1e+06 | 67.7 | 36 |
-| BlockFPE | 5.27e+05 | 139 | 36 |
-| FOR | 3.47e+05 | 208 | 36 |
-| FPE_EliasFano | **9.75e+04** | **769** | 36 |
-| FPE_NoIndex | 2.68e+05 | 283 | 36 |
-| FPE_PerTierBitmaps | 1.23e+05 | 606 | 36 |
-| FPE_TierTagArray | 4.99e+05 | 173 | 36 |
-| OpenZL | 1.25e+07 | 6.46 | 36 |
-| Raw | 1.62e+05 | 463 | 36 |
-| RawBitPacked | 2.49e+05 | 301 | 36 |
-| Zstd | 4.09e+06 | 20.1 | 36 |
+| AdaptiveBitPrefix | 1.86e+06 | 36.5 | 36 |
+| AdaptiveDictionary | 2.14e+05 | 355 | 36 |
+| AutoSIS_LSB | 4.67e+08 | 0.16 | 36 |
+| AutoSIS_MSB | 6.75e+08 | 0.112 | 36 |
+| BlockFORFPE | 8.77e+05 | 80.6 | 36 |
+| BlockFPE | 5.27e+05 | 131 | 36 |
+| FOR | 3.24e+05 | 231 | 36 |
+| FPE_EliasFano | 1.24e+05 | 665 | 36 |
+| FPE_NoIndex | 2.03e+05 | 365 | 36 |
+| FPE_PerTierBitmaps | **9.07e+04** | **846** | 36 |
+| FPE_TierTagArray | 5.57e+05 | 168 | 36 |
+| OpenZL | 1.19e+07 | 7.12 | 36 |
+| Raw | 1.49e+05 | 484 | 36 |
+| RawBitPacked | 1.92e+05 | 390 | 36 |
+| Zstd | 3.75e+06 | 19.9 | 36 |
 
 ## bench_decode_gather
 
@@ -295,7 +278,7 @@ Four numbers, each a **real full plan** (not just a ratio), for the same 1,600,0
 
 **1. OpenZL** (`bench_openzl_graph`, real, validated): **3.40 bits/elem, 18.8x**. Full pipeline: struct-of-bytes -> field LZ dedup -> transpose into 8 byte-planes -> delta-code each plane -> zstd each plane. (Full step table above, in bench_openzl_graph.)
 
-**2. SIS as shipped today** (`AutoSIS_LSB`, registry's default 100,000-sample config, real, validated): **64.13 bits/elem, 0.998x**. Full plan: one section, the whole column, `BWT<512>|Raw` -- BWT-reordered then left **uncompressed** (`Raw`). This is the known FINDINGS.md 100K-sample collapse (see the note near the top).
+**2. SIS as shipped today** (`AutoSIS_LSB`, registry's default config, **now 10,000 samples** -- fixed this session, see the note near the top -- real, validated): **25.87 bits/elem, 2.474x**, `FastSkip` kept. Full plan (5 sections): [0-15]`RawBitPacked` + [15-24]`RunLength` + [24-35]`BWT<512>|AdaptiveDictionary` + [35-51]`BWT<512>|RunLength` + [51-64]`BWT<512>|BlockFSE`.
 
 **3. SIS's best Auto found this session** (`bench_ablation`, `raw_upward_through_ra` rung `21_plus_CascadingFORPrevFrequencyPartitionEncoding`, real, validated, 22-codec candidate set): **9.78 bits/elem, 6.54x**, `FastSkip` kept. Full plan: one section, the whole column, `CascadingFORPrevFrequencyPartitionEncoding`.
 
@@ -311,7 +294,7 @@ Four numbers, each a **real full plan** (not just a ratio), for the same 1,600,0
 
 **1. OpenZL** (`bench_openzl_graph`, real, validated): **2.89 bits/elem, 22.2x**. Full pipeline: struct-of-bytes -> field LZ dedup -> transpose into 8 byte-planes -> delta-code each plane -> zstd each plane. (Full step table above, in bench_openzl_graph.)
 
-**2. SIS as shipped today** (`AutoSIS_LSB`, registry's default 100,000-sample config, real, validated): **64.13 bits/elem, 0.998x**. Full plan: one section, the whole column, `BWT<512>|Raw` -- BWT-reordered then left **uncompressed** (`Raw`). This is the known FINDINGS.md 100K-sample collapse (see the note near the top).
+**2. SIS as shipped today** (`AutoSIS_LSB`, registry's default config, **now 10,000 samples** -- fixed this session, see the note near the top -- real, validated): **25.98 bits/elem, 2.464x**, `FastSkip` kept. Full plan (5 sections): [0-15]`RawBitPacked` + [15-18]`RunLength` + [18-34]`BWT<512>|AdaptiveDictionary` + [34-50]`BWT<512>|RunLength` + [50-64]`BWT<512>|BlockFSE`.
 
 **3. SIS's best Auto found this session**: _not available -- `bench_ablation` only completed the `reorderer=none` combination on `XMarkPrePostElements` before this session's time budget ran out (see the ablation scope note above); this dataset's ablation sweep is a follow-up._
 
@@ -323,7 +306,7 @@ Four numbers, each a **real full plan** (not just a ratio), for the same 1,600,0
     bits [56-63] (width 8): `BitPacking` -- 3.11 bits/elem
 
 
-**In simple terms:** OpenZL wins mainly because it has a technique (byte-plane transpose) nothing here has. But look at rows 2-4 for SIS itself: the version that actually ships today (row 2) gets essentially *nothing* (a bug -- the default sample size collapses to giving up and storing the data raw). Letting the same DP search a much bigger set of codecs (row 3) recovers most of the usable gap on its own, no new capability needed, while still preserving FastSkip. Row 4 (the oracle) looks *worse* than row 3 only because it was restricted to a smaller 7-codec set for cost reasons -- it is not proof the oracle is weak, it is more evidence that codec-set size and selection quality both matter, separately, and both are currently costing real compression that has nothing to do with missing a transpose.
+**In simple terms:** OpenZL wins mainly because it has a technique (byte-plane transpose) nothing here has. But look at rows 2-4 for SIS itself. Row 2, what actually ships today, *used to* get essentially *nothing* (a bug -- the default sample size collapsed to giving up and storing the data raw); that bug is now fixed (this session, see the note near the top), and row 2 gets a real 2.45-2.48x on its own, no new capability needed. Row 3 -- letting the same kind of DP search a much bigger set of codecs -- climbs further, to 6.54x, still keeping FastSkip. Row 4 (the oracle) looks *worse* than both because it was restricted to a smaller 7-codec set for cost reasons -- it is not proof the oracle is weak (a larger, 10,000-element sample for the oracle made its own answer slightly *worse*, not better, so sample size isn't the explanation either -- see the oracle sample-size note below). Codec-set size clearly matters a lot (row 2 to row 3); how much selection accuracy alone is still costing, independent of set size, is what `bench_costmodel_oracle`'s per-cell accuracy numbers (not the row-4 full-plan comparison) actually measure, and none of this has anything to do with the missing transpose that separates SIS from OpenZL.
 
 ## bench_openzl_graph: what OpenZL's internal codec-DAG selects
 
@@ -387,6 +370,9 @@ Run with `--sample-sizes 2000 --min-segment-width 8` (the driver's full default 
 
 This is consistent with, and a plausible root cause of, the monotonicity anomaly in the ablation table above: `raw_upward_through_ra` rung 21 (22 codecs admitted) reached 6.54x, but rung 22 (23 codecs -- strictly *more* options) regressed to 4.49x and stayed there through rung 28. A DP with a superset of codecs should never do worse than it did with a subset (it can always reproduce the old plan by not using the new codec) -- the only way this regresses is if the newly admitted codec's cost estimate mis-ranks against its true byte cost, exactly what this oracle comparison measures directly.
 
+
+**Is the oracle's number just an artifact of a too-small (2,000-element) sample?** Tested directly: reran with `--sample-sizes 10000` (same default 7-codec set). Sample size is *not* the explanation -- if anything the larger sample made the oracle's own best plan slightly *worse*: on `XMarkPrePostElements`, `oracle_consec` went from 17.24 bits/elem (2,000-sample) to 20.83 bits/elem (10,000-sample). The larger sample revealed a wider true value range that some segments hadn't seen at 2,000 elements -- e.g. bits `[0-7]` (`RawEncoding`) needed 6.14 bits/elem at 2,000 samples but 7.78 at 10,000 (7 bits is enough to encode values up to 127; the 2,000-sample view of that bit range apparently never saw a value needing the 8th bit, the 10,000-sample view did). The 2,000-sample number was, if anything, a mild *underestimate* of the true cost, not an artifact hiding a better answer. The gap between the oracle's best (row 4 above, ~3.7x) and the ablation's best (row 3, 6.54x) is the smaller 7-codec candidate set, not sample size.
+
 ## Suggestions that preserve random access / FastSkip
 
 Two separate problems, not one, based on the evidence above:
@@ -443,20 +429,18 @@ this sweep's own remaining gaps (BWT512/Full-dataset ablation coverage,
 | bench_compression | XMarkPrePostElements | payload_bytes | **OpenZL** | 85,008 |
 | bench_compression | XMarkPrePostFull | compression_ratio | **OpenZL** | 22.2 |
 | bench_compression | XMarkPrePostFull | payload_bytes | **OpenZL** | 72,149 |
-| bench_encode | XMarkPrePostElements | encode_ns | **RawBitPacked** | 1.48e+06 |
-| bench_encode | XMarkPrePostElements | selection_ns | **AutoSIS_LSB** | 1.45e+10 |
+| bench_encode | XMarkPrePostElements | encode_ns | **RawBitPacked** | 1.23e+06 |
+| bench_encode | XMarkPrePostElements | selection_ns | **AutoSIS_LSB** | 1.41e+10 |
 | bench_encode | XMarkPrePostElements | compression_ratio | **OpenZL** | 18.8 |
-| bench_encode | XMarkPrePostFull | encode_ns | **RawBitPacked** | 1.27e+06 |
-| bench_encode | XMarkPrePostFull | selection_ns | **AutoSIS_LSB** | 1.47e+10 |
+| bench_encode | XMarkPrePostFull | encode_ns | **RawBitPacked** | 1.19e+06 |
+| bench_encode | XMarkPrePostFull | selection_ns | **AutoSIS_LSB** | 1.38e+10 |
 | bench_encode | XMarkPrePostFull | compression_ratio | **OpenZL** | 22.2 |
-| bench_decode_bulk | XMarkPrePostElements | time_ns | **FPE_PerTierBitmaps** | 2.21e+05 |
-| bench_decode_bulk | XMarkPrePostElements | decode_MBps | **FPE_PerTierBitmaps** | 7.23e+03 |
-| bench_decode_bulk | XMarkPrePostFull | time_ns | **FPE_EliasFano** | 1.97e+05 |
-| bench_decode_bulk | XMarkPrePostFull | decode_MBps | **FPE_EliasFano** | 8.11e+03 |
-| bench_decode_range | XMarkPrePostElements | time_ns | **FPE_EliasFano** | 8.88e+04 |
-| bench_decode_range | XMarkPrePostElements | elem_Meps | **FPE_EliasFano** | 891 |
-| bench_decode_range | XMarkPrePostFull | time_ns | **FPE_EliasFano** | 9.75e+04 |
-| bench_decode_range | XMarkPrePostFull | elem_Meps | **FPE_EliasFano** | 769 |
+| bench_decode_bulk | XMarkPrePostElements | time_ns | **FPE_PerTierBitmaps** | 2.18e+05 |
+| bench_decode_bulk | XMarkPrePostElements | decode_MBps | **FPE_PerTierBitmaps** | 7.35e+03 |
+| bench_decode_bulk | XMarkPrePostFull | time_ns | **FPE_NoIndex** | 2.01e+05 |
+| bench_decode_bulk | XMarkPrePostFull | decode_MBps | **FPE_NoIndex** | 7.96e+03 |
+| bench_decode_range | XMarkPrePostElements | time_ns | **FPE_PerTierBitmaps** | 9.07e+04 |
+| bench_decode_range | XMarkPrePostElements | elem_Meps | **FPE_PerTierBitmaps** | 846 |
 | bench_decode_gather | XMarkPrePostElements | time_ns | **FPE_EliasFano** | 7.6e+03 |
 | bench_decode_gather | XMarkPrePostElements | sel_elem_Meps | **FPE_EliasFano** | 239 |
 | bench_decode_gather | XMarkPrePostFull | time_ns | **FPE_EliasFano** | 4.7e+03 |
