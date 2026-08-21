@@ -23,9 +23,11 @@
 #include "encodings/EncodingProperty.hpp"
 #include "encodings/EncodingType.hpp"
 
+#include "encoders/AdaptiveDictionaryEncoder.hpp"
 #include "encoders/AdaptiveFramedBitPrefixEncoder.hpp"
 #include "encoders/BlockFORFPEEncoder.hpp"
 #include "encoders/BlockFrequencyPartitionEncoder.hpp"
+#include "encoders/FOREncoder.hpp"
 #include "encoders/FrequencyPartitionEncoder.hpp"
 #include "encoders/OpenZLEncoder.hpp"
 #include "encoders/RawBitPackedEncoder.hpp"
@@ -133,6 +135,18 @@ inline std::vector<EncoderEntry<int64_t>> baselineEncoders() {
                                     std::make_shared<BlockFORFPEEncoder<Elem>>(),
                                     "baseline", /*variant=*/{}, /*knownBroken=*/true));
     e.push_back(detail::entry<Elem>("Zstd", std::make_shared<ZstdEncoder<Elem>>(), "baseline"));
+    e.push_back(detail::entry<Elem>("AdaptiveDictionary",
+                                    std::make_shared<AdaptiveDictionaryEncoder<Elem>>(),
+                                    "baseline"));
+    {
+        // Whole-column FOR: TOut=Elem (no narrowing, we haven't profiled a safe
+        // residual width for an arbitrary dataset) with a Raw sub-encoder for the
+        // residual stream, mirroring the construction idiom already used for
+        // SubIntSplit's FOR section codec (SubIntEncodingUtils.hpp).
+        FORConfig<Elem, Elem> cfg{.subEncoder = std::make_shared<RawEncoder<Elem>>()};
+        e.push_back(detail::entry<Elem>(
+            "FOR", std::make_shared<FOREncoder<Elem, Elem, 128>>(cfg), "baseline"));
+    }
 #ifdef HAVE_OPENZL
     e.push_back(detail::entry<Elem>("OpenZL", makeOpenZLCodec<Elem>(), "baseline", /*variant=*/{},
                                     /*knownBroken=*/false, /*sequentialOverride=*/true));
