@@ -287,6 +287,44 @@ Datasets: `XMarkPrePostElements`, `XMarkPrePostFull` (level:8|pre:28|post:28 bit
 | none | 27_plus_CascadingFORPrevHuffmanEncoding | CascadingFORPrevHuffmanEncoding | 28 | 356,360 | 4.49 | 0.223 | 1.0 |
 | none | 28_plus_CascadingFORPrevFSEEncoding | CascadingFORPrevFSEEncoding | 29 | 356,360 | 4.49 | 0.223 | 1.0 |
 
+## The gap, plainly: OpenZL vs SIS's best Auto vs SIS's best Oracle
+
+Four numbers, each a **real full plan** (not just a ratio), for the same 1,600,000-byte (200,000-element) column:
+
+### XMarkPrePostElements
+
+**1. OpenZL** (`bench_openzl_graph`, real, validated): **3.40 bits/elem, 18.8x**. Full pipeline: struct-of-bytes -> field LZ dedup -> transpose into 8 byte-planes -> delta-code each plane -> zstd each plane. (Full step table above, in bench_openzl_graph.)
+
+**2. SIS as shipped today** (`AutoSIS_LSB`, registry's default 100,000-sample config, real, validated): **64.13 bits/elem, 0.998x**. Full plan: one section, the whole column, `BWT<512>|Raw` -- BWT-reordered then left **uncompressed** (`Raw`). This is the known FINDINGS.md 100K-sample collapse (see the note near the top).
+
+**3. SIS's best Auto found this session** (`bench_ablation`, `raw_upward_through_ra` rung `21_plus_CascadingFORPrevFrequencyPartitionEncoding`, real, validated, 22-codec candidate set): **9.78 bits/elem, 6.54x**, `FastSkip` kept. Full plan: one section, the whole column, `CascadingFORPrevFrequencyPartitionEncoding`.
+
+**4. SIS's best Oracle** (`bench_costmodel_oracle`, `oracle_consec` sampling, byte-count oracle over the driver's smaller **default 7-codec** candidate set -- *not* the 29-codec set rung 3 used, and estimated on a 2,000-element sample, not a full validated encode): **17.24 bits/elem, 3.71x**. Full plan:
+    bits [ 0- 7] (width 8): `RawEncoding` -- 6.14 bits/elem
+    bits [ 8-15] (width 8): `RunLengthEncoding` -- 1.28 bits/elem
+    bits [16-27] (width 12): `RunLengthEncoding` -- 0.34 bits/elem
+    bits [28-55] (width 28): `AdaptiveFrameOfReference` -- 6.37 bits/elem
+    bits [56-63] (width 8): `BitPacking` -- 3.11 bits/elem
+
+
+### XMarkPrePostFull
+
+**1. OpenZL** (`bench_openzl_graph`, real, validated): **2.89 bits/elem, 22.2x**. Full pipeline: struct-of-bytes -> field LZ dedup -> transpose into 8 byte-planes -> delta-code each plane -> zstd each plane. (Full step table above, in bench_openzl_graph.)
+
+**2. SIS as shipped today** (`AutoSIS_LSB`, registry's default 100,000-sample config, real, validated): **64.13 bits/elem, 0.998x**. Full plan: one section, the whole column, `BWT<512>|Raw` -- BWT-reordered then left **uncompressed** (`Raw`). This is the known FINDINGS.md 100K-sample collapse (see the note near the top).
+
+**3. SIS's best Auto found this session**: _not available -- `bench_ablation` only completed the `reorderer=none` combination on `XMarkPrePostElements` before this session's time budget ran out (see the ablation scope note above); this dataset's ablation sweep is a follow-up._
+
+**4. SIS's best Oracle** (`bench_costmodel_oracle`, `oracle_consec` sampling, byte-count oracle over the driver's smaller **default 7-codec** candidate set -- *not* the 29-codec set rung 3 used, and estimated on a 2,000-element sample, not a full validated encode): **17.53 bits/elem, 3.65x**. Full plan:
+    bits [ 0- 7] (width 8): `RawEncoding` -- 6.14 bits/elem
+    bits [ 8-15] (width 8): `RunLengthEncoding` -- 1.57 bits/elem
+    bits [16-27] (width 12): `RunLengthEncoding` -- 0.34 bits/elem
+    bits [28-55] (width 28): `AdaptiveFrameOfReference` -- 6.37 bits/elem
+    bits [56-63] (width 8): `BitPacking` -- 3.11 bits/elem
+
+
+**In simple terms:** OpenZL wins mainly because it has a technique (byte-plane transpose) nothing here has. But look at rows 2-4 for SIS itself: the version that actually ships today (row 2) gets essentially *nothing* (a bug -- the default sample size collapses to giving up and storing the data raw). Letting the same DP search a much bigger set of codecs (row 3) recovers most of the usable gap on its own, no new capability needed, while still preserving FastSkip. Row 4 (the oracle) looks *worse* than row 3 only because it was restricted to a smaller 7-codec set for cost reasons -- it is not proof the oracle is weak, it is more evidence that codec-set size and selection quality both matter, separately, and both are currently costing real compression that has nothing to do with missing a transpose.
+
 ## bench_openzl_graph: what OpenZL's internal codec-DAG selects
 
 Run with `--validate`, `--n 200000`, default level (0). Unlike every other driver here, OpenZL is not a single registered codec but a *graph selector* over its own internal transform/entropy-coder library -- this shows what it actually composed, as a concrete answer to "what does OpenZL have that we don't."

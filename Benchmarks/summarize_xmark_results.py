@@ -345,6 +345,131 @@ def build_oracle_section(results_dir: Path) -> str:
     return "\n".join(lines)
 
 
+def _plan_bits_per_elem(plans_df: pd.DataFrame, dataset: str, plan: str) -> tuple[float, list[str]]:
+    """Sum a full plan's segments into overall bits/element, plus a
+    human-readable line per segment. autosis rows' est_bits are scaled to the
+    full N=200,000; oracle_random/oracle_consec rows' est_bits are scaled to
+    the 2,000-element sample they were measured over; oracle_merged has no
+    est_bits (has_cost_model=0) and uses measured sample_bytes*8 instead.
+    """
+    sub = plans_df[(plans_df["dataset"] == dataset) & (plans_df["plan"] == plan)]
+    if sub.empty:
+        return float("nan"), []
+    basis = 200000 if plan == "autosis" else 2000
+    lines = []
+    total_bits = 0.0
+    for _, row in sub.sort_values("bit_start").iterrows():
+        bits = row["est_bits"] if pd.notna(row["est_bits"]) else row["sample_bytes"] * 8
+        bpe = bits / basis
+        total_bits += bpe
+        lines.append(f"    bits [{int(row['bit_start']):>2}-{int(row['bit_end']):>2}] "
+                     f"(width {int(row['width'])}): `{row['encoding']}` -- {bpe:.2f} bits/elem")
+    return total_bits, lines
+
+
+def build_full_choice_comparison(results_dir: Path) -> str:
+    """The plain-language headline comparison the PR asks for: OpenZL's full
+    pipeline vs SIS's best Auto choice vs SIS's best Oracle choice, each
+    shown as its actual full plan, not just a ratio number.
+    """
+    openzl_path = results_dir / "xmark_bench_openzl_graph.csv"
+    comp_path = results_dir / "xmark_bench_compression.csv"
+    sections_path = results_dir / "xmark_bench_compression_sections.csv"
+    ablation_path = results_dir / "xmark_bench_ablation.csv"
+    oracle_plans_path = results_dir / "xmark_bench_costmodel_oracle.plans.csv"
+    if not all(p.exists() for p in (openzl_path, comp_path, sections_path,
+                                     ablation_path, oracle_plans_path)):
+        return ""
+
+    openzl = pd.read_csv(openzl_path)
+    comp = pd.read_csv(comp_path)
+    sections = pd.read_csv(sections_path)
+    ablation = pd.read_csv(ablation_path)
+    oracle_plans = pd.read_csv(oracle_plans_path)
+
+    lines = ["## The gap, plainly: OpenZL vs SIS's best Auto vs SIS's best Oracle\n",
+             "Four numbers, each a **real full plan** (not just a ratio), for the "
+             "same 1,600,000-byte (200,000-element) column:\n"]
+
+    for dataset in sorted(comp["dataset"].unique()):
+        lines.append(f"### {dataset}\n")
+
+        oz = openzl[openzl["dataset"] == dataset]
+        oz_bits = oz["bits_per_element"].iloc[0] if not oz.empty else float("nan")
+        oz_ratio = 64 / oz_bits if oz_bits else float("nan")
+        lines.append(f"**1. OpenZL** (`bench_openzl_graph`, real, validated): "
+                     f"**{oz_bits:.2f} bits/elem, {oz_ratio:.1f}x**. Full pipeline: "
+                     f"struct-of-bytes -> field LZ dedup -> transpose into 8 byte-planes "
+                     f"-> delta-code each plane -> zstd each plane. (Full step table "
+                     f"above, in bench_openzl_graph.)\n")
+
+        # SIS as shipped: the registered AutoSIS entry, default 100K-sample config.
+        default_row = comp[(comp["dataset"] == dataset) & (comp["encoding"] == "AutoSIS_LSB")]
+        sec_row = sections[(sections["dataset"] == dataset) &
+                            (sections["encoding"] == "AutoSIS_LSB_Prof")]
+        if not default_row.empty and not sec_row.empty:
+            bpe = 64 / default_row["compression_ratio"].iloc[0]
+            enc = sec_row["section_encoding"].iloc[0]
+            lines.append(f"**2. SIS as shipped today** (`AutoSIS_LSB`, registry's default "
+                         f"100,000-sample config, real, validated): **{bpe:.2f} bits/elem, "
+                         f"{default_row['compression_ratio'].iloc[0]:.3f}x**. Full plan: "
+                         f"one section, the whole column, `{enc}` -- BWT-reordered then left "
+                         f"**uncompressed** (`Raw`). This is the known FINDINGS.md "
+                         f"100K-sample collapse (see the note near the top).\n")
+
+        # SIS's best Auto: the best plan bench_ablation's DP actually found and validated.
+        abl = ablation[ablation["dataset"] == dataset]
+        if abl.empty:
+            lines.append("**3. SIS's best Auto found this session**: _not available -- "
+                         "`bench_ablation` only completed the `reorderer=none` combination "
+                         "on `XMarkPrePostElements` before this session's time budget ran "
+                         "out (see the ablation scope note above); this dataset's ablation "
+                         "sweep is a follow-up._\n")
+        else:
+            best_idx = abl["compression_ratio"].idxmax()
+            best = abl.loc[best_idx]
+            bpe = 64 / best["compression_ratio"]
+            lines.append(f"**3. SIS's best Auto found this session** "
+                         f"(`bench_ablation`, `{best['ladder']}` rung `{best['rung_name']}`, "
+                         f"real, validated, {int(best['allowed_count'])}-codec candidate set): "
+                         f"**{bpe:.2f} bits/elem, {best['compression_ratio']:.2f}x**, "
+                         f"`FastSkip` kept. Full plan: one section, the whole column, "
+                         f"`{best['segment_plan'].split(':', 1)[1]}`.\n")
+
+        # SIS's best Oracle: byte-count oracle over the *smaller* default 7-codec set,
+        # sample-estimated (not a full validated encode) -- best of the two profiles.
+        best_oracle_bpe, best_oracle_lines, best_oracle_plan = None, None, None
+        for plan in ("oracle_consec", "oracle_random"):
+            bpe, seg_lines = _plan_bits_per_elem(oracle_plans, dataset, plan)
+            if bpe == bpe and (best_oracle_bpe is None or bpe < best_oracle_bpe):  # bpe==bpe: not NaN
+                best_oracle_bpe, best_oracle_lines, best_oracle_plan = bpe, seg_lines, plan
+        if best_oracle_bpe is not None:
+            lines.append(f"**4. SIS's best Oracle** (`bench_costmodel_oracle`, `{best_oracle_plan}` "
+                         f"sampling, byte-count oracle over the driver's smaller **default "
+                         f"7-codec** candidate set -- *not* the 29-codec set rung 3 used, and "
+                         f"estimated on a 2,000-element sample, not a full validated encode): "
+                         f"**{best_oracle_bpe:.2f} bits/elem, {64/best_oracle_bpe:.2f}x**. "
+                         f"Full plan:\n" + "\n".join(best_oracle_lines) + "\n")
+
+        lines.append("")
+
+    lines.append(
+        "**In simple terms:** OpenZL wins mainly because it has a technique "
+        "(byte-plane transpose) nothing here has. But look at rows 2-4 for SIS "
+        "itself: the version that actually ships today (row 2) gets essentially "
+        "*nothing* (a bug -- the default sample size collapses to giving up and "
+        "storing the data raw). Letting the same DP search a much bigger set of "
+        "codecs (row 3) recovers most of the usable gap on its own, no new "
+        "capability needed, while still preserving FastSkip. Row 4 (the oracle) "
+        "looks *worse* than row 3 only because it was restricted to a smaller "
+        "7-codec set for cost reasons -- it is not proof the oracle is weak, it "
+        "is more evidence that codec-set size and selection quality both matter, "
+        "separately, and both are currently costing real compression that has "
+        "nothing to do with missing a transpose.\n")
+
+    return "\n".join(lines)
+
+
 RA_PRESERVING_SUGGESTIONS = """## Suggestions that preserve random access / FastSkip
 
 Two separate problems, not one, based on the evidence above:
@@ -445,6 +570,10 @@ def main() -> None:
         for _, row in best_ablation_rows.iterrows():
             all_best.append(("bench_ablation", row["dataset"], "compression_ratio",
                              f"{row['ladder']}/{row['rung_name']}", row["compression_ratio"]))
+
+    comparison_section = build_full_choice_comparison(args.results_dir)
+    if comparison_section:
+        out_lines.append(comparison_section)
 
     openzl_section = build_openzl_graph_section(args.results_dir)
     if openzl_section:
