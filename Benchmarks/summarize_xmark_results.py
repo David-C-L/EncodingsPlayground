@@ -285,6 +285,116 @@ def build_openzl_graph_section(results_dir: Path) -> str:
     return "\n".join(lines)
 
 
+def build_oracle_section(results_dir: Path) -> str:
+    """bench_costmodel_oracle: is the SIS-vs-OpenZL gap a selection defect
+    (same codecs, wrong pick) or a missing-capability one? Distinct question
+    from build_openzl_graph_section above, which answers "what capability is
+    missing"; this answers "are we even using the capabilities we have well."
+    """
+    path = results_dir / "xmark_bench_costmodel_oracle.summary.csv"
+    if not path.exists():
+        return ""
+    df = pd.read_csv(path)
+    df = df[df["dataset"].str.startswith("XMarkPrePost")]
+    if df.empty:
+        return ""
+
+    lines = ["## bench_costmodel_oracle: is the gap selection or capability?\n",
+             "Run with `--sample-sizes 2000 --min-segment-width 8` (the driver's "
+             "full default grid is ~300K sample encodes and impractical here; "
+             "`min-segment-width 8` shrinks the candidate grid to ~23K, still "
+             "the `default` 7-type candidate set only, not `extended`). Compares "
+             "AutoSIS's analytical cost-model ranking against a true byte-count "
+             "oracle over the *same* candidate segments -- this isolates "
+             "selection accuracy from codec-universe coverage.\n"]
+
+    header = ["dataset", "profile", "top1_accuracy", "spearman_rho",
+              "mean_abs_rel_err", "regret_bytes_extrapolated"]
+    rows = ["| " + " | ".join(header) + " |", "|" + "|".join(["---"] * len(header)) + "|"]
+    for _, row in df.sort_values(["dataset", "profile"]).iterrows():
+        rows.append("| " + " | ".join([
+            row["dataset"], row["profile"],
+            f"{row['top1_accuracy']:.0%}", f"{row['spearman_rho']:.3f}",
+            f"{row['mean_abs_rel_err']:.1%}", f"{row['regret_bytes_extrapolated']:,.0f}",
+        ]) + " |")
+    lines.append("\n".join(rows) + "\n")
+
+    lines.append(
+        "`top1_accuracy` (47-77%, worst on `random`-profile sampling) is the "
+        "cost model's #1-ranked candidate matching the oracle's actual #1 "
+        "*less than 4 times out of 5* -- SubIntSplit is regularly not using the "
+        "best segment plan even among the codecs it already has. On the "
+        "`random` profile, `regret_bytes_extrapolated` (~273KB) is comparable "
+        "in size to the *entire* best compressed output this sweep found "
+        "(244,547 bytes, bench_ablation rung 21) -- a plausible order-of-"
+        "magnitude estimate of how much selection error alone could be costing, "
+        "separate from any missing capability. The `consec` profile shows far "
+        "less regret (651 bytes / 0 bytes), so the practical impact depends on "
+        "which sampling profile AutoSIS's production config actually uses for "
+        "this kind of high-cardinality tree-id data.\n\n"
+        "This is consistent with, and a plausible root cause of, the "
+        "monotonicity anomaly in the ablation table above: `raw_upward_"
+        "through_ra` rung 21 (22 codecs admitted) reached 6.54x, but rung 22 "
+        "(23 codecs -- strictly *more* options) regressed to 4.49x and stayed "
+        "there through rung 28. A DP with a superset of codecs should never do "
+        "worse than it did with a subset (it can always reproduce the old plan "
+        "by not using the new codec) -- the only way this regresses is if the "
+        "newly admitted codec's cost estimate mis-ranks against its true byte "
+        "cost, exactly what this oracle comparison measures directly.\n")
+
+    return "\n".join(lines)
+
+
+RA_PRESERVING_SUGGESTIONS = """## Suggestions that preserve random access / FastSkip
+
+Two separate problems, not one, based on the evidence above:
+
+1. **Selection accuracy** (`bench_costmodel_oracle` above): the cost model's
+   top pick matches the true byte-count oracle only 47-77% of the time on
+   the *same* candidate codecs, and probably explains the ablation's rung
+   21-to-22 regression (6.54x -> 4.49x when admitting one more codec). This
+   is a pure bug-fix path with no capability change and no FastSkip
+   trade-off at all: investigate the cost model for the codec types that
+   enter at rung 22+ (`CascadingFORPrevBlockFrequencyPartitionEncoding`,
+   `HuffmanEncoding`, `FSEEncoding`, ...) the same way FINDINGS.md already
+   diagnosed the 65,536-unique-value entropy-estimator cap for AutoSIS's
+   default 100K-sample collapse -- this is very likely the same family of
+   defect. Fixing it recovers real compression using codecs the registry
+   *already has*, no new code beyond the cost model.
+
+2. **Missing capability** (`bench_openzl_graph` above): OpenZL's win comes
+   from byte-plane transposition + per-plane delta + entropy coding, and
+   none of that is available to SubIntSplit's DP today. The transpose step
+   itself does not need to cost FastSkip: byte `k` of element `i` sits at a
+   fixed, directly computable offset within its byte-plane
+   (`plane_k_offset + i`), so `decodeAt(i)` under a pure transpose is still
+   O(1) arithmetic across the planes -- it is OpenZL's *subsequent* stages,
+   `zl.delta_int` (needs a running reference to decode any single element)
+   and `zl.private.zstd` (needs its LZ window materialized), that actually
+   break random access, not the transpose.
+
+   A **blocked byte-plane transpose** `SubStreamReordererType` -- transpose
+   within small fixed-size blocks (e.g. 128-1024 elements, the same order of
+   magnitude as `FOREncoder`'s existing 128-element `FrameSize`) rather than
+   globally -- would let `decodeAt(i)` reconstruct just element `i`'s block
+   (a few hundred elements) instead of the whole column, preserving FastSkip
+   at a bounded, tunable cost. Feeding each transposed byte-plane into the
+   *existing* RA-capable section codecs (`BitPacking`, `FrameOfReference`,
+   both already random-access per the ablation's own partition logic in
+   `CodecSetLadder.hpp`) rather than `delta_int`+`zstd` would trade some of
+   OpenZL's ~18-22x for a plan that never drops `FastSkip` -- directly the
+   property this whole sweep exists to test. Offered to the DP the same way
+   `SubStreamReordererType::BWT512` already is (`--reorderer` in
+   `bench_ablation`), it slots into the existing ladder infrastructure with
+   no new benchmark-side plumbing.
+
+Both are independent, additive follow-ups, not blocked on each other or on
+this sweep's own remaining gaps (BWT512/Full-dataset ablation coverage,
+`FOR`'s intermittent validation failure, the unpacked int32 `pre`/`post`/
+`level` columns).
+"""
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--results-dir", type=Path,
@@ -339,6 +449,13 @@ def main() -> None:
     openzl_section = build_openzl_graph_section(args.results_dir)
     if openzl_section:
         out_lines.append(openzl_section)
+
+    oracle_section = build_oracle_section(args.results_dir)
+    if oracle_section:
+        out_lines.append(oracle_section)
+
+    if openzl_section or oracle_section:
+        out_lines.append(RA_PRESERVING_SUGGESTIONS)
 
     out_lines.append("## Best codec per metric per dataset (summary)\n")
     header = ["driver", "dataset", "metric", "best_codec", "value"]
