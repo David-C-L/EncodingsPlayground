@@ -51,6 +51,46 @@ advantage (~4.1x, same-block vs cross-block) — confirming the caching that
 exists helps, it's just not enough. Even the *best* case here is
 ~1,500x slower than a genuinely O(1) codec.
 
+**This cache's own contribution can be decomposed from the two numbers
+above**, because `fseCache_` caches only the decode *table*, never decoded
+values (confirmed from source) — so even a same-block repeat still runs the
+full tANS bit-decode loop for the block on every call, it just skips
+rebuilding the table:
+
+- same-block (7,550 ns/probe) ≈ decode-loop cost alone (table already cached)
+- cross-block (30,720 ns/probe) ≈ table-(re)build cost + the same decode-loop cost
+
+Subtracting: **table (re)construction ≈ 23,170 ns, decode-loop ≈ 7,550 ns** —
+table construction is the *dominant* cost here, ~3x more expensive than the
+bit-unpacking work itself. (23 μs is also too large to be a CPU-cache-locality
+artifact — this is real compute, building a tANS state-transition table, not
+a memory-latency effect.) Two implications:
+
+1. The cache that exists is working as designed and is worth keeping/
+   extending, not replacing.
+2. It also sets a floor on how far *this* cache alone can go: even with the
+   table always hot, every call still pays the ~7,550 ns decode-loop, because
+   there's no cache for decoded *values*. Closing that gap is what the
+   checkpoint design below is actually for — table caching cannot get there
+   on its own.
+
+## Quick win, cheaper and orthogonal: widen `fseCache_` from LRU-1 to LRU-K
+
+Before the deeper checkpoint redesign below: since table (re)construction is
+the dominant cost, and the existing cache holds only the *single* most
+recently used block's table, any access pattern that cycles among a small
+*working set* of blocks (e.g. a gather sweep touching several concentrated
+ranges, each its own block) pays a full table rebuild on every block switch
+even if it revisits the same handful of blocks repeatedly. Widening
+`fseCache_` to an LRU-K (K = 4-16, say) is a small, low-risk, format-
+compatible change — no new on-disk structure, no versioning question, just a
+bigger cache — that would directly help that access shape, measurable with
+the same `bench_decode_point`/`bench_decode_gather` same-block-vs-cross-block
+methodology already validated this session, just with a *set* of K blocks
+cycled through instead of one. Worth doing and measuring on its own, as a
+prerequisite or a fallback if the full checkpoint redesign below turns out to
+be more invasive than it's worth.
+
 Also measured: applying `BlockFSE` to the *whole* 64-bit column directly
 (rather than as one narrow section after bit-splitting) achieved a
 compression ratio of **0.72x — worse than storing the data raw**. FSE/tANS
@@ -143,7 +183,10 @@ making `checkpoint_stride` small.
 ## Deliverable
 
 A phased implementation plan (this prompt asks for the plan, not the
-implementation): the exact format change, the checkpoint-stride selection
+implementation), with the LRU-K cache widening above as an early, cheap phase
+(measure it in isolation before committing to the deeper checkpoint format
+change — it may cover enough of the gap for some access patterns on its own)
+followed by: the exact format change, the checkpoint-stride selection
 strategy (fixed default vs tunable vs cost-model-driven), how `decodeAt` and
 `decodeRange` both change, compatibility/versioning decision, and a
 verification step per phase (cite the specific test/driver invocation,
