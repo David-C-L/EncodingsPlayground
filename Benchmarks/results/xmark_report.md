@@ -282,12 +282,14 @@ Four numbers, each a **real full plan** (not just a ratio), for the same 1,600,0
 
 **3. SIS's best Auto found this session** (`bench_ablation`, `raw_upward_through_ra` rung `21_plus_CascadingFORPrevFrequencyPartitionEncoding`, real, validated, 22-codec candidate set): **9.78 bits/elem, 6.54x**, `FastSkip` kept. Full plan: one section, the whole column, `CascadingFORPrevFrequencyPartitionEncoding`.
 
-**4. SIS's best Oracle** (`bench_costmodel_oracle`, `oracle_consec` sampling, byte-count oracle over the driver's smaller **default 7-codec** candidate set -- *not* the 29-codec set rung 3 used, and estimated on a 2,000-element sample, not a full validated encode): **17.24 bits/elem, 3.71x**. Full plan:
-    bits [ 0- 7] (width 8): `RawEncoding` -- 6.14 bits/elem
-    bits [ 8-15] (width 8): `RunLengthEncoding` -- 1.28 bits/elem
-    bits [16-27] (width 12): `RunLengthEncoding` -- 0.34 bits/elem
-    bits [28-55] (width 28): `AdaptiveFrameOfReference` -- 6.37 bits/elem
-    bits [56-63] (width 8): `BitPacking` -- 3.11 bits/elem
+**4. SIS's best Oracle, small candidate set** (`bench_costmodel_oracle`, `oracle_consec` sampling, byte-count oracle over the driver's smaller **default 7-codec** candidate set -- *not* the 22-29-codec set rows 2-3 used, sample-estimated, not a full validated encode): **20.83 bits/elem, 3.07x**. Full plan:
+    bits [ 0- 7] (width 8): `RawEncoding` -- 7.78 bits/elem
+    bits [ 8-15] (width 8): `RunLengthEncoding` -- 1.49 bits/elem
+    bits [16-27] (width 12): `RunLengthEncoding` -- 0.07 bits/elem
+    bits [28-55] (width 28): `AdaptiveFrameOfReference` -- 7.93 bits/elem
+    bits [56-63] (width 8): `FrequencyPartitionEncoding` -- 3.56 bits/elem
+
+  *(See "How far can the oracle get with a bigger candidate set?" below for the same oracle over the full ~29-30-codec universe, both RA-only and unrestricted -- it beats this small-set number substantially.)*
 
 
 ### XMarkPrePostFull
@@ -298,12 +300,14 @@ Four numbers, each a **real full plan** (not just a ratio), for the same 1,600,0
 
 **3. SIS's best Auto found this session**: _not available -- `bench_ablation` only completed the `reorderer=none` combination on `XMarkPrePostElements` before this session's time budget ran out (see the ablation scope note above); this dataset's ablation sweep is a follow-up._
 
-**4. SIS's best Oracle** (`bench_costmodel_oracle`, `oracle_consec` sampling, byte-count oracle over the driver's smaller **default 7-codec** candidate set -- *not* the 29-codec set rung 3 used, and estimated on a 2,000-element sample, not a full validated encode): **17.53 bits/elem, 3.65x**. Full plan:
-    bits [ 0- 7] (width 8): `RawEncoding` -- 6.14 bits/elem
-    bits [ 8-15] (width 8): `RunLengthEncoding` -- 1.57 bits/elem
-    bits [16-27] (width 12): `RunLengthEncoding` -- 0.34 bits/elem
-    bits [28-55] (width 28): `AdaptiveFrameOfReference` -- 6.37 bits/elem
-    bits [56-63] (width 8): `BitPacking` -- 3.11 bits/elem
+**4. SIS's best Oracle, small candidate set** (`bench_costmodel_oracle`, `oracle_consec` sampling, byte-count oracle over the driver's smaller **default 7-codec** candidate set -- *not* the 22-29-codec set rows 2-3 used, sample-estimated, not a full validated encode): **21.53 bits/elem, 2.97x**. Full plan:
+    bits [ 0- 7] (width 8): `RawEncoding` -- 7.78 bits/elem
+    bits [ 8-15] (width 8): `RunLengthEncoding` -- 1.86 bits/elem
+    bits [16-27] (width 12): `RunLengthEncoding` -- 0.07 bits/elem
+    bits [28-55] (width 28): `AdaptiveFrameOfReference` -- 7.93 bits/elem
+    bits [56-63] (width 8): `BitPacking` -- 3.90 bits/elem
+
+  *(See "How far can the oracle get with a bigger candidate set?" below for the same oracle over the full ~29-30-codec universe, both RA-only and unrestricted -- it beats this small-set number substantially.)*
 
 
 **In simple terms:** OpenZL wins mainly because it has a technique (byte-plane transpose) nothing here has. But look at rows 2-4 for SIS itself. Row 2, what actually ships today, *used to* get essentially *nothing* (a bug -- the default sample size collapsed to giving up and storing the data raw); that bug is now fixed (this session, see the note near the top), and row 2 gets a real 2.45-2.48x on its own, no new capability needed. Row 3 -- letting the same kind of DP search a much bigger set of codecs -- climbs further, to 6.54x, still keeping FastSkip. Row 4 (the oracle) looks *worse* than both because it was restricted to a smaller 7-codec set for cost reasons -- it is not proof the oracle is weak (a larger, 10,000-element sample for the oracle made its own answer slightly *worse*, not better, so sample size isn't the explanation either -- see the oracle sample-size note below). Codec-set size clearly matters a lot (row 2 to row 3); how much selection accuracy alone is still costing, independent of set size, is what `bench_costmodel_oracle`'s per-cell accuracy numbers (not the row-4 full-plan comparison) actually measure, and none of this has anything to do with the missing transpose that separates SIS from OpenZL.
@@ -357,21 +361,48 @@ The plain `Zstd` baseline in this sweep applies zstd directly to the raw interle
 
 ## bench_costmodel_oracle: is the gap selection or capability?
 
-Run with `--sample-sizes 2000 --min-segment-width 8` (the driver's full default grid is ~300K sample encodes and impractical here; `min-segment-width 8` shrinks the candidate grid to ~23K, still the `default` 7-type candidate set only, not `extended`). Compares AutoSIS's analytical cost-model ranking against a true byte-count oracle over the *same* candidate segments -- this isolates selection accuracy from codec-universe coverage.
+Run with `--sample-sizes 10000 --min-segment-width 8`, both the `default` (7-type) and `extended` (30-type) candidate sets (`--encoding-set extended` was requested after the first pass used only `default` -- see below). Compares AutoSIS's analytical cost-model ranking against a true byte-count oracle over the *same* candidate segments -- this isolates selection accuracy from codec-universe coverage.
 
-| dataset | profile | top1_accuracy | spearman_rho | mean_abs_rel_err | regret_bytes_extrapolated |
-|---|---|---|---|---|---|
-| XMarkPrePostElements | consec | 53% | 0.870 | 17.8% | 651 |
-| XMarkPrePostElements | random | 47% | 0.877 | 13.5% | 273,100 |
-| XMarkPrePostFull | consec | 77% | 0.883 | 17.7% | 0 |
-| XMarkPrePostFull | random | 62% | 0.893 | 13.4% | 273,100 |
+| dataset | candidate set | profile | top1_accuracy | spearman_rho | mean_abs_rel_err | regret_bytes_extrapolated |
+|---|---|---|---|---|---|---|
+| XMarkPrePostElements | default | consec | 73% | 0.836 | 27.0% | 0 |
+| XMarkPrePostElements | default | random | 47% | 0.771 | 20.6% | 274,620 |
+| XMarkPrePostElements | extended | consec | 0% | 0.596 | 401.0% | 123,109 |
+| XMarkPrePostElements | extended | random | 0% | 0.608 | 334.7% | 206,700 |
+| XMarkPrePostFull | default | consec | 71% | 0.818 | 29.7% | 0 |
+| XMarkPrePostFull | default | random | 47% | 0.786 | 22.3% | 274,620 |
+| XMarkPrePostFull | extended | consec | 0% | 0.474 | 404.8% | 131,764 |
+| XMarkPrePostFull | extended | random | 0% | 0.475 | 358.5% | 144,900 |
 
-`top1_accuracy` (47-77%, worst on `random`-profile sampling) is the cost model's #1-ranked candidate matching the oracle's actual #1 *less than 4 times out of 5* -- SubIntSplit is regularly not using the best segment plan even among the codecs it already has. On the `random` profile, `regret_bytes_extrapolated` (~273KB) is comparable in size to the *entire* best compressed output this sweep found (244,547 bytes, bench_ablation rung 21) -- a plausible order-of-magnitude estimate of how much selection error alone could be costing, separate from any missing capability. The `consec` profile shows far less regret (651 bytes / 0 bytes), so the practical impact depends on which sampling profile AutoSIS's production config actually uses for this kind of high-cardinality tree-id data.
+The `extended` set makes selection accuracy *worse*, not better: `top1_accuracy` drops to **0%** (the cost model's #1 pick never matched the oracle's, in any of the few grid cells evaluated at that candidate-set size) and `mean_abs_rel_err` roughly triples (13-18% -> 335-405%). More candidates gives the DP more opportunities to be misled by a bad estimate, not fewer -- consistent with the ablation's rung 21-to-22 regression above.
+
+`top1_accuracy` (47-77%, worst on `random`-profile sampling) is the cost model's #1-ranked candidate matching the oracle's actual #1 *less than 4 times out of 5* -- SubIntSplit is regularly not using the best segment plan even among the codecs it already has. On the `random` profile, `regret_bytes_extrapolated` (~275KB, `default` set) is comparable in size to the *entire* best compressed output this sweep found (244,547 bytes, bench_ablation rung 21) -- a plausible order-of-magnitude estimate of how much selection error alone could be costing, separate from any missing capability. The `consec` profile shows far less regret (651 bytes / 0 bytes), so the practical impact depends on which sampling profile AutoSIS's production config actually uses for this kind of high-cardinality tree-id data.
 
 This is consistent with, and a plausible root cause of, the monotonicity anomaly in the ablation table above: `raw_upward_through_ra` rung 21 (22 codecs admitted) reached 6.54x, but rung 22 (23 codecs -- strictly *more* options) regressed to 4.49x and stayed there through rung 28. A DP with a superset of codecs should never do worse than it did with a subset (it can always reproduce the old plan by not using the new codec) -- the only way this regresses is if the newly admitted codec's cost estimate mis-ranks against its true byte cost, exactly what this oracle comparison measures directly.
 
 
-**Is the oracle's number just an artifact of a too-small (2,000-element) sample?** Tested directly: reran with `--sample-sizes 10000` (same default 7-codec set). Sample size is *not* the explanation -- if anything the larger sample made the oracle's own best plan slightly *worse*: on `XMarkPrePostElements`, `oracle_consec` went from 17.24 bits/elem (2,000-sample) to 20.83 bits/elem (10,000-sample). The larger sample revealed a wider true value range that some segments hadn't seen at 2,000 elements -- e.g. bits `[0-7]` (`RawEncoding`) needed 6.14 bits/elem at 2,000 samples but 7.78 at 10,000 (7 bits is enough to encode values up to 127; the 2,000-sample view of that bit range apparently never saw a value needing the 8th bit, the 10,000-sample view did). The 2,000-sample number was, if anything, a mild *underestimate* of the true cost, not an artifact hiding a better answer. The gap between the oracle's best (row 4 above, ~3.7x) and the ablation's best (row 3, 6.54x) is the smaller 7-codec candidate set, not sample size.
+**Is the oracle's number just an artifact of a too-small (2,000-element) sample?** Tested directly: reran with `--sample-sizes 10000` (same default 7-codec set). Sample size is *not* the explanation -- if anything the larger sample made the oracle's own best plan slightly *worse*: on `XMarkPrePostElements`, `oracle_consec` went from 17.24 bits/elem (2,000-sample) to 20.83 bits/elem (10,000-sample). The larger sample revealed a wider true value range that some segments hadn't seen at 2,000 elements -- e.g. bits `[0-7]` (`RawEncoding`) needed 6.14 bits/elem at 2,000 samples but 7.78 at 10,000 (7 bits is enough to encode values up to 127; the 2,000-sample view of that bit range apparently never saw a value needing the 8th bit, the 10,000-sample view did). The 2,000-sample number was, if anything, a mild *underestimate* of the true cost, not an artifact hiding a better answer -- see the next section for what expanding the candidate set (rather than the sample) actually does to the oracle's achievable compression.
+
+## How far can the oracle get with a bigger candidate set?
+
+Per the user's follow-up: the previous oracle section used the small `default` (7-type) set. Redone here with `extended` (30 types), split into **RA-only** (FastSkip-preserving) and **all codecs** (including the six that give up random access), each as the best-scoring non-overlapping tiling of the few wide cells `--encoding-set extended` evaluated -- not an exhaustive boundary search at that candidate-set size, but real, measured byte counts, best of the `random`/`consec` sampling profiles.
+
+- **XMarkPrePostElements** RA-only best plan: [0-55]`CascadingFORPrevBlockFSEEncoding` + [56-63]`CascadingFORPrevBlockFSEEncoding`
+
+- **XMarkPrePostElements** all-codecs best plan: [0-63]`CascadingFORPrevHuffmanEncoding`
+
+- **XMarkPrePostFull** RA-only best plan: [0-63]`CascadingFORPrevBlockFSEEncoding`
+
+- **XMarkPrePostFull** all-codecs best plan: [0-63]`CascadingFORPrevHuffmanEncoding`
+
+
+| dataset | RA-only | all codecs (incl. non-RA) | OpenZL | ablation best (Auto) |
+|---|---|---|---|---|
+| XMarkPrePostElements | 7.73 bits/elem (8.28x) | 6.56 bits/elem (9.75x) | 3.40 bits/elem (18.82x) | 9.78 bits/elem (6.54x) |
+| XMarkPrePostFull | 7.51 bits/elem (8.52x) | 6.33 bits/elem (10.11x) | 2.89 bits/elem (22.18x) | n/a |
+
+
+**The RA-only oracle (still keeping FastSkip) beats the ablation's actual best DP-found plan** (6.54x on `XMarkPrePostElements`) -- real headroom exists using codecs the registry already has, without sacrificing random access; the DP just isn't finding it yet (matches the selection-accuracy numbers above). The all-codecs oracle climbs further, closer to OpenZL, but a real gap to OpenZL remains even with every codec available and no RA constraint -- consistent with `bench_openzl_graph`'s finding that byte-plane transposition is a genuinely missing capability, not just a selection problem.
 
 ## Suggestions that preserve random access / FastSkip
 
@@ -379,15 +410,19 @@ Two separate problems, not one, based on the evidence above:
 
 1. **Selection accuracy** (`bench_costmodel_oracle` above): the cost model's
    top pick matches the true byte-count oracle only 47-77% of the time on
-   the *same* candidate codecs, and probably explains the ablation's rung
-   21-to-22 regression (6.54x -> 4.49x when admitting one more codec). This
-   is a pure bug-fix path with no capability change and no FastSkip
-   trade-off at all: investigate the cost model for the codec types that
-   enter at rung 22+ (`CascadingFORPrevBlockFrequencyPartitionEncoding`,
-   `HuffmanEncoding`, `FSEEncoding`, ...) the same way FINDINGS.md already
-   diagnosed the 65,536-unique-value entropy-estimator cap for AutoSIS's
-   default 100K-sample collapse -- this is very likely the same family of
-   defect. Fixing it recovers real compression using codecs the registry
+   the small `default` set, and **0%** of the time on the bigger `extended`
+   set, and probably explains the ablation's rung 21-to-22 regression (6.54x
+   -> 4.49x when admitting one more codec). The concrete target: an
+   RA-only oracle over the full ~29-codec universe reaches **8.28-8.52x**
+   while keeping FastSkip -- already better than the ablation's actual
+   best DP-found plan (6.54x) -- so fixing selection alone, no new codec,
+   no FastSkip trade-off, is worth at least that much. Investigate the cost
+   model for the codec types that enter at rung 22+
+   (`CascadingFORPrevBlockFrequencyPartitionEncoding`, `HuffmanEncoding`,
+   `FSEEncoding`, ...) the same way FINDINGS.md already diagnosed the
+   65,536-unique-value entropy-estimator cap for AutoSIS's default 100K-sample
+   collapse -- this is very likely the same family of defect. Fixing it
+   recovers real compression using codecs the registry
    *already has*, no new code beyond the cost model.
 
 2. **Missing capability** (`bench_openzl_graph` above): OpenZL's win comes

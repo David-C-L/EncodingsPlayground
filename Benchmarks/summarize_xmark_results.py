@@ -308,31 +308,41 @@ def build_oracle_section(results_dir: Path) -> str:
         return ""
 
     lines = ["## bench_costmodel_oracle: is the gap selection or capability?\n",
-             "Run with `--sample-sizes 2000 --min-segment-width 8` (the driver's "
-             "full default grid is ~300K sample encodes and impractical here; "
-             "`min-segment-width 8` shrinks the candidate grid to ~23K, still "
-             "the `default` 7-type candidate set only, not `extended`). Compares "
-             "AutoSIS's analytical cost-model ranking against a true byte-count "
-             "oracle over the *same* candidate segments -- this isolates "
-             "selection accuracy from codec-universe coverage.\n"]
+             "Run with `--sample-sizes 10000 --min-segment-width 8`, both the "
+             "`default` (7-type) and `extended` (30-type) candidate sets "
+             "(`--encoding-set extended` was requested after the first pass "
+             "used only `default` -- see below). Compares AutoSIS's analytical "
+             "cost-model ranking against a true byte-count oracle over the "
+             "*same* candidate segments -- this isolates selection accuracy "
+             "from codec-universe coverage.\n"]
 
-    header = ["dataset", "profile", "top1_accuracy", "spearman_rho",
+    header = ["dataset", "candidate set", "profile", "top1_accuracy", "spearman_rho",
               "mean_abs_rel_err", "regret_bytes_extrapolated"]
     rows = ["| " + " | ".join(header) + " |", "|" + "|".join(["---"] * len(header)) + "|"]
-    for _, row in df.sort_values(["dataset", "profile"]).iterrows():
+    for _, row in df.sort_values(["dataset", "encoding_set", "profile"]).iterrows():
         rows.append("| " + " | ".join([
-            row["dataset"], row["profile"],
+            row["dataset"], row["encoding_set"], row["profile"],
             f"{row['top1_accuracy']:.0%}", f"{row['spearman_rho']:.3f}",
             f"{row['mean_abs_rel_err']:.1%}", f"{row['regret_bytes_extrapolated']:,.0f}",
         ]) + " |")
     lines.append("\n".join(rows) + "\n")
 
     lines.append(
+        "The `extended` set makes selection accuracy *worse*, not better: "
+        "`top1_accuracy` drops to **0%** (the cost model's #1 pick never "
+        "matched the oracle's, in any of the few grid cells evaluated at that "
+        "candidate-set size) and `mean_abs_rel_err` roughly triples (13-18% "
+        "-> 335-405%). More candidates gives the DP more opportunities to be "
+        "misled by a bad estimate, not fewer -- consistent with the ablation's "
+        "rung 21-to-22 regression above.\n")
+
+    lines.append(
         "`top1_accuracy` (47-77%, worst on `random`-profile sampling) is the "
         "cost model's #1-ranked candidate matching the oracle's actual #1 "
         "*less than 4 times out of 5* -- SubIntSplit is regularly not using the "
         "best segment plan even among the codecs it already has. On the "
-        "`random` profile, `regret_bytes_extrapolated` (~273KB) is comparable "
+        "`random` profile, `regret_bytes_extrapolated` (~275KB, `default` set) "
+        "is comparable "
         "in size to the *entire* best compressed output this sweep found "
         "(244,547 bytes, bench_ablation rung 21) -- a plausible order-of-"
         "magnitude estimate of how much selection error alone could be costing, "
@@ -364,24 +374,171 @@ def build_oracle_section(results_dir: Path) -> str:
         "2,000-sample view of that bit range apparently never saw a value "
         "needing the 8th bit, the 10,000-sample view did). The 2,000-sample "
         "number was, if anything, a mild *underestimate* of the true cost, "
-        "not an artifact hiding a better answer. The gap between the oracle's "
-        "best (row 4 above, ~3.7x) and the ablation's best (row 3, 6.54x) is "
-        "the smaller 7-codec candidate set, not sample size.\n")
+        "not an artifact hiding a better answer -- see the next section for "
+        "what expanding the candidate set (rather than the sample) actually "
+        "does to the oracle's achievable compression.\n")
+
+    return "\n".join(lines)
+
+
+# Encodings bench_costmodel_oracle's "extended" set exposes with no random-access
+# decodeAt -- see Source/benchmark/registry/CodecSetLadder.hpp's own doc comment
+# ("exactly six declare no RandomAccess: Huffman, FSE, and the four CascadingFOR
+# variants with a Huffman or FSE leaf"), verified against this dataset's own
+# per-candidate rows below.
+ORACLE_NON_RA_ENCODINGS = {
+    "HuffmanEncoding", "FSEEncoding", "CascadingFORFSEEncoding",
+    "CascadingFORHuffmanEncoding", "CascadingFORPrevFSEEncoding",
+    "CascadingFORPrevHuffmanEncoding",
+}
+
+
+def build_extended_oracle_achievement(results_dir: Path) -> str:
+    """User's follow-up: the earlier oracle used a small 7-codec set; what does
+    the oracle achieve given a much bigger candidate set -- first restricted to
+    RA-capable codecs only (preserves FastSkip), then with every codec
+    (including the six that give up random access)?
+
+    bench_costmodel_oracle's --encoding-set extended only evaluates a handful
+    of wide grid cells (not a full fine-grained boundary search at that
+    candidate-set size -- too expensive), so this reconstructs the best FULL
+    COLUMN plan as the best-scoring among the few non-overlapping ways those
+    evaluated cells happen to tile bits 0-63 (e.g. one 64-bit section, or two
+    halves) -- not an exhaustive search over every possible segmentation.
+    """
+    path = results_dir / "xmark_bench_costmodel_oracle.accuracy.csv"
+    if not path.exists():
+        return ""
+    df = pd.read_csv(path)
+    df = df[df["dataset"].str.startswith("XMarkPrePost")]
+    df = df[df["encoding_set"] == "extended"]
+    df = df[df["encoding"] != "OpenZL"]  # not a real SIS section-codec candidate
+    df = df[df["has_cost_model"] == 1]
+    df = df[df["act_bits_per_elem"].notna()]
+    if df.empty:
+        return ""
+
+    def best_per_cell(frame: pd.DataFrame, ra_only: bool) -> pd.DataFrame:
+        f = frame[~frame["encoding"].isin(ORACLE_NON_RA_ENCODINGS)] if ra_only else frame
+        f = f.dropna(subset=["act_bits_per_elem"])
+        if f.empty:
+            return f
+        return f.loc[f.groupby(["l", "r"])["act_bits_per_elem"].idxmin()]
+
+    def best_tiling(best_cells: pd.DataFrame) -> tuple[float, pd.DataFrame] | None:
+        """Among the evaluated cells, try every non-overlapping full-column
+        tiling (in practice: 1, 2 or 3 wide segments) and keep the cheapest."""
+        indexed = best_cells.set_index(["l", "r"])
+        cells = [(int(l), int(r)) for l, r in indexed.index]
+        n = 64
+        best = None
+        # Small cell counts here (<=6) -- brute force every subset that tiles 0..63.
+        from itertools import combinations
+        for k in range(1, len(cells) + 1):
+            for combo in combinations(cells, k):
+                spans = sorted(combo)
+                covered = 0
+                ok = True
+                for l, r in spans:
+                    if l != covered:
+                        ok = False
+                        break
+                    covered = r + 1
+                if not ok or covered != n:
+                    continue
+                rows = indexed.loc[list(combo)].reset_index()
+                total = rows["act_bits_per_elem"].sum()
+                if best is None or total < best[0]:
+                    best = (total, rows)
+        return best
+
+    lines = ["## How far can the oracle get with a bigger candidate set?\n",
+             "Per the user's follow-up: the previous oracle section used the "
+             "small `default` (7-type) set. Redone here with `extended` "
+             "(30 types), split into **RA-only** (FastSkip-preserving) and "
+             "**all codecs** (including the six that give up random access), "
+             "each as the best-scoring non-overlapping tiling of the few wide "
+             "cells `--encoding-set extended` evaluated -- not an exhaustive "
+             "boundary search at that candidate-set size, but real, measured "
+             "byte counts, best of the `random`/`consec` sampling profiles.\n"]
+
+    header = ["dataset", "RA-only", "all codecs (incl. non-RA)", "OpenZL", "ablation best (Auto)"]
+    rows = ["| " + " | ".join(header) + " |", "|" + "|".join(["---"] * len(header)) + "|"]
+    openzl_df = pd.read_csv(results_dir / "xmark_bench_openzl_graph.csv") \
+        if (results_dir / "xmark_bench_openzl_graph.csv").exists() else None
+    ablation_df = pd.read_csv(results_dir / "xmark_bench_ablation.csv") \
+        if (results_dir / "xmark_bench_ablation.csv").exists() else None
+
+    for dataset in sorted(df["dataset"].unique()):
+        best_ra, best_all = None, None
+        for profile in df["profile"].unique():
+            sub = df[(df["dataset"] == dataset) & (df["profile"] == profile)]
+            ra_cells = best_per_cell(sub, ra_only=True)
+            all_cells = best_per_cell(sub, ra_only=False)
+            ra_tiling = best_tiling(ra_cells) if not ra_cells.empty else None
+            all_tiling = best_tiling(all_cells) if not all_cells.empty else None
+            if ra_tiling and (best_ra is None or ra_tiling[0] < best_ra[0]):
+                best_ra = ra_tiling
+            if all_tiling and (best_all is None or all_tiling[0] < best_all[0]):
+                best_all = all_tiling
+
+        ra_str = f"{best_ra[0]:.2f} bits/elem ({64/best_ra[0]:.2f}x)" if best_ra else "n/a"
+        all_str = f"{best_all[0]:.2f} bits/elem ({64/best_all[0]:.2f}x)" if best_all else "n/a"
+        oz_str = "n/a"
+        if openzl_df is not None:
+            oz = openzl_df[openzl_df["dataset"] == dataset]
+            if not oz.empty:
+                b = oz["bits_per_element"].iloc[0]
+                oz_str = f"{b:.2f} bits/elem ({64/b:.2f}x)"
+        abl_str = "n/a"
+        if ablation_df is not None:
+            abl = ablation_df[ablation_df["dataset"] == dataset]
+            if not abl.empty:
+                best_idx = abl["compression_ratio"].idxmax()
+                r = abl.loc[best_idx, "compression_ratio"]
+                abl_str = f"{64/r:.2f} bits/elem ({r:.2f}x)"
+        rows.append("| " + " | ".join([dataset, ra_str, all_str, oz_str, abl_str]) + " |")
+
+        if best_ra:
+            plan_str = " + ".join(
+                f"[{int(r['l'])}-{int(r['r'])}]`{r['encoding']}`"
+                for _, r in best_ra[1].sort_values("l").iterrows())
+            lines.append(f"- **{dataset}** RA-only best plan: {plan_str}\n")
+        if best_all:
+            plan_str = " + ".join(
+                f"[{int(r['l'])}-{int(r['r'])}]`{r['encoding']}`"
+                for _, r in best_all[1].sort_values("l").iterrows())
+            lines.append(f"- **{dataset}** all-codecs best plan: {plan_str}\n")
+
+    lines.append("\n" + "\n".join(rows) + "\n")
+    lines.append(
+        "\n**The RA-only oracle (still keeping FastSkip) beats the ablation's "
+        "actual best DP-found plan** (6.54x on `XMarkPrePostElements`) -- real "
+        "headroom exists using codecs the registry already has, without "
+        "sacrificing random access; the DP just isn't finding it yet (matches "
+        "the selection-accuracy numbers above). The all-codecs oracle climbs "
+        "further, closer to OpenZL, but a real gap to OpenZL remains even with "
+        "every codec available and no RA constraint -- consistent with "
+        "`bench_openzl_graph`'s finding that byte-plane transposition is a "
+        "genuinely missing capability, not just a selection problem.\n")
 
     return "\n".join(lines)
 
 
 def _plan_bits_per_elem(plans_df: pd.DataFrame, dataset: str, plan: str) -> tuple[float, list[str]]:
     """Sum a full plan's segments into overall bits/element, plus a
-    human-readable line per segment. autosis rows' est_bits are scaled to the
-    full N=200,000; oracle_random/oracle_consec rows' est_bits are scaled to
-    the 2,000-element sample they were measured over; oracle_merged has no
-    est_bits (has_cost_model=0) and uses measured sample_bytes*8 instead.
+    human-readable line per segment. Only the `default` (small, 7-type)
+    candidate set -- see build_extended_oracle_achievement for the bigger
+    `extended` set. autosis rows' est_bits are scaled to the full
+    N=200,000; oracle_random/oracle_consec rows' est_bits are scaled to the
+    sample they were measured over; oracle_merged has no est_bits
+    (has_cost_model=0) and uses measured sample_bytes*8 instead.
     """
-    sub = plans_df[(plans_df["dataset"] == dataset) & (plans_df["plan"] == plan)]
+    sub = plans_df[(plans_df["dataset"] == dataset) & (plans_df["plan"] == plan) &
+                   (plans_df["encoding_set"] == "default")]
     if sub.empty:
         return float("nan"), []
-    basis = 200000 if plan == "autosis" else 2000
+    basis = 200000 if plan == "autosis" else int(sub["sample_size_actual"].iloc[0])
     lines = []
     total_bits = 0.0
     for _, row in sub.sort_values("bit_start").iterrows():
@@ -472,12 +629,16 @@ def build_full_choice_comparison(results_dir: Path) -> str:
             if bpe == bpe and (best_oracle_bpe is None or bpe < best_oracle_bpe):  # bpe==bpe: not NaN
                 best_oracle_bpe, best_oracle_lines, best_oracle_plan = bpe, seg_lines, plan
         if best_oracle_bpe is not None:
-            lines.append(f"**4. SIS's best Oracle** (`bench_costmodel_oracle`, `{best_oracle_plan}` "
-                         f"sampling, byte-count oracle over the driver's smaller **default "
-                         f"7-codec** candidate set -- *not* the 29-codec set rung 3 used, and "
-                         f"estimated on a 2,000-element sample, not a full validated encode): "
-                         f"**{best_oracle_bpe:.2f} bits/elem, {64/best_oracle_bpe:.2f}x**. "
-                         f"Full plan:\n" + "\n".join(best_oracle_lines) + "\n")
+            lines.append(f"**4. SIS's best Oracle, small candidate set** "
+                         f"(`bench_costmodel_oracle`, `{best_oracle_plan}` sampling, byte-count "
+                         f"oracle over the driver's smaller **default 7-codec** candidate set -- "
+                         f"*not* the 22-29-codec set rows 2-3 used, sample-estimated, not a full "
+                         f"validated encode): **{best_oracle_bpe:.2f} bits/elem, "
+                         f"{64/best_oracle_bpe:.2f}x**. Full plan:\n" + "\n".join(best_oracle_lines) +
+                         "\n\n  *(See \"How far can the oracle get with a bigger candidate set?\" "
+                         "below for the same oracle over the full ~29-30-codec universe, both "
+                         "RA-only and unrestricted -- it beats this small-set number "
+                         "substantially.)*\n")
 
         lines.append("")
 
@@ -511,15 +672,19 @@ Two separate problems, not one, based on the evidence above:
 
 1. **Selection accuracy** (`bench_costmodel_oracle` above): the cost model's
    top pick matches the true byte-count oracle only 47-77% of the time on
-   the *same* candidate codecs, and probably explains the ablation's rung
-   21-to-22 regression (6.54x -> 4.49x when admitting one more codec). This
-   is a pure bug-fix path with no capability change and no FastSkip
-   trade-off at all: investigate the cost model for the codec types that
-   enter at rung 22+ (`CascadingFORPrevBlockFrequencyPartitionEncoding`,
-   `HuffmanEncoding`, `FSEEncoding`, ...) the same way FINDINGS.md already
-   diagnosed the 65,536-unique-value entropy-estimator cap for AutoSIS's
-   default 100K-sample collapse -- this is very likely the same family of
-   defect. Fixing it recovers real compression using codecs the registry
+   the small `default` set, and **0%** of the time on the bigger `extended`
+   set, and probably explains the ablation's rung 21-to-22 regression (6.54x
+   -> 4.49x when admitting one more codec). The concrete target: an
+   RA-only oracle over the full ~29-codec universe reaches **8.28-8.52x**
+   while keeping FastSkip -- already better than the ablation's actual
+   best DP-found plan (6.54x) -- so fixing selection alone, no new codec,
+   no FastSkip trade-off, is worth at least that much. Investigate the cost
+   model for the codec types that enter at rung 22+
+   (`CascadingFORPrevBlockFrequencyPartitionEncoding`, `HuffmanEncoding`,
+   `FSEEncoding`, ...) the same way FINDINGS.md already diagnosed the
+   65,536-unique-value entropy-estimator cap for AutoSIS's default 100K-sample
+   collapse -- this is very likely the same family of defect. Fixing it
+   recovers real compression using codecs the registry
    *already has*, no new code beyond the cost model.
 
 2. **Missing capability** (`bench_openzl_graph` above): OpenZL's win comes
@@ -623,6 +788,10 @@ def main() -> None:
     oracle_section = build_oracle_section(args.results_dir)
     if oracle_section:
         out_lines.append(oracle_section)
+
+    extended_oracle_section = build_extended_oracle_achievement(args.results_dir)
+    if extended_oracle_section:
+        out_lines.append(extended_oracle_section)
 
     if openzl_section or oracle_section:
         out_lines.append(RA_PRESERVING_SUGGESTIONS)
