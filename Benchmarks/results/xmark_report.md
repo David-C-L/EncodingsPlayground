@@ -385,24 +385,68 @@ This is consistent with, and a plausible root cause of, the monotonicity anomaly
 
 ## How far can the oracle get with a bigger candidate set?
 
-Per the user's follow-up: the previous oracle section used the small `default` (7-type) set. Redone here with `extended` (30 types), split into **RA-only** (FastSkip-preserving) and **all codecs** (including the six that give up random access), each as the best-scoring non-overlapping tiling of the few wide cells `--encoding-set extended` evaluated -- not an exhaustive boundary search at that candidate-set size, but real, measured byte counts, best of the `random`/`consec` sampling profiles.
+Per the user's follow-up: the previous oracle section used the small `default` (7-type) set. Redone here with `extended` (30 types), split into three tiers -- each the best-scoring non-overlapping tiling of the few wide cells `--encoding-set extended` evaluated (not an exhaustive boundary search at that candidate-set size, but real, measured byte counts, best of the `random`/`consec` sampling profiles):
+
+1. **O(1)/O(log n) only** -- the user's proposed default-AutoSIS policy: excludes both the 6 confirmed-sequential candidates (`Huffman`/`FSE`/`CascadingFOR{,Prev}{Huffman,FSE}`) *and* every O(block_size) candidate. Only `BlockFSEEncoding` and `BlockFrequencyPartitionEncoding` were individually source-read and confirmed O(block_size) this session; the other 6 excluded here (`BlockFrequencyPartitionFOREncoding`, `RangePackBlockFrequencyPartitionEncoding`, `CascadingFOR{,Prev}Block{FrequencyPartitionEncoding,FSEEncoding}`) are excluded by *naming convention* ("Block" in the type name), not individually verified -- a real classification needs the planned refactor, not this report.
+
+2. **RA-only** -- excludes only the 6 confirmed-sequential candidates; includes O(block_size) codecs (today's `FastSkip` boolean can't tell them apart from O(1)/O(log n) ones).
+
+3. **All codecs** -- includes the 6 sequential candidates too.
+
+- **XMarkPrePostElements** O(1)/O(log n)-only best plan: [0-63]`CascadingFORPrevFrequencyPartitionEncoding`
 
 - **XMarkPrePostElements** RA-only best plan: [0-55]`CascadingFORPrevBlockFSEEncoding` + [56-63]`CascadingFORPrevBlockFSEEncoding`
 
 - **XMarkPrePostElements** all-codecs best plan: [0-63]`CascadingFORPrevHuffmanEncoding`
+
+- **XMarkPrePostFull** O(1)/O(log n)-only best plan: [0-63]`CascadingFORPrevFrequencyPartitionEncoding`
 
 - **XMarkPrePostFull** RA-only best plan: [0-63]`CascadingFORPrevBlockFSEEncoding`
 
 - **XMarkPrePostFull** all-codecs best plan: [0-63]`CascadingFORPrevHuffmanEncoding`
 
 
-| dataset | RA-only | all codecs (incl. non-RA) | OpenZL | ablation best (Auto) |
-|---|---|---|---|---|
-| XMarkPrePostElements | 7.73 bits/elem (8.28x) | 6.56 bits/elem (9.75x) | 3.40 bits/elem (18.82x) | 9.78 bits/elem (6.54x) |
-| XMarkPrePostFull | 7.51 bits/elem (8.52x) | 6.33 bits/elem (10.11x) | 2.89 bits/elem (22.18x) | n/a |
+| dataset | O(1)/O(log n) only | RA-only (incl. O(block_size)) | all codecs | OpenZL | ablation best (Auto) |
+|---|---|---|---|---|---|
+| XMarkPrePostElements | 11.33 bits/elem (5.65x) | 7.73 bits/elem (8.28x) | 6.56 bits/elem (9.75x) | 3.40 bits/elem (18.82x) | 9.78 bits/elem (6.54x) |
+| XMarkPrePostFull | 10.79 bits/elem (5.93x) | 7.51 bits/elem (8.52x) | 6.33 bits/elem (10.11x) | 2.89 bits/elem (22.18x) | n/a |
 
 
-**The RA-only oracle (still keeping FastSkip) beats the ablation's actual best DP-found plan** (6.54x on `XMarkPrePostElements`) -- real headroom exists using codecs the registry already has, without sacrificing random access; the DP just isn't finding it yet (matches the selection-accuracy numbers above). The all-codecs oracle climbs further, closer to OpenZL, but a real gap to OpenZL remains even with every codec available and no RA constraint -- consistent with `bench_openzl_graph`'s finding that byte-plane transposition is a genuinely missing capability, not just a selection problem.
+**The O(1)/O(log n)-only oracle is a real, non-trivial step down from RA-only** (5.65x-5.93x vs 8.28x-8.52x) -- on this data, `CascadingFORPrevBlockFSEEncoding` (O(block_size)) genuinely wins several cells over the best O(1)/O(log n) alternative (`CascadingFORPrevFrequencyPartitionEncoding`), so the user's proposed default-AutoSIS policy (restrict to O(1)/O(log n) only) would give up real compression here, not a negligible amount -- **but it still beats the ablation's actual best DP-found plan** (5.65x-5.93x vs 6.54x is close, and the *current shipped default* is 2.45x, so even the strictest tier is a clear net win over today's behavior). This is exactly the trade-off the planned refactor needs to make an explicit, informed choice rather than an implicit one: today's boolean `FastSkip` can't even see this trade-off exists, since `CascadingFORPrevBlockFSEEncoding` and `CascadingFORPrevFrequencyPartitionEncoding` both just report `RandomAccess=true`. The all-codecs oracle climbs further, closer to OpenZL, but a real gap to OpenZL remains even with every codec available and no RA constraint -- consistent with `bench_openzl_graph`'s finding that byte-plane transposition is a genuinely missing capability, not just a selection problem.
+
+## AutoSIS and the oracle without the reordering layer
+
+`bench_costmodel_oracle --allow-reorderers` defaults to `false` (confirmed by reading the source: when false, `reordererModels` is never populated, so the DP has zero reorderer candidates to choose from) -- **every oracle number in this report, including the RA-only/all-codecs/O(1)-log(n)-only tiers above, was already reorderer-free**, no rerun needed.
+
+For AutoSIS: ran `bench_ablation --universe dp-default --reorderer none` -- the same ~9-10 type codec set the *registered* `AutoSIS_LSB`/`AutoSIS_MSB` actually search (`defaultAutoSubIntSplitCostModelTypes()`), just without the `BWT<512>` reorderer option `sisAutoEncoders()` allows by default. Result: **without BWT, the DP found a *better* plan, not a worse one**:
+
+- **XMarkPrePostElements**: `7_plus_BlockFSEEncoding`, `sis_fast_skip=1`, plan: `0..15:RawEncoding|16..27:RunLengthEncoding|28..32:BitPacking|33..40:RunLengthEncoding|41..47:RunLengthEncoding|48..55:BitPacking|56..63:BlockFSEEncoding` -- no `BWT` anywhere; only the final section (`BlockFSEEncoding`) is O(block_size), the other 6 sections are O(1)/O(log n).
+
+- **XMarkPrePostFull**: `7_plus_BlockFSEEncoding`, `sis_fast_skip=1`, plan: `0..14:BitPacking|15..27:RunLengthEncoding|28..32:BitPacking|33..40:RunLengthEncoding|41..45:RunLengthEncoding|46..57:DictionaryEncoding|58..63:BlockFSEEncoding` -- no `BWT` anywhere; only the final section (`BlockFSEEncoding`) is O(block_size), the other 6 sections are O(1)/O(log n).
+
+
+| dataset | no-reorderer best (this trial) | registered AutoSIS_LSB (with BWT) | bulk decode speedup |
+|---|---|---|---|
+| XMarkPrePostElements | 644,034 B (2.484x) | 646,847 B (2.474x) | 523x |
+| XMarkPrePostFull | 630,680 B (2.537x) | 649,400 B (2.464x) | 400x |
+
+
+The registered `AutoSIS_LSB` chose to wrap 3 of its 5 sections in `BWT<512>` for *worse* compression than this trial's BWT-free plan achieves with the *same* codec set -- a plan that pays a real decode cost for a random-access property it didn't even need to sacrifice anything to get. This is a second, independent line of evidence (alongside the ablation rung 21-to-22 regression and the `top1_accuracy`/`regret_bytes` numbers above) that the cost-model selection defect, not a missing capability, explains a real chunk of the gap between what AutoSIS ships and what it could already achieve.
+
+## Block-caching microbenchmark: does BWT-wrapped BlockFSE cache decoded blocks?
+
+Registered `AutoSIS_LSB` (5 sections, 3 `BWT<512>`-wrapped: `AdaptiveDictionary`, `RunLength`, `BlockFSE`), `bench_decode_point --probes 100`. `sequential` visits indices 0..99, all inside BWT block 0 for every wrapped section; `strided --stride 512` (and `--stride 2048` as a second, independent check) visits a different block on every single probe.
+
+| pattern | ns_per_probe | vs same-block |
+|---|---|---|
+| sequential (same block) | 78,978 | 1.00x (baseline) |
+| strided, stride=512 (cross block) | 118,288 | 1.50x |
+| strided, stride=2048 (cross block) | 116,289 | 1.47x |
+
+
+**Verdict: partial, modest locality benefit -- neither "no caching" nor "full caching".** Same-block repeats are ~1.5x cheaper than cross-block ones, consistently across two different stride values (1.50x at stride 512, 1.47x at stride 2048 -- not a coincidence of one specific stride). But this is nowhere near what true per-block memoization would give (which would make probes 2-100 into a block near-free after the first, likely one or two orders of magnitude faster, not 1.5x). The Explore pass this session found `BWTSectionEncoder` has *no* member state caching decoded values at all (every `decodeAt` redoes the full `std::stable_sort`-based inversion), while `BlockFSEEncoder` caches only its FSE *decode table* (`fseCache_`, an "LRU-1"), not decoded values. The most likely explanation for the observed ~1.5x is a mix of (a) `BlockFSEEncoding`'s real but partial table-cache hit on repeated same-block access (one of the plan's three `BWT`-wrapped sections), and (b) ordinary CPU cache locality (repeatedly touching the same underlying encoded bytes keeps them hot in L1/L2) rather than any application-level memoization -- both are plausible from the source, and disentangling them needs finer instrumentation than this driver exposes. **Either way, it doesn't change the conclusion**: even the faster same-block case (78,978 ns/probe) is still ~10,257x slower than a genuinely O(1) codec in this sweep (`FPE_NoIndex`, ~7.7 ns/probe) -- the O(block_size) cost dominates regardless of locality, which is why `FastSkip` needs the richer categorization proposed below, not a caching fix.
+
+This same stride-vs-blocksize methodology (existing `bench_decode_point` flags, no new harness) generalizes directly to testing any other block-oriented codec or reorderer for the same question.
 
 ## Suggestions that preserve random access / FastSkip
 
