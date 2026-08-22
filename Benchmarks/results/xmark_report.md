@@ -448,6 +448,26 @@ Registered `AutoSIS_LSB` (5 sections, 3 `BWT<512>`-wrapped: `AdaptiveDictionary`
 
 This same stride-vs-blocksize methodology (existing `bench_decode_point` flags, no new harness) generalizes directly to testing any other block-oriented codec or reorderer for the same question.
 
+## Isolating bare BlockFSE: what does it cost without BWT?
+
+Per the user's follow-up ('is there really no way to get FSE-level compression with high RA throughput'): every `BlockFSE` number elsewhere in this report was compounded with `BWT<512>`'s cost (the registered plan wraps it). `SIS_BareBlockFSE` (a new manual SIS plan: single full-width `[0,63]` section, `BlockFSEEncoding` only, no reorderer) isolates it directly.
+
+**Compression, applied to the whole 64-bit id directly: 0.721x -- *worse than storing it raw*.** This is itself a finding: FSE/tANS entropy coding needs a genuinely skewed symbol distribution to win, and this near-unique 64-bit id has none at the whole-value level -- every other `BlockFSE` result in this report that *did* compress well used it as one narrow *section* after `SubIntSplit`'s bit-splitting had already isolated a lower-entropy sub-field (e.g. an 8-bit tail). `BlockFSE`'s compression value here comes from being paired with bit-splitting, not from being applied broadly.
+
+**Decode cost, isolated from BWT:**
+
+| metric | bare BlockFSE (this trial) | BWT-wrapped (registered AutoSIS_LSB) | Raw baseline |
+|---|---|---|---|
+| point, same-block (ns/probe) | 7,550 | 78,978 | ~5 |
+| point, cross-block (ns/probe) | 30,720 | 118,288 | ~5 |
+| range, median (elem_Meps) | 5.93 | ~0.12-0.16 | ~470 |
+| bulk (Meps) | 4.40 | 0.17 | ~315 |
+
+
+**Isolated, `BlockFSE`'s own same-block/cross-block advantage is ~4.1x** (7,550 vs 30,720 ns/probe) -- much clearer than the ~1.5x seen in the BWT-compounded case above, consistent with `BlockFSEEncoder`'s confirmed decode-*table* cache (`fseCache_`) actually mattering once `BWT`'s own zero-caching O(W log W) inversion cost isn't swamping it. And bare `BlockFSE` is ~26x faster in bulk and ~15-60x faster in range than the `BWT`-wrapped version -- **`BWT`, not `BlockFSE`, is the dominant cost** in every mixed plan measured this session. `BlockFSE` alone is still real and non-trivial (~1,510x slower than a genuinely O(1) codec even at its best), but the catastrophic numbers earlier in this report were mostly `BWT`, not `BlockFSE`.
+
+**Answering the question directly: no, not for free, but the picture is better than 'FSE compression or fast RA, pick one'.** Three real, independent levers, none requiring giving up FSE's compression: (1) don't use `BlockFSE` as a whole-column codec -- pair it with bit-splitting the way the winning plans in this report already do, where it only has to cover a narrow, already-decorrelated section; (2) drop `BWT` specifically -- it's the dominant cost, and the no-reorderer trial above shows the DP doesn't even need it for compression on this data; (3) shrink `BlockFSE`'s own block size, or decouple its entropy-table-refresh granularity from its decode-checkpoint granularity (detailed design in `Benchmarks/drivers/BLOCKFSE_CHECKPOINT_REFACTOR_PROMPT.md`) -- store periodic decoder-state snapshots *within* a still-large table-fitting window, so a point query only replays a small checkpoint stride, not the whole block, without touching compression at all.
+
 ## Suggestions that preserve random access / FastSkip
 
 Two separate problems, not one, based on the evidence above:

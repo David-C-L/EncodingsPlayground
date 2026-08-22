@@ -732,6 +732,95 @@ def build_block_cache_microbenchmark(results_dir: Path) -> str:
     return "\n".join(lines)
 
 
+def build_bare_blockfse_section(results_dir: Path) -> str:
+    """Isolates BlockFSEEncoding's own decode cost from BWT<512>'s, using the
+    new SIS_BareBlockFSE manual plan (single full-width section, no
+    reorderer) -- every other BlockFSE number in this report was compounded
+    with BWT's cost.
+    """
+    point_path = results_dir / "xmark_bench_barefse_point.csv"
+    range_path = results_dir / "xmark_bench_barefse_range.csv"
+    bulk_path = results_dir / "xmark_bench_barefse_bulk.csv"
+    comp_path = results_dir / "xmark_bench_barefse_compression.csv"
+    if not all(p.exists() for p in (point_path, range_path, bulk_path, comp_path)):
+        return ""
+
+    comp = pd.read_csv(comp_path)
+    comp = comp[(comp["dataset"] == "XMarkPrePostElements") & (comp["encoding"] == "SIS_BareBlockFSE")]
+    point = pd.read_csv(point_path)
+    seq = point[point["pattern"] == "sequential"]
+    cross = point[point["pattern"] == "strided"]
+    rng = pd.read_csv(range_path)
+    bulk = pd.read_csv(bulk_path)
+    if comp.empty or seq.empty or cross.empty:
+        return ""
+
+    ratio = comp["compression_ratio"].iloc[0]
+    seq_ns = seq["ns_per_probe"].iloc[0]
+    cross_ns = cross["ns_per_probe"].iloc[0]
+
+    lines = ["## Isolating bare BlockFSE: what does it cost without BWT?\n",
+             "Per the user's follow-up ('is there really no way to get FSE-level "
+             "compression with high RA throughput'): every `BlockFSE` number "
+             "elsewhere in this report was compounded with `BWT<512>`'s cost "
+             "(the registered plan wraps it). `SIS_BareBlockFSE` (a new manual "
+             "SIS plan: single full-width `[0,63]` section, `BlockFSEEncoding` "
+             "only, no reorderer) isolates it directly.\n\n"
+             f"**Compression, applied to the whole 64-bit id directly: "
+             f"{ratio:.3f}x -- *worse than storing it raw*.** This is itself a "
+             f"finding: FSE/tANS entropy coding needs a genuinely skewed "
+             f"symbol distribution to win, and this near-unique 64-bit id has "
+             f"none at the whole-value level -- every other `BlockFSE` result "
+             f"in this report that *did* compress well used it as one narrow "
+             f"*section* after `SubIntSplit`'s bit-splitting had already "
+             f"isolated a lower-entropy sub-field (e.g. an 8-bit tail). "
+             f"`BlockFSE`'s compression value here comes from being paired "
+             f"with bit-splitting, not from being applied broadly.\n\n"
+             f"**Decode cost, isolated from BWT:**\n"]
+
+    header = ["metric", "bare BlockFSE (this trial)", "BWT-wrapped (registered AutoSIS_LSB)", "Raw baseline"]
+    rows = ["| " + " | ".join(header) + " |", "|" + "|".join(["---"] * len(header)) + "|"]
+    rows.append(f"| point, same-block (ns/probe) | {seq_ns:,.0f} | 78,978 | ~5 |")
+    rows.append(f"| point, cross-block (ns/probe) | {cross_ns:,.0f} | 118,288 | ~5 |")
+    if not rng.empty:
+        rows.append(f"| range, median (elem_Meps) | {rng['elem_Meps'].median():.2f} | ~0.12-0.16 | ~470 |")
+    if not bulk.empty:
+        rows.append(f"| bulk (Meps) | {bulk['decode_Meps'].iloc[0]:.2f} | 0.17 | ~315 |")
+    lines.append("\n".join(rows) + "\n")
+
+    lines.append(
+        f"\n**Isolated, `BlockFSE`'s own same-block/cross-block advantage is "
+        f"~{cross_ns/seq_ns:.1f}x** ({seq_ns:,.0f} vs {cross_ns:,.0f} ns/probe) -- "
+        f"much clearer than the ~1.5x seen in the BWT-compounded case above, "
+        f"consistent with `BlockFSEEncoder`'s confirmed decode-*table* cache "
+        f"(`fseCache_`) actually mattering once `BWT`'s own zero-caching "
+        f"O(W log W) inversion cost isn't swamping it. And bare `BlockFSE` is "
+        f"~26x faster in bulk and ~15-60x faster in range than the "
+        f"`BWT`-wrapped version -- **`BWT`, not `BlockFSE`, is the dominant "
+        f"cost** in every mixed plan measured this session. `BlockFSE` alone "
+        f"is still real and non-trivial (~{seq_ns/5:,.0f}x slower than a "
+        f"genuinely O(1) codec even at its best), but the catastrophic "
+        f"numbers earlier in this report were mostly `BWT`, not `BlockFSE`.\n\n"
+        f"**Answering the question directly: no, not for free, but the "
+        f"picture is better than 'FSE compression or fast RA, pick one'.** "
+        f"Three real, independent levers, none requiring giving up FSE's "
+        f"compression: (1) don't use `BlockFSE` as a whole-column codec -- "
+        f"pair it with bit-splitting the way the winning plans in this report "
+        f"already do, where it only has to cover a narrow, already-decorrelated "
+        f"section; (2) drop `BWT` specifically -- it's the dominant cost, and "
+        f"the no-reorderer trial above shows the DP doesn't even need it for "
+        f"compression on this data; (3) shrink `BlockFSE`'s own block size, or "
+        f"decouple its entropy-table-refresh granularity from its "
+        f"decode-checkpoint granularity (detailed design in "
+        f"`Benchmarks/drivers/BLOCKFSE_CHECKPOINT_REFACTOR_PROMPT.md`) -- "
+        f"store periodic decoder-state snapshots *within* a still-large "
+        f"table-fitting window, so a point query only replays a small "
+        f"checkpoint stride, not the whole block, without touching "
+        f"compression at all.\n")
+
+    return "\n".join(lines)
+
+
 def _plan_bits_per_elem(plans_df: pd.DataFrame, dataset: str, plan: str) -> tuple[float, list[str]]:
     """Sum a full plan's segments into overall bits/element, plus a
     human-readable line per segment. Only the `default` (small, 7-type)
@@ -1007,6 +1096,10 @@ def main() -> None:
     block_cache_section = build_block_cache_microbenchmark(args.results_dir)
     if block_cache_section:
         out_lines.append(block_cache_section)
+
+    bare_blockfse_section = build_bare_blockfse_section(args.results_dir)
+    if bare_blockfse_section:
+        out_lines.append(bare_blockfse_section)
 
     if openzl_section or oracle_section:
         out_lines.append(RA_PRESERVING_SUGGESTIONS)
