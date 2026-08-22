@@ -23,9 +23,11 @@
 #include "encodings/EncodingProperty.hpp"
 #include "encodings/EncodingType.hpp"
 
+#include "encoders/AdaptiveDictionaryEncoder.hpp"
 #include "encoders/AdaptiveFramedBitPrefixEncoder.hpp"
 #include "encoders/BlockFORFPEEncoder.hpp"
 #include "encoders/BlockFrequencyPartitionEncoder.hpp"
+#include "encoders/FOREncoder.hpp"
 #include "encoders/FrequencyPartitionEncoder.hpp"
 #include "encoders/OpenZLEncoder.hpp"
 #include "encoders/RawBitPackedEncoder.hpp"
@@ -133,6 +135,18 @@ inline std::vector<EncoderEntry<int64_t>> baselineEncoders() {
                                     std::make_shared<BlockFORFPEEncoder<Elem>>(),
                                     "baseline", /*variant=*/{}, /*knownBroken=*/true));
     e.push_back(detail::entry<Elem>("Zstd", std::make_shared<ZstdEncoder<Elem>>(), "baseline"));
+    e.push_back(detail::entry<Elem>("AdaptiveDictionary",
+                                    std::make_shared<AdaptiveDictionaryEncoder<Elem>>(),
+                                    "baseline"));
+    {
+        // Whole-column FOR: TOut=Elem (no narrowing, we haven't profiled a safe
+        // residual width for an arbitrary dataset) with a Raw sub-encoder for the
+        // residual stream, mirroring the construction idiom already used for
+        // SubIntSplit's FOR section codec (SubIntEncodingUtils.hpp).
+        FORConfig<Elem, Elem> cfg{.subEncoder = std::make_shared<RawEncoder<Elem>>()};
+        e.push_back(detail::entry<Elem>(
+            "FOR", std::make_shared<FOREncoder<Elem, Elem, 128>>(cfg), "baseline"));
+    }
 #ifdef HAVE_OPENZL
     e.push_back(detail::entry<Elem>("OpenZL", makeOpenZLCodec<Elem>(), "baseline", /*variant=*/{},
                                     /*knownBroken=*/false, /*sequentialOverride=*/true));
@@ -214,6 +228,17 @@ inline std::vector<EncoderEntry<int64_t>> sisManualPlans() {
     e.push_back(detail::entry<Elem>(
         "SIS_Delta5", makeSubIntSplitEncoderManual<Elem>(deltaBits, deltaEncs),
         "sis-manual", detail::planSignature(deltaBits, deltaEncs)));
+
+    // Bare BlockFSE, single full-width section, no reorderer: isolates
+    // BlockFSEEncoding's own decode cost from the BWT<512> wrapper the DP
+    // otherwise reaches for, and from every other section in a mixed plan.
+    // See Benchmarks/drivers/FASTSKIP_REFACTOR_PROMPT.md / BLOCKFSE_CHECKPOINT
+    // _REFACTOR_PROMPT.md -- this entry exists to measure that gap directly.
+    const std::vector<uint8_t> bareBlockFSEBits{64};
+    const std::vector<EncodingType> bareBlockFSEEncs{EncodingType::BlockFSEEncoding};
+    e.push_back(detail::entry<Elem>(
+        "SIS_BareBlockFSE", makeSubIntSplitEncoderManual<Elem>(bareBlockFSEBits, bareBlockFSEEncs),
+        "sis-manual", detail::planSignature(bareBlockFSEBits, bareBlockFSEEncs)));
     return e;
 }
 

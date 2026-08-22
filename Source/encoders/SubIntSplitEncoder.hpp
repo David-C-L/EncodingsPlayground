@@ -1756,7 +1756,13 @@ inline typename SubIntSplitAutoEncoder<T>::Config makeDefaultAutoSubIntSplitConf
     cfg.selectorConfig.minSegmentWidth = 1; // avoid tiny slices that inflate headers/rounding
     cfg.selectorConfig.splitPenalty = 100.0; // discourage excessive splitting (heavier for MSB)
     cfg.selectorConfig.enableMergePhase = false; // merge adjacent in MSB mode to reduce fragmentation
-    cfg.samplerConfig.maxSamples = 100'000;   // cap total sampled points
+    // 10,000, not 100,000: at 100K samples the entropy cost model collapses to
+    // a degenerate single full-width section on near-unique high-cardinality
+    // ids (FINDINGS.md; independently reproduced on XMark tree ids -- see
+    // Benchmarks/results/xmark_report.md). The CostModelSet overload below
+    // already defaults to 10,000 for the same reason; this brings the
+    // compression-only overload in line with it.
+    cfg.samplerConfig.maxSamples = 10'000;    // cap total sampled points
     cfg.samplerConfig.stride = 0;           // unused when blockSize > 0
     cfg.samplerConfig.blockSize = 32;       // 625 blocks × 16 elements — diverse enough to capture slowly-varying fields (e.g. Snowflake timestamps that change every 4096 IDs)
     cfg.samplerConfig.maxPercentage = 0; // or maxSamples, whichever is smaller
