@@ -228,6 +228,17 @@ inline std::vector<EncoderEntry<int64_t>> sisManualPlans() {
     e.push_back(detail::entry<Elem>(
         "SIS_Delta5", makeSubIntSplitEncoderManual<Elem>(deltaBits, deltaEncs),
         "sis-manual", detail::planSignature(deltaBits, deltaEncs)));
+
+    // Bare BlockFSE, single full-width section, no reorderer: isolates
+    // BlockFSEEncoding's own decode cost from the BWT<512> wrapper the DP
+    // otherwise reaches for, and from every other section in a mixed plan.
+    // See Benchmarks/drivers/FASTSKIP_REFACTOR_PROMPT.md / BLOCKFSE_CHECKPOINT
+    // _REFACTOR_PROMPT.md -- this entry exists to measure that gap directly.
+    const std::vector<uint8_t> bareBlockFSEBits{64};
+    const std::vector<EncodingType> bareBlockFSEEncs{EncodingType::BlockFSEEncoding};
+    e.push_back(detail::entry<Elem>(
+        "SIS_BareBlockFSE", makeSubIntSplitEncoderManual<Elem>(bareBlockFSEBits, bareBlockFSEEncs),
+        "sis-manual", detail::planSignature(bareBlockFSEBits, bareBlockFSEEncs)));
     return e;
 }
 
