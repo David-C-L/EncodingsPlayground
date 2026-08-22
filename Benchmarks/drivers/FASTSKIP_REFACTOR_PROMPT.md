@@ -5,6 +5,15 @@ implementation) on `EncodingsPlayground`, a C++ compression-codec benchmark
 playground. Hand this file to a fresh planning agent/session — it assumes no
 memory of any prior conversation.
 
+**Related, split-out work**: `Benchmarks/drivers/BLOCKFSE_CHECKPOINT_REFACTOR_
+PROMPT.md` is a separate, narrower prompt specifically about reducing
+`BlockFSEEncoder`'s O(block_size) constant (decoupling its entropy-table
+window from its decode-checkpoint granularity). It's designed to run in
+parallel with this one — this prompt's categorization work only needs to know
+`BlockFSEEncoder` currently *is* O(block_size), not what its constant will
+become; the other prompt's outcome just makes that constant smaller once it
+lands, with no ordering dependency either way.
+
 ## Problem
 
 `Source/encodings/EncodingProperty.hpp` defines `EncodingProperty::RandomAccess`
@@ -95,11 +104,18 @@ An access-cost **class**, applied independently to two layers that compound:
    on top (e.g. `BWT<512>|BlockFSE` should cost roughly the O(W log W) BWT
    inversion *plus* the wrapped codec's own O(block_size) decode, not just
    one or the other). Design the composition rule explicitly rather than
-   picking whichever layer is "worse" — this session's data
-   (`BWT<512>|BlockFSE` at ~79,000-118,000 ns/probe vs `BlockFSEEncoding`
-   alone, untested in isolation here but worth deriving/measuring as part of
-   the design) suggests they're not simply additive vs max — settle this with
-   real measurement, not assumption.
+   picking whichever layer is "worse". This session measured `BlockFSEEncoding`
+   truly in isolation (a new manual plan, `SIS_BareBlockFSE`, single
+   full-width section, no reorderer: 7,550 ns/probe same-block, 30,720
+   ns/probe cross-block), but the only *compound* number available is the
+   registered `AutoSIS_LSB` 5-section plan as a whole (78,978/118,288
+   ns/probe), which mixes cost from `BWT<512>|BlockFSE` *and* two other
+   `BWT`-wrapped sections (`AdaptiveDictionary`, `RunLength`) — **not** a
+   clean `BWT<512>|BlockFSE`-alone number. Getting one (e.g. a second manual
+   plan, single full-width `BWT<512>|BlockFSE` section, no other sections)
+   is a small, cheap first step for whoever picks this up, and would settle
+   the composition rule with real measurement instead of the two whole-plan
+   numbers above, which only bound the answer loosely.
 
 ## Design questions for the plan to answer
 
